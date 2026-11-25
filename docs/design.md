@@ -18,13 +18,13 @@
 | Config format | YAML with a published JSON Schema; unknown keys are errors with did-you-mean (pnpm 12 behaviour). |
 | CLI language | **Rust.** It owns everything that does not need a JVM: config, graph, hashing, no-op detection, lockfile fetch, cache restore, reporting. |
 | Compiler side | A **Scala JVM worker** (“`scpmd`”) that embeds **Zinc 2.1** directly — *not* Bloop. Narrow protocol: compile/test/run requests in, structured events out. All scheduling stays in Rust. |
-| Daemon? | **Yes locally** (one shared per-user daemon per `(scpm version, JDK)`, idle-timeout, serves every workspace and worktree). **In CI, the same worker runs in the foreground for the life of the job** with a JDK 25 AOT cache. Zinc cannot be made fast enough cold: JIT warmup is 3–5× (*measured*). |
+| Daemon? | **Yes locally** (one shared per-user daemon per `(scpm version, worker JDK)`, idle-timeout, serves every workspace and worktree). **In CI, the same worker runs in the foreground for the life of the job** with a JDK 25 AOT cache. Zinc cannot be made fast enough cold: JIT warmup is 3.4–5× (*measured*). |
 | Dependencies | **Coursier owns resolution and the cache.** Phase 1: spawn native `cs`. Phase 2: a small native-image resolver sidecar on the coursier API (JSON-lines over stdio). Never reimplement Maven resolution in Rust. |
-| Lockfile | **Yes**, our own (`scpm-lock.yaml`), because nothing in the Scala ecosystem has one. Restoring from the lock needs no resolver, only intransitive downloads with sha256 verification, so the Rust CLI can do it itself, writing a coursier-compatible cache layout. |
+| Lockfile | **Yes**, our own (`scpm-lock.yaml`), because nothing in the Scala ecosystem has one. Restoring from the lock needs no resolver, only intransitive downloads with sha256 verification, so the Rust CLI does it itself from Phase 1, writing a coursier-compatible cache layout. |
 | Semver ranges | Allowed **only in manifests, only for direct deps, resolved at lock time**. Published POMs never contain ranges. `^`/`~` are translated with Scala's early-semver rules and the dependency's `info.versionScheme`. |
-| Agents | **`scpm mcp`** is a first-class front-end from Phase 1. It is a thin layer over `--json` and the event stream, uses the shared daemon, and is token-frugal by default (§9.3). |
+| Agents | **`scpm mcp`** is a first-class front-end from Phase 1. It is a thin layer over `--json` and the event stream, owns a foreground worker in Phase 1 and uses the shared daemon from Phase 2, and is token-frugal by default (§9.3). |
 | Reporting | Everything is an **event stream** (NDJSON). Reporters (tty, GitHub, JUnit, JSON, SARIF, MCP) are consumers. The plugin API is mostly “subscribe to events / contribute facts”. |
-| IDE | Write **`.metals/mbt.json`** for Metals v2's fast path (Scala 2.12, 2.13 and 3; full speed needs Scala 3.3.8+ or 3.8.4+). Serve a **narrow, well-implemented BSP**. For IntelliJ, add `scpm idea` (generated `.idea` XML) early and a native ExternalSystem plugin later, so we're not stuck with IntelliJ's weaker BSP experience (§10). |
+| IDE | Write **`.metals/mbt.json`** for Metals v2's fast path (Scala 2.12, 2.13 and 3; full speed needs Scala 3.3.8+ or 3.8.4+). Serve a **narrow, well-implemented BSP**. For IntelliJ, add `scpm idea` (generated `.idea` XML) early and a native ExternalSystem plugin in Phase 5, so we're not stuck with IntelliJ's weaker BSP experience (§10). |
 | Worktrees | Shared daemon + shared coursier cache + **copy-on-write seeding** of build outputs and portable Zinc analysis from a sibling worktree or the remote cache: `scpm worktree add` gives a warm incremental build. |
 
 ---
@@ -111,8 +111,8 @@ flowchart TB
     subgraph jvm["Out-of-process helpers"]
         direction LR
         resolver["Resolver<br/>Phase 1: cs CLI<br/>Phase 2: native-image sidecar<br/>Runs only when the lock is stale"]
-        scpmd["scpmd: Scala on JDK 25<br/>Zinc 2.1, scalafmt, scalafix, JS/Native linkers<br/>Shared daemon locally, foreground in CI"]
-        testjvm["Forked test/run JVM<br/>sbt test-interface"]
+        scpmd["scpmd: Scala on the worker JDK (25+)<br/>Zinc 2.1, scalafmt, scalafix, JS/Native linkers<br/>Shared daemon locally, foreground in CI"]
+        testjvm["Forked test/run JVM<br/>project JDK, sbt test-interface"]
     end
 
     subgraph disk["Shared on-disk state"]
@@ -154,13 +154,13 @@ Only the Rust box runs on every command. Everything in "Out-of-process helpers" 
 
 This is the Pants/Bazel shape: a native orchestrator with persistent JVM workers, which is proven at scale.
 
-**Resolver.** Coursier, out of process (see [§5](#5-dependencies-and-coursier)). It is only needed when the lockfile is stale, so in CI with `--frozen-lockfile` it is never invoked.
+**Resolver.** Coursier, out of process (see [§5](#5-dependencies-and-coursier)). It is only needed when the lockfile is stale, so in CI with `--frozen` it is never invoked.
 
 ### 3.2 Hot paths, and which ones touch the JVM
 
 | Command | JVM? | Notes |
 |---|---|---|
-| `scpm install` / `scpm ci` with up-to-date lock | No | Rust fetches missing jars by URL + sha256. No POMs, no resolution rounds (§5.2). |
+| `scpm install` / `scpm ci` with up-to-date lock | No | Rust fetches missing jars by URL + sha256. No POMs, no resolution rounds (§5.2). Phase 1 gets the JDK with `cs java-home` (native, cached). |
 | `scpm install` with stale lock | `cs` (native) | Coursier resolves and downloads. 40–130 ms warm *measured* (cats-effect+circe → spark-sql). |
 | `scpm compile` no-op | No | Fingerprint check in Rust; bleep's ctime-manifest trick (5 s → 5 ms per project). |
 | `scpm pipeline` all cache hits | No | Restore outputs + replay logs/annotations from the remote cache. |
@@ -194,7 +194,7 @@ This is the Pants/Bazel shape: a native orchestrator with persistent JVM workers
   - presets
   - task definitions and pipelines
   - versioning and supply-chain policy
-- **Each module's `scpm.yaml`** owns only its identity, its dependencies (including other workspace modules) and its own task overrides.
+- **Each module's `scpm.yaml`** owns only its identity, its sources, its dependencies (including other workspace modules), its compiler and run settings, and its own task overrides.
 
 The explicitness concern ("A depends on B, here are all my projects") is kept two ways:
 
@@ -218,17 +218,20 @@ modules:
 organization: com.acme           # default groupId for publishing
 
 toolchain:
-  jdk: temurin:25                # fetched via coursier's JVM index, cached
+  jdk: temurin:25                # project JDK: release target, runs tests and `run` (§6.3); workspace-only
   scala: catalog:                # default Scala version for modules (key `scala` in the default catalog)
 
 repositories:
   - central
   - id: acme
     url: https://acme.jfrog.io/artifactory/maven
-    credentials: env:ARTIFACTORY_TOKEN     # or coursier credentials.properties
+    credentials: env:ARTIFACTORY_TOKEN     # bearer token; or { user: env:U, password: env:P } (§5.7)
+
+lock:
+  resolutionContext: { os: linux, arch: x86_64, jdk: 25 }   # the default (jdk = project JDK major); §5.4
 
 catalog:                         # default catalog → referenced as `catalog:`
-  scala: 3.7.4                   # the key is the field's natural key: `scala` here, the coordinate for deps
+  scala: 3.9.0                   # the key is the field's natural key: `scala` here, the coordinate for deps
   org.typelevel::cats-core: 2.13.0
   org.typelevel::cats-effect: ^3.6.0
   org.scalameta::munit: 1.2.1
@@ -236,6 +239,7 @@ catalog:                         # default catalog → referenced as `catalog:`
 catalogs:
   scala213:
     scala: 2.13.18
+    org.typelevel::cats-core: 2.12.0
   spark:
     org.apache.spark::spark-sql: 3.5.1
 
@@ -254,10 +258,13 @@ presets:                         # named, mergeable fragments; modules opt in wi
     scala: [catalog:, catalog:scala213]   # a list = cross-build over these Scala versions
 
 tasks:                           # pnpm-style task defaults, inherited by every module
-  compile: { dependsOn: ['^compile'] }
+  compile: { dependsOn: ['^compile'] }   # built-in tasks need no `run:`
   test:    { dependsOn: [compile], outputs: [] }
-  lint:    { run: builtin:scalafix --check, outputs: [] }
-  fmt:check: { run: builtin:scalafmt --check, outputs: [] }
+  lint:    { outputs: [] }
+  fmt:check: { outputs: [] }
+  lint:strict:                   # custom task reusing a built-in with arguments
+    run: builtin:scalafix --check --config .scalafix-strict.conf
+    outputs: []
 
 pipelines:
   default: [fmt:check, compile, lint, test]
@@ -267,7 +274,6 @@ pipelineBase: origin/main
 
 policy:
   minimumReleaseAge: 1d          # see §5.6
-  checksums: [sha256]
   versionConflicts: error        # sbt-style eviction errors using info.versionScheme
 
 versioning:
@@ -280,7 +286,7 @@ versioning:
 
 ```yaml
 # modules/core/scpm.yaml
-name: core                       # artifactId = core_3 (+ platform suffix) on publish
+name: core                       # artifactId = core_3 on publish (core_sjs1_3 for Scala.js)
 extends: [library, cross-213-3]
 platforms: [jvm, js]             # variants = platforms × scala versions → core@jvm-3, core@js-2.13, …
 
@@ -299,22 +305,51 @@ testDependencies:
 boms:
   - com.acme:platform-bom:2026.11.0
 
+javacOptions: [-parameters]
+generatedSources: [src_managed]  # dirs under ${outDir} that tasks write; compiled with the sources
+
 variants:                        # per-variant overrides, keyed by variant selector, only when needed
   '2.13':                        # matches every variant on Scala 2.13 (also: 'js', 'jvm-3', …)
     scalacOptions: [-Xsource:3]
+    compilerPlugins:             # coord → spec; added as -Xplugin
+      org.typelevel:::kind-projector: 0.13.3
 
 tasks:
   generate:                      # module-local task; codegen before compile
-    run: scpm run //tools/codegen -- --out ${outDir}/src_managed
+    run: scpm run codegen -- --out ${outDir}/src_managed
     outputs: ['${outDir}/src_managed/**']
   compile: { dependsOn: ['^compile', generate] }
+```
+
+```yaml
+# modules/codegen/scpm.yaml
+name: codegen
+scala: none                      # Java-only: no Scala suffix, no scala-library; one variant, codegen@jvm
+release: 17                      # Java release target; default: the project JDK's major version
+mainClass: com.acme.codegen.Main
+jvmOptions: [-Xmx1g]             # forked `run` / `test` JVMs
+env: { CODEGEN_STRICT: 'true' }
+
+dependencies:
+  com.squareup:javapoet: 1.13.0
 ```
 
 Notes:
 
 - **Dependency syntax** keeps the Scala convention (`::` cross-version, `:::` full version, `:` plain Java). Keys are coordinates and values are version specs, so Renovate and agents can edit a single line. Bare names (`util:`) refer to workspace modules.
 - **Scopes**: `dependencies`, `providedDependencies` (compile-only), `runtimeDependencies`, `testDependencies`. Four is deliberately small; no Ivy configurations.
-- **Catalog references** look up the field's natural key: for a dependency, its coordinate (`catalog:` → default catalog, `catalog:spark` → the `spark` catalog); for `scala`, the key `scala`. A catalog entry may itself be a range (`^3.6.0`).
+- **Catalog references** look up the field's natural key: for a dependency, its coordinate (`catalog:` → default catalog, `catalog:spark` → the `spark` catalog); for `scala`, the key `scala`. A catalog entry may itself be a range (`^3.6.0`); it is resolved once per (platform, Scala binary version) for the whole workspace (§5.4). A variant that needs a different version uses a `variants` override:
+  ```yaml
+  variants:
+    '2.13':
+      dependencies:
+        org.typelevel::cats-core: catalog:scala213   # looks up org.typelevel::cats-core in catalogs.scala213
+  ```
+- **Source layout** is sbt/Maven's by default: `src/main/scala`, `src/main/java`, `src/main/resources`, `src/test/scala`, `src/test/java`, `src/test/resources`. Version- and platform-specific directories (`src/main/scala-2`, `scala-3`, `scala-2.13`, `scala-jvm`, `scala-js`, `scala-native`, and their `src/test/…` twins) are added automatically for the variants they match. `sources`, `resources`, `testSources` and `testResources` (lists of directories relative to the module) replace the defaults.
+- **`${outDir}`** is `.scpm/out/<variant-id>/`. `generatedSources` lists directories relative to it; tasks write them and they join the compile sources.
+- **`scala: none`** marks a Java-only module: no suffix, no scala-library, variant id `<name>@jvm`.
+- **`compilerPlugins`** maps a coordinate to a spec, like dependencies. `:::` coordinates are resolved full-cross (`_<full Scala version>`). Every plugin jar is passed as `-Xplugin:<jar>`, Scala 3 plugins included.
+- **Java and run settings:** `javacOptions`; `release`, the Java release target (default: the project JDK's major, §6.3); `mainClass`; `jvmOptions` and `env` for forked `run` and `test` JVMs.
 - **Exclusions and classifiers** use an expanded object form when needed:
   ```yaml
   dependencies:
@@ -328,20 +363,50 @@ Notes:
 
 pnpm has almost no inheritance; it relies on catalogs and root-level settings. We need slightly more because of scalac options and cross builds. Four mechanisms, in priority order:
 
-1. **Catalogs.** Versions, defined once and referenced everywhere. Named catalogs replace sbt's `val catsVersion = …` idiom and double as cross-build sets.
-2. **Root `tasks:`.** Defaults inherited by every module and overridable per module (pnpm 12 semantics: an unconfigured task defaults to `dependsOn: ['^self']`).
-3. **Presets + `extends:`.** Named fragments merged into the module in order. Lists append (deduplicated), maps merge deeply, scalars override, and a `!replace` YAML tag on a value (`scalacOptions: !replace [-deprecation]`) replaces instead of merging. This is bleep's templates idea, but the presets live in the root and are referenced from leaves.
+1. **Catalogs.** Versions, defined once and referenced everywhere. Named catalogs replace sbt's `val catsVersion = …` idiom.
+2. **Root `tasks:`.** Defaults inherited by every module and overridable per module (pnpm 12 semantics: an unconfigured task defaults to `dependsOn: ['^self']`, where `^self` means the same task in each upstream module).
+3. **Presets + `extends:`.** Named fragments merged into the module in order, by the rules below. A `!replace` YAML tag on a value (`scalacOptions: !replace [-deprecation]`) replaces instead of merging. This is bleep's templates idea, but the presets live in the root and are referenced from leaves.
 4. **Config dependencies** (later). Presets and catalogs published as a Maven artifact (`com.acme:scpm-presets:1.4.0`) and pinned in the lockfile's boot section, so an org can share them across repos. This mirrors pnpm's `configDependencies`.
 
 Directory-based implicit inheritance (child configs silently picking up parent-directory config) is **not** supported: everything a module gets is visible from its own file plus `extends:`. `scpm config core --resolved [--json]` prints the fully expanded result, and `scpm config core --explain scalacOptions` shows where each value came from (as `aube config explain` does).
 
+#### Effective variant config (normative)
+
+**Order.** A variant's effective config is built by merging, later over earlier:
+
+1. toolchain defaults (`toolchain:` in the workspace);
+2. presets, in `extends` order. A preset may itself have `extends`; expansion is depth-first, each preset's own `extends` applied before the preset, and a preset already applied is skipped. A cycle is an error;
+3. the module file;
+4. each `variants` entry whose selector matches the variant, in file order (later wins). Entries contributed by presets come first; an entry repeated under the same selector merges into the first.
+
+**Merge rules.**
+
+| Value | Rule |
+|---|---|
+| Map | Merge by key, recursively. |
+| Scalar | Later replaces earlier. |
+| List | Append, **without** deduplication. |
+| Set-like list: `extends`, `boms` | Append, deduplicated (first occurrence kept). |
+| `scala`, `platforms` | Always **replace** (`platforms` is also deduplicated). They define the matrix, so a module's `scala:` overrides a preset's list rather than growing it. |
+| Any value tagged `!replace` | Replaces. |
+
+**Where keys may appear.**
+
+- A preset may contain any module key except `name`.
+- A `variants` entry may contain any module key except `name`, `extends`, `platforms`, `scala` and `variants`.
+- `toolchain.jdk` is workspace-only in v1. A module sets its Java target with `release`.
+
+**Variant ids** are `<module>@<platform>-<scala binary>` (`core@jvm-3`, `core@js-2.13`), or `<module>@jvm` for a Java-only module.
+
+**Selectors** (keys of `variants`, and the part after `@` in filters) are dash-separated parts. Each part matches a platform (`jvm`, `js`, `native`), a Scala binary version (`3`, `2.13`) or a full Scala version (`3.9.0`); any other part is an error. A variant matches if every part matches. In filters, `-F core` matches every variant of `core`, and globs work (`-F 'core@jvm-*'`).
+
 ### 4.5 Cross-building
 
-This is Scala-specific and has no pnpm analogue. A module's variants are `platforms × scala versions`, optionally pruned with an `exclude` list. A variant id looks like `core@jvm-3` or `core@js-2.13`.
+This is Scala-specific and has no pnpm analogue. A module's variants are `platforms × scala versions`, optionally pruned with an `exclude` list. A variant id looks like `core@jvm-3` or `core@js-2.13`; a Java-only module (`scala: none`) has one variant, `codegen@jvm` (id and selector grammar in §4.4).
 
-- `workspace:` edges match variants by platform and Scala binary version, failing with a clear error when no match exists.
-- The lockfile resolves each variant separately (§5.4).
-- Filters understand variants: `scpm test -F core@jvm-*`.
+- `workspace:` edges match variants by platform and Scala binary version, failing with a clear error when no match exists. An edge to a Java-only module matches any JVM variant.
+- The lockfile has an entry per variant, resolved jointly with its upstream workspace modules (§5.4).
+- Filters understand variants: `scpm test -F core@jvm-*`; `-F core` selects every variant of `core`.
 
 ### 4.6 Format choice
 
@@ -354,6 +419,8 @@ This is Scala-specific and has no pnpm analogue. A module's variants are `platfo
 TOML is the main alternative (Cargo, Mill YAML aside) and is arguably safer: there's no Norway problem, so `no` and `3.10` stay strings. We would mitigate YAML's pitfalls by treating every version field as a string in the schema and rejecting unquoted floats.
 
 Unknown keys are **errors** with did-you-mean suggestions, matching pnpm 12's `ERR_PNPM_UNRECOGNIZED_WORKSPACE_SETTINGS`.
+
+**The v1 schema is defined up front** and accepted from Phase 1. A key for a feature that isn't implemented yet is an error — "`<key>` is not supported yet (planned for Phase N)" — whenever it would change behaviour (`platforms: [jvm]` is fine in Phase 1; `platforms: [jvm, js]` is not). It is never silently ignored.
 
 ---
 
@@ -397,12 +464,14 @@ Unknown keys are **errors** with did-you-mean suggestions, matching pnpm 12's `E
 | JNI or GraalVM `--shared` C library | Possible but adds little over a sidecar process. Skip. |
 | Reimplement in Rust | **No.** The long tail costs months: profiles, BOM import cycles, relocations, Gradle variant matching, coursier's deliberate latest-wins semantics. The result would also diverge from sbt/Mill/scala-cli on the same inputs. Existing Rust crates (`jbuild`, `deps-maven`, `mvn`) are immature. |
 
-The **one thing Rust does natively is restoring from the lockfile**, which is not resolution: it is "download these N URLs and verify sha256" into the coursier cache layout:
+The **one thing Rust does natively is restoring from the lockfile**, which is not resolution: it is "download these N files and verify sha256" into the coursier cache layout. It ships in **Phase 1**, behind a compatibility test suite that runs `cs` and the Rust fetcher concurrently on one cache.
 
+- URL: the configured URL of the artifact's `repo` id (§5.4), with mirrors applied, plus the Maven path;
 - path: `<cache>/https/<host>/<path>`, with coursier's escaping rules;
 - write `.part` then rename;
 - take POSIX `fcntl` locks to interoperate with the JVM's `FileChannel.lock` (**[verify on macOS]**);
-- write `.__sha1` sidecar files so coursier's own checks pass.
+- write checksum sidecars that match coursier's auxiliary file naming (e.g. `.<file>__sha1`), so coursier's own checks pass;
+- authenticate with the repository's `credentials` and coursier's own credentials (§5.7).
 
 Release artifacts are immutable, so this is safe. Changing (`-SNAPSHOT`) artifacts are always delegated to coursier.
 
@@ -413,7 +482,7 @@ There are two cases, and **no single command chains a coursier resolve into a Ru
 | Case | When | Who does it | Requests |
 |---|---|---|---|
 | **Lock is stale** | `scpm add`, `scpm update`, a manifest edit | Coursier, resolving *and* downloading in one `cs fetch`. Rust only hashes the jars it got (local disk, no network) to write sha256 into the lock. | All POMs (with parent and BOM chains), then all jars |
-| **Lock is fresh** | CI, a fresh clone, a new worktree, switching branches | Rust alone, from URLs and sha256 values in the lock. No resolution at all. | Jars only, in one parallel burst |
+| **Lock is fresh** | CI, a fresh clone, a new worktree, switching branches | Rust alone, from the coordinates, repository ids and sha256 values in the lock. No resolution at all. | Jars only, in one parallel burst |
 
 **What coursier actually does** (verified in the 2.1.27 source: `Fetch.scala`, `ResolutionProcess.scala`):
 
@@ -436,7 +505,7 @@ The POMs Rust skipped are not missing from anything that needs them. Coursier fe
 
 **Optional optimisation for the stale-lock case: speculative prefetch.** When the lock is stale, most entries in the *old* lock are still right. Rust can start downloading those jars while coursier resolves, and whatever coursier then asks for is already cached. Wrong guesses cost bandwidth but never correctness.
 
-**Why not have coursier do the fresh-lock case too?** It can't do it without POMs from the CLI. It could through the library (`cache.file(artifact)` for each artifact, gathered), which a native-image sidecar could expose. But Rust already has the lock in memory, needs the sha256 checks anyway, and starting the fetch costs it no process spawn. The Phase 0 spike should measure a cold `cs fetch` against a Rust lock restore on a GitHub runner to confirm the gap is worth owning this code.
+**Why not have coursier do the fresh-lock case too?** It can't do it without POMs from the CLI. It could through the library (`cache.file(artifact)` for each artifact, gathered), which a native-image sidecar could expose. But Rust already has the lock in memory, needs the sha256 checks anyway, and starting the fetch costs it no process spawn. The Phase 0 spike should measure a cold `cs fetch` against a Rust lock restore on a GitHub runner to quantify the gap.
 
 ### 5.3 Cache sharing
 
@@ -446,40 +515,86 @@ In CI, the `setup-scpm` action caches it, keyed by the lockfile hash.
 
 ### 5.4 Lockfile: `scpm-lock.yaml`
 
-Design goals, taking lessons from pnpm v13: few merge conflicts, one entry per artifact, sorted, stable.
+Design goals, taking lessons from pnpm 12's experimental v13 lockfile format: few merge conflicts, one entry per artifact, sorted, stable.
 
 ```yaml
 lockfileVersion: 1
-inputs: sha256:…                 # hash of all manifests' dependency sections + catalogs + repos + policy
+resolutionContext: { os: linux, arch: x86_64, jdk: 25 }   # see below; a change re-locks every variant
 
-boot:                            # resolved before anything else, needed for CI fast path
-  jdk: { id: temurin:25.0.1, url: …, sha256: … }
-  scala-compiler@3.7.4: [org.scala-lang:scala3-compiler_3:3.7.4, …]
-  zinc-bridge@3.7.4: [org.scala-lang:scala3-sbt-bridge:3.7.4]
-  tools: { scalafmt: 3.10.1, scalafix: 0.14.4 }
+boot:                            # everything needed before a JVM starts; lists reference `artifacts`
+  jdk:                           # project JDK per os-arch; Phase 1 records only the JVM index id
+    linux-x86_64:  { id: temurin:25.0.1 }
+    macos-aarch64: { id: temurin:25.0.1 }
+  scala-compiler@3.9.0: [org.scala-lang:scala3-compiler_3:3.9.0, org.scala-lang:scala3-library_3:3.9.0, …]
+  compiler-bridge@3.9.0: [org.scala-lang:scala3-sbt-bridge:3.9.0]
+  worker: [dev.scpm:scpm-worker_3:0.4.2, …]
+  test-runner: [dev.scpm:scpm-test-runner_3:0.4.2, org.scala-sbt:test-interface:1.0, …]
+  tools:
+    scalafmt@3.10.1: [org.scalameta:scalafmt-cli_2.13:3.10.1, …]
+    scalafix@0.14.4: [ch.epfl.scala:scalafix-cli_2.13.18:0.14.4, …]
 
-modules:
+variants:                        # keyed by variant id, even for single-variant modules
   core@jvm-3:
-    dependencies:
-      org.typelevel::cats-core: { spec: 'catalog: (2.13.0)', version: 2.13.0 }
-      io.circe::circe-core:     { spec: '^0.14.10', version: 0.14.14 }
-    classpath: [org.typelevel:cats-core_3:2.13.0, io.circe:circe-core_3:0.14.14, …]   # ordered
-    testClasspath: [ … ]
+    specifiers:                  # each direct dependency as written, and the version scpm selected
+      org.typelevel::cats-core: { spec: 'catalog:', version: 2.13.0 }
+      io.circe::circe-core:     { spec: ^0.14.10, version: 0.14.14 }
+      org.scalameta::munit:     { spec: 'catalog:', version: 1.2.1 }
+      util:                     { spec: 'workspace:*' }
+    inputsHash: sha256:…
+    compileClasspath:            # ordered
+      - { module: util@jvm-3 }
+      - org.typelevel:cats-core_3:2.13.0
+      - io.circe:circe-core_3:0.14.14
+      - …
+    runtimeClasspath: [ … ]
+    testCompileClasspath: [ … ]
+    testRuntimeClasspath: [ … ]
 
-artifacts:
+artifacts:                       # group:artifact:version[:classifier][@type]; one entry per file
   org.typelevel:cats-core_3:2.13.0:
-    repo: central
-    jar: { sha256: …, size: 6012345 }
-    sources: { sha256: … }        # optional, fetched lazily for IDE
+    repo: central                # repository id from config, never a mirror
+    sha256: …
+    size: 6012345
     deps: [org.typelevel:cats-kernel_3:2.13.0]
+  io.netty:netty-transport-native-epoll:4.1.115.Final:linux-x86_64: { … }
 ```
 
-The `boot` section matters because the compiler, Zinc bridge, JDK and formatter are pinned too. A CI run can then fetch everything it needs in parallel from Rust before any JVM starts.
+#### Variants
 
-**Commands:**
+Each variant locks four ordered classpaths:
 
-- `scpm install` — update the lock if the inputs hash changed.
-- `scpm install --frozen` — the default when `CI=true`; fail if the inputs hash changed.
+| List | Contents |
+|---|---|
+| `compileClasspath` | `dependencies` + `providedDependencies` |
+| `runtimeClasspath` | `dependencies` + `runtimeDependencies` |
+| `testCompileClasspath` | `compileClasspath` + `testDependencies` |
+| `testRuntimeClasspath` | `runtimeClasspath` + `providedDependencies` + `testDependencies` |
+
+- **Workspace modules** (`workspace:*`) appear as references (`{ module: util@jvm-3 }`), not artifacts: every upstream variant in the transitive closure, in dependency order, before the external artifacts, which follow coursier's order. Upstream modules contribute their `dependencies` to every list and their `runtimeDependencies` to the runtime lists, never their provided or test dependencies.
+- **Resolution is joint over the variant's transitive workspace closure.** A variant's external dependencies are resolved in one coursier call together with those of every upstream variant, so if A depends on B, A's classpaths hold one version of each library for both A's and B's code.
+- **Catalog ranges are resolved once per (platform, Scala binary version) for the whole workspace**, so every variant that uses that `catalog:` entry on that platform and Scala binary version gets the same version.
+- **`specifiers`** records each direct dependency's spec as written and the version scpm selected for it (§5.5), before coursier's reconciliation, like pnpm's importers. `workspace:*` entries have no version.
+- **`inputsHash`** is a sha256 over the variant's *effective* config after presets and `variants` (§4.4): dependencies (catalog references replaced by their entries), BOMs, overrides, toolchain and repositories, plus the same for every upstream variant in its workspace closure, since those are resolved jointly.
+- A variant with `compilerPlugins` also has an ordered `compilerPlugins` list.
+
+**Artifacts** are keyed `group:artifact:version[:classifier][@type]`, with `@type` omitted for `jar`. Each file has one entry, shared by every variant that uses it; `deps` lists its direct dependencies for `scpm why`. **Sources jars are not in the lock.** They are IDE-only, fetched on demand and verified against the repository's checksum.
+
+**Boot** holds the closures of the Scala compiler, compiler bridge, scpm worker, test runner and tools (scalafmt, scalafix), each a list of references into `artifacts`. A CI run can then fetch everything it needs in parallel from Rust before any JVM starts. `boot.jdk` is the project JDK (§6.3), keyed by `os-arch` (`linux-x86_64`, `macos-aarch64`, …). In Phase 1 it records only the JVM index id, which `cs java-home --jvm <id>` turns into a cached JDK; the Rust JDK fetcher (Phase 3) adds a URL and sha256 per entry.
+
+#### Resolution context and repositories
+
+- **Resolution uses a fixed, declared context**, never the machine's own: by default `{os: linux, arch: x86_64, jdk: <project JDK major>}`, configurable as `lock.resolutionContext` in the workspace. It is passed to coursier (`--jdk-version`, and the OS and architecture properties that drive POM profile activation), so a lock made on macOS equals one made on Linux. The lock records it, and a change re-locks every variant.
+- **Mirrors** are applied at fetch time and never recorded.
+- **`repo`** records the repository **id** from config, derived by matching the artifact's URL against the configured repository URLs (and their mirrors) by prefix, longest match first. A URL that matches no configured repository is an error.
+
+#### Staleness and commands
+
+A variant is **stale** when its recomputed `inputsHash` differs from the lock's.
+
+- `scpm install` — re-lock stale variants, then fetch whatever is missing.
+- `scpm install --frozen` — the default when `CI=true`; a stale variant is an error.
+- `scpm compile|test|run` — locally, a stale lock is installed first (aube-style install-before-run) and scpm prints what changed. With `CI=true` or `--frozen`, a stale lock is an error.
+- `scpm ci` — `scpm install --frozen`, then `scpm pipeline`.
 - `scpm update [selector]` — re-resolve within the declared ranges.
 - `scpm outdated` — list newer versions.
 - `scpm why <coord>` — explain why a coordinate is on the classpath.
@@ -492,26 +607,31 @@ The risk is that ranges in **published** POMs are bad for Maven consumers: they 
 1. **Manifest syntax:**
    - exact: `1.2.3`, the default; `scpm add` writes exact versions unless `--save-range` is given
    - `^1.2.3`, `~1.2.3`, `>=1.2 <2`
-   - `catalog:`, `workspace:*` / `workspace:^`
-   - Maven intervals `[1.0,2.0)` pass through as-is
-2. **Translation uses Scala's early-semver rules:**
-   - `^1.2.3` → `[1.2.3, 2.0.0)`
-   - `^0.14.10` → `[0.14.10, 0.15.0)`
-   - `~1.2.3` → `[1.2.3, 1.3.0)`
-   - Pre-releases are excluded unless the spec contains one, fixing Maven's MNG-3092 behaviour.
-3. **Only direct dependencies get ranges.** Transitive versions follow coursier's normal reconciliation. Ranges *inside* third-party POMs are honoured, because coursier does, and then pinned by the lock.
-4. **Ranges are resolved at lock time and never re-resolved implicitly.**
-5. **Publishing rewrites every spec to a concrete version.** The default is the **locked** version, which is what was actually tested, so Maven consumers see an ordinary POM. Option: publish the range's lower bound instead.
-6. **Conflict policy:** after resolution, check every eviction against the evicted library's `info.versionScheme` (early-semver, pvp, semver-spec, strict, always), as sbt does. Fail with a readable diff that suggests an override.
+   - `catalog:`, `workspace:*` (publishing always writes concrete versions, so there is no `workspace:^` or `workspace:~`)
+2. **Bounds use Scala's early-semver rules**, or the dependency's `info.versionScheme` when it declares one:
+   - `^1.2.3` → `>=1.2.3 <2.0.0`
+   - `^0.14.10` → `>=0.14.10 <0.15.0`
+   - `~1.2.3` → `>=1.2.3 <1.3.0`
+3. **scpm selects the version itself and hands coursier an exact one.** For each range it:
+   1. lists the available versions (coursier's version listing, or `maven-metadata.xml` per repository);
+   2. drops pre-releases unless the spec names one;
+   3. drops versions younger than `minimumReleaseAge` (§5.6);
+   4. keeps those within the bounds and picks the highest.
+
+   Ranges are **not** passed to coursier as Maven intervals: in Maven ordering `2.0.0-RC1 < 2.0.0`, so `[1.2.3,2.0.0)` would admit `2.0.0` pre-releases (MNG-3092). A catalog range is selected once per (platform, Scala binary version) for the whole workspace (§5.4).
+4. **Only direct dependencies get ranges.** Transitive versions follow coursier's normal reconciliation. Ranges *inside* third-party POMs are honoured, because coursier does, and then pinned by the lock. A transitive version that violates `minimumReleaseAge` is an error naming the dependency path; fix it with an `overrides` pin or an exclusion.
+5. **Ranges are resolved at lock time and never re-resolved implicitly.**
+6. **Publishing rewrites every spec to a concrete version.** The default is the **locked** version, which is what was actually tested, so Maven consumers see an ordinary POM. Option: publish the range's lower bound instead.
+7. **Conflict policy:** after resolution, check every eviction against the evicted library's `info.versionScheme` (early-semver, pvp, semver-spec, strict, always), as sbt does. Fail with a readable diff that suggests an override.
 
 Prior art: Gradle (dynamic versions + `gradle.lockfile`) is the only mainstream JVM tool with both ranges and locking. Bazel's `rules_jvm_external` locks via coursier's JSON report.
 
 ### 5.6 Supply-chain policy (cheap wins borrowed from pnpm 11 / aube)
 
 - **sha256 in the lock**, verified on every fetch. Central reliably serves `.sha1` and `.md5` but not always `.sha256`, so we compute sha256 at lock time.
-- **`minimumReleaseAge`.** Refuse to lock a version published less than N ago. Use the POM's `Last-Modified` header (one HEAD request, only for *new* versions at lock time), the Central search API timestamp, or Artifactory's `createdAt` (§5.7). Overrides for security fixes are below.
+- **`minimumReleaseAge`.** Refuse to lock a version published less than N ago: ranges skip young versions, and a young transitive version is an error (§5.5). Use the POM's `Last-Modified` header (one HEAD request, only for *new* versions at lock time), the Central search API timestamp, or Artifactory's `createdAt` (§5.7). Overrides for security fixes are below.
 - **`trustPolicy: no-downgrade`** for PGP or Sigstore signatures (later).
-- **Vulnerability audit.** `scpm audit` checks every locked artifact in one `POST https://api.osv.dev/v1/querybatch`. OSV covers Maven, including GHSA data; Scala artifacts are queried by their suffixed artifactId, e.g. `cats-core_3`.
+- **Vulnerability audit.** `scpm audit` checks every locked artifact in one `POST https://api.osv.dev/v1/querybatch`. OSV covers Maven, including GHSA data. OSV's Maven package names are `groupId:artifactId`, so Scala artifacts are queried with the suffixed artifactId, e.g. `org.typelevel:cats-core_3`.
 
 #### Overriding the release-age gate for CVE fixes
 
@@ -545,6 +665,8 @@ The trust anchor is the advisory database's "fixed in" data (curated GHSA/OSV), 
 - **Compile-time code execution.** Macros and compiler plugins run arbitrary code at compile time, so an `allowBuilds` analogue can't be enforced the way npm's lifecycle scripts can. At minimum, report which deps contribute compiler plugins or annotation processors.
 
 ### 5.7 Enterprise repositories (optional fast paths)
+
+**Credentials.** A repository's `credentials` is either `env:VAR` (sent as a bearer token) or `{user: env:U, password: env:P}` (basic auth). Phase 1's Rust fetcher reads those, plus coursier's `COURSIER_CREDENTIALS` / `credentials.properties` for matching hosts.
 
 Correctness always comes from coursier. These only speed up `outdated`, version listing and checksums:
 
@@ -632,16 +754,28 @@ The manifest format already helps: every dependency is one `coord: version` line
 
 There is no maintained native-image `scalac` (the only one we found was a 2018 Scala 2.12 experiment).
 
+**Caveat on the AOT rows.** The JDK AOT cache covers only classes loaded by the built-in class loaders from a class path matching the training run. These numbers ran scalac directly on the application class path. Zinc loads scalac through a per-Scala-version `ScalaInstance` class loader, so the gain may not carry over; the Phase 0 spike must measure through Zinc.
+
 ### 6.2 Conclusion
 
-- **A warm JVM matters for interactive dev.** A 3–5× difference in compile time is the difference between a fast edit-compile loop and a slow one. There is no way around JIT warmup today: the AOT cache halves *startup*, but warm code still needs profiling. JEP 544 (AOT code compilation, JDK 28 EA) and CRaC (Linux) may change this later.
+- **A warm JVM matters for interactive dev.** A 3.4–5× difference in compile time is the difference between a fast edit-compile loop and a slow one. There is no way around JIT warmup today: the AOT cache halves *startup*, but warm code still needs profiling. JEP 544 (AOT code compilation, JDK 28 EA) and CRaC (Linux) may change this later.
 - **A daemon does *not* matter for CI, as long as one job uses one JVM.** What kills CI is a JVM per module (sbt forks, Maven reactor plugins) or `sbt` boot plus project loading. A foreground worker that lives for the whole `scpm pipeline` invocation pays warmup once per job.
 - **The largest CI win is not compiling at all**: remote cache plus affected-only selection, as bleep's 22 min → 16 s result shows. Then come the AOT cache, the warm coursier cache, and the cached JDK.
 
 ### 6.3 Design
 
+**Two JDKs:**
+
+| | Worker JDK | Project JDK |
+|---|---|---|
+| Chosen by | scpm (25+), pinned per scpm release | `toolchain.jdk` in the workspace |
+| Runs | `scpmd`: Zinc, scalafmt, scalafix, linkers | tests and `run` (forked JVMs) |
+| Also | The AOT cache applies here | Java release target: scalac `-release` / `-java-output-version`, javac `--release`; a module's `release:` overrides the default (its major version) |
+
+scpm picks a worker JDK at least as new as the project JDK, so any release target can be compiled.
+
 **Locally:**
-- One shared `scpmd` per `(scpm version, JDK)` per user. It serves every workspace and worktree.
+- One shared `scpmd` per `(scpm version, worker JDK)` per user. It serves every workspace and worktree.
 - It listens on a unix socket in `~/.cache/scpm/daemons/`.
 - It shuts down after 1 h idle, with a heap cap and ZGC (bleep's defaults).
 - `scpm daemon ls|top|stop|logs` with OOM reporting, so stale daemons don't pile up.
@@ -653,7 +787,7 @@ There is no maintained native-image `scalac` (the only one we found was a 2018 S
 - It is started **only if** at least one compile task misses the cache.
 
 **AOT cache:**
-- Generated on first run per `(JDK, scpm version, Scala version)` and stored in `~/.cache/scpm/aot/`.
+- Generated on first run per `(worker JDK, scpm version, Scala version)` and stored in `~/.cache/scpm/aot/`.
 - The `setup-scpm` action caches it.
 - We could also pre-build AOT caches per release for the common JDK/Scala pairs **[needs validation that the AOT cache is portable across machines with the same JDK build]**.
 
@@ -684,8 +818,8 @@ Inspired by aube's and pnpm's global virtual store. In the JVM world most of it 
 | Resource | Sharing across worktrees |
 |---|---|
 | Dependency jars | Coursier cache (already global). |
-| JDK, compiler, tools | Coursier / `cs java` cache. |
-| Compile daemon | One per `(scpm, JDK)` per user; workspaces are keyed by absolute path. |
+| JDKs, compiler, tools | Coursier / `cs java` cache. |
+| Compile daemon | One per `(scpm, worker JDK)` per user; workspaces are keyed by absolute path. |
 | Build outputs + Zinc analysis | **Per worktree** (`.scpm/out/`), but **seeded** on creation (below). |
 | Task-result cache | Global local cache at `~/.cache/scpm/tasks`, keyed by content hash, so a hit in one worktree is a hit in all. |
 
@@ -713,7 +847,7 @@ We copy pnpm 12's semantics almost verbatim, so the docs can say "same as pnpm".
 - `concurrencyGroup` limits apply machine-wide across processes, e.g. to limit concurrent test JVMs.
 - `--dry-run --json` prints the graph; `--resume-from <module>` reruns a failed run.
 
-**Built-in tasks** are implemented natively rather than as shell commands:
+**Built-in tasks** are implemented natively rather than as shell commands, and need no `run:`. A custom task that wants a built-in with arguments writes `run: builtin:<name> <args>`:
 - `compile`, `test`, `run`, `console`
 - `fmt`, `fmt:check`, `lint` (scalafix)
 - `package` (jar, assembly), `link` (Scala.js / Native)
@@ -721,7 +855,7 @@ We copy pnpm 12's semantics almost verbatim, so the docs can say "same as pnpm".
 
 **Custom tasks** are either:
 - shell commands (`run:`), or
-- **script modules**: an ordinary module whose `main` is run with its classpath. This is bleep-style scripting without compiling the build definition.
+- **script modules**: an ordinary module whose `mainClass` is run with its classpath (`run: scpm run codegen -- …`). This is bleep-style scripting without compiling the build definition.
 
 **Filtering** uses pnpm's selector syntax:
 - `-F core...` — core and its dependencies
@@ -729,10 +863,10 @@ We copy pnpm 12's semantics almost verbatim, so the docs can say "same as pnpm".
 - `-F '[origin/main]'` — modules changed since the merge base
 - `-F ./modules/**` — by path
 - `!` excludes
-- Variant-aware: `core@jvm-3`.
+- Variant-aware: `core@jvm-3`, `core@jvm-*`; a bare `core` selects every variant.
 
-**`scpm pipeline`** (the CI entry point):
-1. Frozen install.
+**`scpm pipeline`** (the CI entry point; `scpm ci` = `scpm install --frozen`, then `scpm pipeline`):
+1. Install: auto-install locally, an error on a stale lock in CI (§5.4).
 2. Affected modules plus dependents, since `pipelineBase`. A module also counts as changed when one of its catalog entries changes.
 3. Restore from cache.
 4. Run the graph, continuing past failures so every error is reported in one run.
@@ -745,7 +879,7 @@ We copy pnpm 12's semantics almost verbatim, so the docs can say "same as pnpm".
   - inputs (git blob OIDs of tracked files, plus hashes of untracked non-ignored files)
   - the task definition
   - upstream task keys
-  - the lock entries for that module
+  - the variant's lock entry
   - toolchain IDs
   - declared env vars
 - On a hit we restore outputs and **replay the event log**, so annotations still appear on a cached run.
@@ -803,7 +937,7 @@ Agents are a primary user, so the MCP server is a first-class front-end next to 
 
 - **Token-frugal by default.** A green compile returns about one line (bleep reports 25 tokens, versus 31k for `mvn test`). Failures return structured diagnostics, capped and ranked like the GitHub reporter, with a `more` cursor to page through the rest.
 - **Long operations stream progress.** They return a run ID that can be polled or cancelled, so an agent is never blocked waiting on a 3-minute test run.
-- **Uses the shared daemon.** The MCP server is a Rust process. It reuses the warm `scpmd`, so it starts nothing heavy and serves every worktree an agent opens.
+- **Uses the shared daemon.** The MCP server is a Rust process. From Phase 2 it reuses the warm `scpmd`, so it starts nothing heavy and serves every worktree an agent opens. In Phase 1, before the daemon exists, `scpm mcp` owns a foreground worker for its lifetime.
 - **Edits go through the same code paths as the CLI.** `add_dependency` edits the YAML (preserving comments) and updates the lock, exactly like `scpm add`.
 - **Tools are scoped to the workspace root it was started in.** It never touches paths outside that root.
 
@@ -875,7 +1009,7 @@ So the downgrade is mostly **server quality plus IntelliJ's weaker BSP sync UX**
    - Gets IntelliJ's native JPS build and runners today, with no plugin.
    - Costs: re-run on config changes (the CLI can do that automatically after `install`); IDE and CLI compile separately into different output dirs; generated sources must be produced first.
    - Mill's docs call GenIdea "probably the preferred way" for polyglot or unusual projects.
-3. **A native IntelliJ ExternalSystem plugin (Phase 4–5).** This is what Gradle, Maven and sbt (via sbt-structure) do, and the real "native" experience: IntelliJ owns the project model and sync, with a choice of JPS or scpm builds.
+3. **A native IntelliJ ExternalSystem plugin (Phase 5).** This is what Gradle, Maven and sbt (via sbt-structure) do, and the real "native" experience: IntelliJ owns the project model and sync, with a choice of JPS or scpm builds.
    - **Much cheaper for us than for sbt.** sbt's importer has to run sbt plus a plugin to extract the structure. Ours just runs `scpm config --resolved --json` (the same model `mbt.json` comes from) and watches the YAML files, so sync is instant and automatic.
    - **This is a concrete differentiator.** bleep's IntelliJ plugin is only a BSP launcher and wrapper, not a native importer.
    - The cost is maintaining a Kotlin plugin against IntelliJ API churn. Start it once the config model has stabilised.
@@ -892,7 +1026,7 @@ Copied from pnpm 11.11+ with JVM-specific checks added:
 
 - **`scpm change`** writes changesets-format intent files to `.changes/*.md`.
 - **`scpm change check`** runs on every PR. Beyond pnpm, it **validates the declared bump against reality**:
-  - runs MiMa (Scala 2 bytecode) or tasty-mima (Scala 3 TASTy) against the last published version;
+  - runs MiMa on every Scala and Java module (bytecode compatibility), plus tasty-mima for Scala 3 modules (TASTy compatibility), against the last published version;
   - a binary-breaking change declared as a patch or minor fails;
   - this is checked against the module's `versionScheme`, which is also written to the POM as `info.versionScheme`.
 - **`scpm version -r`**:
@@ -934,7 +1068,7 @@ Yes. That's the recommended architecture, with the daemon kept deliberately narr
 Only as an orchestrator. Compilation has to happen in a JVM (no native scalac), so it's a Rust orchestrator plus JVM workers.
 
 **Is a daemon needed, or can Zinc start fast enough?**
-- Locally: a daemon is needed. Cold is 3–5× slower even with an AOT cache.
+- Locally: a daemon is needed. Cold is 3.4–5× slower than warm, and still ≈2–2.4× with an AOT cache (§6.1).
 - In CI: no detached daemon. Use one foreground worker per job, an AOT cache, and above all the remote cache.
 
 **How much can coursier do; where are its limits?**
@@ -963,7 +1097,7 @@ Yes, if ranges stay in our manifests and lockfile and never reach published POMs
 
    Chose **scpm**. Before anything is public, still to do: check trademarks, and claim the crates.io, npm and GitHub org names and the `scpm.dev` domain used in the schema URL.
 2. **bleep overlap.** Decide deliberately whether to compete, collaborate or fork (§2). At the very least, read bleep's compile-server and portable-analysis code before writing ours.
-3. **JDK management** is part of "fast CI". Pin the JDK in the lock and fetch it via coursier's JVM index from Rust, so `actions/setup-java` isn't needed.
+3. **JDK management** is part of "fast CI". Pin the project JDK in the lock (`boot.jdk`), so `actions/setup-java` isn't needed. Phase 1 obtains it with `cs java-home --jvm <id>` (native, cached); a Rust fetcher reading coursier's JVM index replaces that in Phase 3.
 4. **Test running** is its own subsystem:
    - sbt `test-interface` for munit, ScalaTest, weaver and ZIO Test, in forked JVMs;
    - structured per-test events;
@@ -981,7 +1115,7 @@ Yes, if ranges stay in our manifests and lockfile and never reach published POMs
 8. **Scala.js and Scala Native linking.** These are long-running, memory-hungry tasks that belong in the worker too, with incremental linker state cached like Zinc analysis.
 9. **Dependency update automation.** This is the first thing people automate. See §5.8 for the Renovate preset, lock fix-up action, and first-party `scpm upgrade` bot.
 10. **Windows.** Unix sockets exist on Windows 10+, `fcntl` locking does not (coursier uses `LockFileEx` via the JDK there), and copy-on-write clones are only possible on ReFS. Decide early whether Windows is tier 1.
-11. **Tool version pinning and self-bootstrap.** `scpm: 0.4.2` in the workspace file means any `scpm` binary re-execs the pinned version (bleep does this; so do pnpm's `packageManager` field and Corepack). Distribute via mise, Homebrew, `curl | sh`, a GitHub Action, and `cs install`.
+11. **Tool version pinning and self-bootstrap (Phase 3).** `scpm: 0.4.2` in the workspace file means any `scpm` binary re-execs the pinned version (bleep does this; so do pnpm's `packageManager` field and Corepack). Distribute via mise, Homebrew, `curl | sh`, a GitHub Action, and `cs install`.
 12. **Telemetry.** None by default. Write local timing data to the event log instead. `scpm report --since 7d` gives people the performance insight without phoning home.
 13. **Hermeticity limits.** Macros, annotation processors and `sourceGenerators` can read the filesystem and network. The cache key can't see that, so provide `inputs`/`env` declarations and an `--no-cache` escape hatch, and say so plainly in the docs.
 
@@ -993,7 +1127,8 @@ Yes, if ranges stay in our manifests and lockfile and never reach published POMs
 |---|---|
 | Scope: this is pnpm + sbt + changesets + turbo. | Strict phasing (see [roadmap](roadmap.md)): each phase must be useful on its own. Phase 1 alone (lockfile, catalogs, fast compile, GitHub annotations) is already better than the status quo. |
 | bleep closes the gap first. | Differentiate on the package-manager half (lock, ranges, catalogs, releases); consider collaborating. |
-| Writing to the coursier cache from Rust corrupts it. | Read-only from Rust at first, with `cs fetch --intransitive` doing writes. Add Rust writes only after a lock-compatibility test suite. |
-| Daemons accumulate memory (bleep's experience). | Idle timeout, heap governor, `scpm daemon top`, and one daemon per JDK rather than per workspace. |
+| Writing to the coursier cache from Rust corrupts it. | The Phase 1 fetcher ships behind a compatibility suite that runs `cs` and Rust concurrently on one cache (locks, `.part` files, checksum sidecars). |
+| Daemons accumulate memory (bleep's experience). | Idle timeout, heap governor, `scpm daemon top`, and one daemon per worker JDK rather than per workspace. |
 | Zinc portable analysis has edge cases (Zinc 2.1 just fixed several). | Fall back to a full compile on analysis mismatch, and report it as an event so it's visible. |
 | Ranges confuse users coming from Maven/sbt. | Exact versions by default; ranges opt-in per dependency. |
+| Comment-preserving YAML round-trip editing is weak in Rust; it affects `scpm add` and the MCP edit tools. | Edit by span: parse with positions, splice the minimal text change into the original, re-parse to check. Refuse with a diff rather than reformat the file. |
