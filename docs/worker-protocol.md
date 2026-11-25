@@ -77,7 +77,8 @@ belong to. Unknown fields must be ignored by both sides (forward compatibility).
 | `rootPaths` | object? | Portable-analysis markers, e.g. `{"WS": "/abs/ws", "CACHE": "/abs/coursier/cache"}`. When present, analysis is written with paths relative to these roots (`${WS}/src/A.scala`); paths under no root stay absolute. Events always carry absolute paths. |
 | `upstreamAnalyses` | object[]? | `[{"classesDir": "/abs/core/classes", "analysisFile": "/abs/core/analysis.zip"}]`: one entry per workspace module whose classes dir is on `classpath`. `analysisFile` may not exist yet. The worker gives Zinc these analyses (as sbt does between projects), so an API change or a removed class upstream invalidates the sources that use it. Upstream must be compiled before its dependents, so its analysis matches its classes dir; an analysis whose classes dir or any recorded class file is missing is ignored. Without an entry, a classes dir is treated like a jar: its class files are compared by name, size and modification time. |
 
-All paths must be absolute. The request is checked before it is queued: a missing compiler,
+Fields without `?` are required, lists included (`"sources": []` is allowed; an omitted
+`sources` is not). All paths must be absolute. The request is checked before it is queued: a missing compiler,
 library or bridge jar, a missing source, a relative path, or a source inside `classesDir` (after
 resolving `.`, `..` and symbolic links) is a `bad_request` naming the field and path.
 
@@ -141,7 +142,8 @@ plus a `message` string when the run was abandoned (`crashed`).
 and `pending`. The process exits 0 once the response is written and 2 if the request is
 malformed (after an error response). A framework named in `frameworks` that is not on the
 classpath is a `bad_request` ("framework X is not on the classpath"). `filters` that match no
-suite give an `ok` result with zero counts and a `warn` log event.
+suite give an `ok` result with zero counts and a `warn` log event, as do a run that finds no
+framework on the classpath and one that finds no suites in `testClassesDirs`.
 
 If a test ends the JVM (`System.exit`), the runner still emits `test.suite.end` for the running
 suite, an `error` log naming it, and a `crashed` result with the counts so far and the message
@@ -186,7 +188,8 @@ Notes:
   in-process and forked javac; `rendered` is the compiler's own output and may contain ANSI
   colours.
 - A range's `end` is exclusive. When the compiler reports only a caret (javac), the range covers
-  that one character; when it reports only a line, the range is the start of that line.
+  that one character; when it reports only a line, the range is the start of that line. An
+  action edit at a caret is a zero-width range instead: it inserts there.
 - A test failure's `file` is the source path relative to its source root (package directory plus
   the file name recorded in the class file) because bytecode does not record absolute paths. It
   is `null` when no stack frame points into the suite. The CLI resolves it against the target's

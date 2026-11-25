@@ -81,7 +81,9 @@ final case class CompileParams(
 /** An upstream module on the classpath: its classes directory and analysis file (may not exist yet). */
 final case class UpstreamAnalysis(classesDir: String, analysisFile: String)
 object CompileParams:
-  given JsonValueCodec[CompileParams] = JsonCodecMaker.make
+  // A list without a default (`sources`, the toolchain classpaths) must be present; `[]` is fine.
+  // Otherwise an omitted `sources` would compile nothing and delete every class file.
+  given JsonValueCodec[CompileParams] = JsonCodecMaker.make(CodecMakerConfig.withTransientEmpty(false).withRequireCollectionFields(true))
 
 enum CompileStatus:
   @named("ok") case Ok

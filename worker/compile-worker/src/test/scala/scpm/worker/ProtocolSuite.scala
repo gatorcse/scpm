@@ -20,6 +20,15 @@ class ProtocolSuite extends munit.FunSuite:
     assertEquals(params.rootPaths, Map.empty)
   }
 
+  test("compile params require sources, but accept an empty list") {
+    val base =
+      """"target":"t","scalaVersion":"3.9.0","scalaCompilerClasspath":["c.jar"],
+        |"scalaLibraryClasspath":["l.jar"],"compilerBridge":"b.jar","classesDir":"/out","analysisFile":"/out.zip"""".stripMargin
+    intercept[JsonReaderException](readFromString[CompileParams](s"{$base}"))
+    val empty = readFromString[CompileParams](s"""{$base,"sources":[]}""")
+    assertEquals(empty.sources, Nil)
+  }
+
   test("compile results write the status as a string and omit an absent message") {
     val json = writeToString(CompileResult(CompileStatus.Cancelled, 12, 0, noop = false))
     assertEquals(json, """{"status":"cancelled","durationMs":12,"compiledSources":0,"noop":false}""")

@@ -48,7 +48,7 @@ final class ZincCompiler extends CompileService:
       CompileResult(status, (System.nanoTime() - startNanos).nanos.toMillis, compiled, noop, message)
 
     val analysisFile = Path.of(params.analysisFile)
-    val lock = targetLocks.computeIfAbsent(analysisFile, _ => ReentrantLock())
+    val lock = targetLocks.computeIfAbsent(Validation.canonical(analysisFile), _ => ReentrantLock())
     if !ZincCompiler.lockUnlessCancelled(lock, cancelled) then result(CompileStatus.Cancelled)
     else
       lazy val toolchain = Toolchain.of(params)
@@ -111,7 +111,8 @@ final class ZincCompiler extends CompileService:
     val previous = analyses.read(analysisFile)
     // Without an analysis nothing knows which class files are stale, so start from an empty
     // directory. The old one is moved aside, not deleted, until the run is known to be kept.
-    val setAside = Option.when(previous.isEmpty && Files.exists(classesDir, LinkOption.NOFOLLOW_LINKS))(ZincCompiler.setAside(classesDir))
+    val outputDir = ZincCompiler.movable(classesDir)
+    val setAside = Option.when(previous.isEmpty && Files.exists(outputDir, LinkOption.NOFOLLOW_LINKS))(ZincCompiler.setAside(outputDir))
     var kept = false
     try
       Files.createDirectories(classesDir)
@@ -170,7 +171,7 @@ final class ZincCompiler extends CompileService:
         kept = classFiles.kept.getOrElse(!cancelled.get)
         (zincResult, kept)
       finally IO.delete(backup.toFile)
-    finally setAside.foreach(old => if kept then IO.delete(old.toFile) else ZincCompiler.restore(old, classesDir))
+    finally setAside.foreach(old => if kept then IO.delete(old.getParent.toFile) else ZincCompiler.restore(old, outputDir))
   end run
 
 object ZincCompiler:
@@ -183,6 +184,16 @@ object ZincCompiler:
       if !proceed then lock.unlock()
       proceed
     else lockUnlessCancelled(lock, cancelled)
+
+  /**
+   * `dir` without a trailing `.` or `..`, which have no parent or name to move by. `x/.` is `x`
+   * itself (a link stays a link); `x/..` is resolved on disk.
+   */
+  private def movable(dir: Path): Path =
+    Option(dir.getFileName).map(_.toString) match
+      case Some(".")  => movable(dir.getParent)
+      case Some("..") => if Files.exists(dir) then dir.toRealPath() else dir.normalize
+      case _          => dir
 
   /**
    * Moves `dir` into a new sibling directory (a rename on the same volume, so it either happens

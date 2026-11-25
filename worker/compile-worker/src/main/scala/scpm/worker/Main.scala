@@ -105,8 +105,8 @@ final class Server(out: Output, compiler: CompileService, exit: Int => Unit):
         e.printStackTrace()
         out.result(id, CompileResult(CompileStatus.Crashed, elapsedMs(start), 0, noop = false, Some(e.toString)))
       case e: VirtualMachineError =>
-        out.result(id, CompileResult(CompileStatus.Crashed, elapsedMs(start), 0, noop = false, Some(e.toString)))
-        exit(3)
+        try out.result(id, CompileResult(CompileStatus.Crashed, elapsedMs(start), 0, noop = false, Some(e.toString)))
+        finally exit(3)
       case e: Throwable =>
         e.printStackTrace()
         out.error(Some(id), "internal", e.toString)

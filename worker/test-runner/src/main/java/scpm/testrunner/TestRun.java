@@ -106,8 +106,15 @@ final class TestRun {
       }
       if (!taskDefs.isEmpty()) runFramework(framework, taskDefs);
     }
-    if (claimed.isEmpty() && !params.filters().isEmpty()) {
+    if (frameworks.isEmpty()) {
+      out.log("warn", "no test framework found on the classpath");
+    } else if (claimed.isEmpty() && !params.filters().isEmpty()) {
       out.log("warn", "no test suites match the filters " + String.join(", ", params.filters()));
+    } else if (claimed.isEmpty()) {
+      out.log(
+          "warn",
+          "no test suites found in " + String.join(", ", params.testClassesDirs())
+              + " (is each directory on the runner's classpath?)");
     }
     return result(crashed ? "crashed" : failed > 0 ? "failed" : "ok");
   }

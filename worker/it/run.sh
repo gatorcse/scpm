@@ -124,11 +124,14 @@ await() {
 # await_progress ID -> waits for the first compile.progress event of request ID
 await_progress() {
   local deadline=$((SECONDS + 300))
-  until jq -e --argjson id "$1" 'select(.params.requestId == $id and .params.t == "compile.progress")' \
-    "$WORK/worker.out" >/dev/null 2>&1; do
-    if jq -e --argjson id "$1" 'select(.id == $id)' "$WORK/worker.out" >/dev/null 2>&1; then
-      echo "request $1 was answered before any progress: $(await "$1")" >&2; exit 1
-    fi
+  local state
+  while :; do
+    # One read of the output, so progress written just before the response is never missed.
+    state="$(jq -rs --argjson id "$1" '
+      if any(.[]; .params.requestId? == $id and .params.t? == "compile.progress") then "progress"
+      elif any(.[]; .id? == $id) then "answered" else "waiting" end' "$WORK/worker.out" 2>/dev/null || echo waiting)"
+    [ "$state" != progress ] || return 0
+    [ "$state" != answered ] || { echo "request $1 was answered before any progress: $(await "$1")" >&2; exit 1; }
     kill -0 "$WORKER_PID" 2>/dev/null || { echo "worker exited; stderr:" >&2; cat "$WORK/worker.err" >&2; exit 1; }
     [ "$SECONDS" -lt "$deadline" ] || { echo "timed out waiting for progress of request $1" >&2; exit 1; }
     sleep 0.05
@@ -226,6 +229,10 @@ cp -Rp "$S3" "$MOVED"
 compile core@jvm-3 "$SCALA3" "$MOVED"
 expect "analysis is portable: same project in another directory is a no-op" "$R" \
   '.result.status == "ok" and .result.noop == true'
+rm "$MOVED/out/analysis.zip"
+send compile "$(compile_params core@jvm-3 "$SCALA3" "$MOVED" "" "{\"classesDir\": \"$MOVED/out/classes/.\"}")"
+expect "a full compile into an existing classesDir spelled with a trailing /. succeeds" "$(await "$ID")" \
+  '.result.status == "ok" and .result.compiledSources == 2'
 
 # --- Scala 2.13 with Java -----------------------------------------------------------------
 

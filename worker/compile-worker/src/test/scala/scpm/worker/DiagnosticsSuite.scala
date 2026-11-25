@@ -40,6 +40,14 @@ class DiagnosticsSuite extends munit.FunSuite:
     assertEquals(Diagnostics.range(position(caretLine = some(3))), Some(Range(Pos(3, 1), Pos(3, 1))))
   }
 
+  test("an edit at a caret is a zero-width insertion; an edit with a range keeps it") {
+    assertEquals(Diagnostics.editRange(position(caretLine = some(3), caretColumn = some(4))), Some(Range(Pos(3, 5), Pos(3, 5))))
+    assertEquals(
+      Diagnostics.editRange(position(start = Some((4, 24)), end = Some((4, 26)))),
+      Some(Range(Pos(4, 25), Pos(4, 27)))
+    )
+  }
+
   test("global diagnostics have no range") {
     assertEquals(Diagnostics.range(position()), None)
   }

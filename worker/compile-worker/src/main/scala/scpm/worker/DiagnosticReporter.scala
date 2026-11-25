@@ -44,7 +44,7 @@ object Diagnostics:
         Action(
           a.title,
           a.edit.changes.asScala.toList.map { e =>
-            TextEdit(e.position.sourcePath.toScala.map(resolvePath), range(e.position), e.newText)
+            TextEdit(e.position.sourcePath.toScala.map(resolvePath), editRange(e.position), e.newText)
           }
         )
       }
@@ -69,6 +69,15 @@ object Diagnostics:
         int(pos.pointer).fold(Range(Pos(line, 1), Pos(line, 1)))(col => Range(Pos(line, col + 1), Pos(line, col + 2)))
       }
     exact.orElse(caret)
+
+  /**
+   * Like [[range]], except that a caret is a zero-width range: an edit at a point (Scala 2's
+   * procedure-syntax fix) inserts there instead of replacing the character after it.
+   */
+  def editRange(pos: Position): Option[Range] =
+    range(pos).map { r =>
+      if pos.startLine.isPresent && pos.endLine.isPresent then r else r.copy(end = r.start)
+    }
 
   private val AnsiEscape = "\u001b\\[[0-9;]*m".r
   private val SeverityPrefix = "^\\s*(error|warning):\\s*".r
