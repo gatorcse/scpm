@@ -16,24 +16,29 @@ const MATRIX_KEYS: [&str; 2] = ["scala", "platforms"];
 
 /// Merges a module-shaped `overlay` on top of `base` in place.
 pub fn merge_module(base: &mut Value, overlay: Value) {
-    let (Value::Mapping(base_map), Value::Mapping(overlay_map)) = (&mut *base, &overlay) else {
-        merge(base, overlay);
-        return;
-    };
-    for (key, value) in overlay_map.clone() {
-        let is_matrix = key.as_str().is_some_and(|k| MATRIX_KEYS.contains(&k));
-        match base_map.get_mut(&key) {
-            Some(existing) if !is_matrix => merge(existing, value),
-            _ => {
-                base_map.insert(key, strip_replace_tags(value));
+    match (base, overlay) {
+        (Value::Mapping(base_map), Value::Mapping(overlay_map)) => {
+            for (key, value) in overlay_map {
+                if value.is_null() {
+                    continue;
+                }
+                let is_matrix = key.as_str().is_some_and(|k| MATRIX_KEYS.contains(&k));
+                match base_map.get_mut(&key) {
+                    Some(existing) if !is_matrix => merge(existing, value),
+                    _ => {
+                        base_map.insert(key, strip_replace_tags(value));
+                    }
+                }
             }
         }
+        (base, overlay) => merge(base, overlay),
     }
 }
 
-/// Merges `overlay` on top of `base` in place.
+/// Merges `overlay` on top of `base` in place. A null overlay (an empty `key:`) changes nothing.
 pub fn merge(base: &mut Value, overlay: Value) {
     match (base, overlay) {
+        (_, Value::Null) => {}
         (base, Value::Tagged(tagged)) if tagged.tag == REPLACE_TAG => {
             *base = strip_replace_tags(tagged.value);
         }
@@ -41,6 +46,7 @@ pub fn merge(base: &mut Value, overlay: Value) {
             for (key, value) in overlay_map {
                 match base_map.get_mut(&key) {
                     Some(existing) => merge(existing, value),
+                    None if value.is_null() => {}
                     None => {
                         base_map.insert(key, strip_replace_tags(value));
                     }
@@ -51,6 +57,46 @@ pub fn merge(base: &mut Value, overlay: Value) {
             base_seq.extend(overlay_seq.into_iter().map(strip_replace_tags));
         }
         (base, overlay) => *base = strip_replace_tags(overlay),
+    }
+}
+
+/// Whether `value` contains a `!replace` tag anywhere.
+pub fn has_replace_tags(value: &Value) -> bool {
+    match value {
+        Value::Tagged(tagged) => tagged.tag == REPLACE_TAG || has_replace_tags(&tagged.value),
+        Value::Mapping(map) => map.values().any(has_replace_tags),
+        Value::Sequence(seq) => seq.iter().any(has_replace_tags),
+        _ => false,
+    }
+}
+
+/// Calls `found(key_path, tag)` for every tag other than `!replace`.
+pub fn unknown_tags(value: &Value, path: &str, found: &mut dyn FnMut(String, String)) {
+    match value {
+        Value::Tagged(tagged) => {
+            if tagged.tag != REPLACE_TAG {
+                found(path.to_string(), tagged.tag.to_string());
+            }
+            unknown_tags(&tagged.value, path, found);
+        }
+        Value::Mapping(map) => {
+            for (k, v) in map {
+                let key = match k {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => "?".to_string(),
+                };
+                let child = if path.is_empty() { key } else { format!("{path}.{key}") };
+                unknown_tags(v, &child, found);
+            }
+        }
+        Value::Sequence(seq) => {
+            for (i, v) in seq.iter().enumerate() {
+                unknown_tags(v, &format!("{path}[{i}]"), found);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -109,5 +155,22 @@ mod tests {
         let mut base = yaml("{scala: ['3.9.0', '2.13.18'], platforms: [jvm, js], opts: [-a]}");
         merge_module(&mut base, yaml("{scala: '3.9.0', platforms: [jvm], opts: [-b]}"));
         assert_eq!(base, yaml("{scala: '3.9.0', platforms: [jvm], opts: [-a, -b]}"));
+    }
+
+    #[test]
+    fn null_overlays_change_nothing() {
+        let mut base = yaml("{deps: {a: '1'}, opts: [-a]}");
+        merge_module(&mut base, yaml("{deps: ~, opts: ~, extra: ~}"));
+        assert_eq!(base, yaml("{deps: {a: '1'}, opts: [-a]}"));
+        merge(&mut base, yaml("{deps: {b: ~}}"));
+        assert_eq!(base, yaml("{deps: {a: '1'}, opts: [-a]}"));
+    }
+
+    #[test]
+    fn finds_unknown_tags() {
+        let mut found = Vec::new();
+        unknown_tags(&yaml("{a: !replace [x], b: {c: [y, !foo z]}}"), "", &mut |k, t| found.push((k, t)));
+        assert_eq!(found, vec![("b.c[1]".to_string(), "!foo".to_string())]);
+        assert!(has_replace_tags(&yaml("{a: {b: !replace x}}")));
     }
 }

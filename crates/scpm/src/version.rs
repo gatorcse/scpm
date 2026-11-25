@@ -1,16 +1,31 @@
 //! Version specifications as written in manifests and catalogs.
 
+use std::borrow::Cow;
 use std::fmt;
 
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// A version string from YAML. Unquoted numbers are rejected: YAML reads `2.10` as the
-/// float `2.1`, which silently changes the version.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
+/// A version string from YAML. Unquoted integers (`release: 17`) are read as strings, but
+/// unquoted floats are rejected: YAML reads `2.10` as the float `2.1`, which silently changes
+/// the version.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Ver(pub String);
+
+impl JsonSchema for Ver {
+    fn schema_name() -> Cow<'static, str> {
+        "Ver".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "description": "A version. Quote versions that contain a dot (`'2.10'`): YAML reads unquoted ones as floats.",
+            "type": ["string", "integer"]
+        })
+    }
+}
 
 impl Ver {
     pub fn as_str(&self) -> &str {
@@ -42,10 +57,10 @@ impl<'de> Deserialize<'de> for Ver {
                 Err(E::custom(format!("versions must be quoted strings: YAML reads this unquoted number as `{v}`")))
             }
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<Ver, E> {
-                Err(E::custom(format!("versions must be quoted strings, e.g. '{v}'")))
+                Ok(Ver(v.to_string()))
             }
             fn visit_i64<E: de::Error>(self, v: i64) -> Result<Ver, E> {
-                Err(E::custom(format!("versions must be quoted strings, e.g. '{v}'")))
+                Ok(Ver(v.to_string()))
             }
         }
         d.deserialize_any(V)
@@ -133,5 +148,11 @@ mod tests {
         assert!(err.contains("must be quoted"), "{err}");
         assert_eq!(serde_yaml_ng::from_str::<Ver>("'2.10'").unwrap(), Ver("2.10".into()));
         assert_eq!(serde_yaml_ng::from_str::<Ver>("3.7.4").unwrap(), Ver("3.7.4".into()));
+    }
+
+    #[test]
+    fn integers_are_versions() {
+        assert_eq!(serde_yaml_ng::from_str::<Ver>("17").unwrap(), Ver("17".into()));
+        assert_eq!(serde_yaml_ng::from_str::<Ver>("'17'").unwrap(), Ver("17".into()));
     }
 }

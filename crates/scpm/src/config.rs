@@ -282,7 +282,7 @@ pub struct ModuleFile {
     pub scalac_options: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub javac_options: Vec<String>,
-    /// Java release target, e.g. `'17'`. Defaults to the project JDK's major version.
+    /// Java release target, e.g. `17`. Defaults to the project JDK's major version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release: Option<Ver>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

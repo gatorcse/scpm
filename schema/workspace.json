@@ -330,7 +330,7 @@
           ]
         },
         "release": {
-          "description": "Java release target, e.g. `'17'`. Defaults to the project JDK's major version.",
+          "description": "Java release target, e.g. `17`. Defaults to the project JDK's major version.",
           "anyOf": [
             {
               "$ref": "#/$defs/Ver"
@@ -674,8 +674,11 @@
       "additionalProperties": false
     },
     "Ver": {
-      "description": "A version string from YAML. Unquoted numbers are rejected: YAML reads `2.10` as the\nfloat `2.1`, which silently changes the version.",
-      "type": "string"
+      "description": "A version. Quote versions that contain a dot (`'2.10'`): YAML reads unquoted ones as floats.",
+      "type": [
+        "string",
+        "integer"
+      ]
     },
     "VersionScheme": {
       "type": "string",

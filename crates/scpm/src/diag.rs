@@ -9,7 +9,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Diagnostic {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_path")]
     pub file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
@@ -66,12 +66,41 @@ impl Diagnostic {
         suggest(diag)
     }
 
+    /// A YAML syntax error (no key path).
+    pub fn from_yaml_syntax(file: &Path, err: serde_yaml_ng::Error) -> Self {
+        let location = err.location();
+        let mut diag = Diagnostic::new(strip_location(&err.to_string())).in_file(file);
+        diag.line = location.as_ref().map(|l| l.line());
+        diag.column = location.as_ref().map(|l| l.column());
+        diag
+    }
+
     /// Same as [`Diagnostic::from_yaml`] for errors without a source position (merged values).
     pub fn from_value_error(file: &Path, err: serde_path_to_error::Error<serde_yaml_ng::Error>) -> Self {
         let mut diag = Diagnostic::from_yaml(file, err);
         diag.line = None;
         diag.column = None;
         diag
+    }
+}
+
+/// A path for output: `/`-separated on every OS.
+pub fn slash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+pub fn ser_path<S: serde::Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&slash_path(path))
+}
+
+pub fn ser_paths<S: serde::Serializer>(paths: &[PathBuf], s: S) -> Result<S::Ok, S::Error> {
+    s.collect_seq(paths.iter().map(|p| slash_path(p)))
+}
+
+pub fn ser_opt_path<S: serde::Serializer>(path: &Option<PathBuf>, s: S) -> Result<S::Ok, S::Error> {
+    match path {
+        Some(p) => ser_path(p, s),
+        None => s.serialize_none(),
     }
 }
 
@@ -120,7 +149,7 @@ pub fn closest<'a>(word: &str, candidates: impl IntoIterator<Item = &'a str>) ->
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(file) = &self.file {
-            write!(f, "{}", file.display())?;
+            f.write_str(&slash_path(file))?;
             if let Some(line) = self.line {
                 write!(f, ":{line}")?;
                 if let Some(col) = self.column {
@@ -152,6 +181,20 @@ impl Diagnostics {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Drops repeated diagnostics (e.g. the same bad dependency in every variant of a
+    /// cross-built module), keeping the first occurrence.
+    pub fn dedup(&mut self) {
+        let mut seen: Vec<Diagnostic> = Vec::with_capacity(self.0.len());
+        self.0.retain(|d| {
+            if seen.contains(d) {
+                false
+            } else {
+                seen.push(d.clone());
+                true
+            }
+        });
     }
 
     /// `Ok(value)` if no diagnostics were collected.
