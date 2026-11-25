@@ -820,15 +820,21 @@ fn module_discovery_needs_a_manifest_file() {
 #[test]
 fn module_discovery_reports_unreadable_directories() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = workspace(&[("scpm-workspace.yaml", WS), ("modules/a/scpm.yaml", "{}\n"), ("modules/b/x", "")]);
+    let dir =
+        workspace(&[("scpm-workspace.yaml", WS), ("modules/a/scpm.yaml", "{}\n"), ("modules/b/c/scpm.yaml", "{}\n")]);
     let locked = dir.path().join("modules/b");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
     // Root can read it anyway; only check when the permission bites.
     if fs::read_dir(&locked).is_err() {
         let err = config_error(dir.path(), &["ls"]);
         assert!(err.contains("cannot search for modules"), "{err}");
-        // An excluded directory's errors don't matter.
+        // `!modules/b` alone leaves `modules/b/c` included, so the error still matters.
         let ws = "toolchain: {scala: '3.9.0'}\nmodules: ['modules/**', '!modules/b']\n";
+        fs::write(dir.path().join("scpm-workspace.yaml"), ws).unwrap();
+        let err = config_error(dir.path(), &["ls"]);
+        assert!(err.contains("cannot search for modules"), "{err}");
+        // A fully excluded subtree's errors don't.
+        let ws = "toolchain: {scala: '3.9.0'}\nmodules: ['modules/**', '!modules/b', '!modules/b/**']\n";
         fs::write(dir.path().join("scpm-workspace.yaml"), ws).unwrap();
         assert_eq!(ls_ids(dir.path(), &[]), vec!["a@jvm-3"]);
     }

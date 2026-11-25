@@ -771,8 +771,11 @@ fn discover_modules(
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) if is_skippable_walk_error(&e) => continue,
-            // Errors inside an excluded directory don't matter.
-            Err(e) if walk_error_path(&e).is_some_and(|p| rel(root, p).ancestors().any(|a| exclude.is_match(a))) => {
+            // Errors inside a fully excluded subtree don't matter.
+            Err(e)
+                if walk_error_path(&e)
+                    .is_some_and(|p| rel(root, p).ancestors().any(|a| fully_excluded(&exclude, a))) =>
+            {
                 continue;
             }
             Err(e) => {
@@ -812,6 +815,21 @@ fn is_skippable_walk_error(err: &ignore::Error) -> bool {
         ignore::Error::Io(e) => e.kind() == std::io::ErrorKind::NotFound,
         _ => false,
     }
+}
+
+/// Whether `dir` and everything beneath it is excluded (`!modules/b` plus `!modules/b/**`).
+/// Exclusions are checked per module directory, so `!modules/b` alone leaves `modules/b/c`
+/// included. Globs can't be compared, so this probes a few levels down; when unsure it says no,
+/// and the walk error is reported.
+fn fully_excluded(exclude: &GlobSet, dir: &Path) -> bool {
+    if dir.as_os_str().is_empty() || !exclude.is_match(dir) {
+        return false;
+    }
+    let mut probe = dir.to_path_buf();
+    (0..3).all(|_| {
+        probe.push("scpm-probe");
+        exclude.is_match(&probe)
+    })
 }
 
 /// The path a walk error is about, if it names one.
