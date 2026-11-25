@@ -38,6 +38,7 @@ Kill the riskiest assumptions with throwaway code before committing to the archi
 
 **Build commands**
 - `scpm compile|test|run` on JVM Scala 3, Scala 2.13 and Java, compiling for the project JDK's release target on the worker JDK (§6.3).
+- Cross-building: Scala 2.13 × 3 variants on the JVM.
 - Rust input fingerprinting and no-op compile detection: a no-op `compile` starts no JVM.
 - The worker runs in the foreground (no daemon yet); tests run in forked JVMs with sbt test-interface.
 
@@ -58,7 +59,7 @@ Kill the riskiest assumptions with throwaway code before committing to the archi
 - `scpm doctor`: environment and config checks (JDKs, cache, credentials, stale daemons, Scala 3 versions below the Metals v2 floor).
 - IDE: `.metals/mbt.json` generation, a narrow BSP server (`scpm bsp`) with solid run/test environments and source jars, and `scpm idea` to generate native IntelliJ project files.
 - `scpm worktree add|prune` with copy-on-write seeding of outputs and analysis.
-- Cross-building: Scala 2.13 × 3 variants, Scala.js and Scala Native linking in the worker.
+- Cross-building to Scala.js and Scala Native: `js` and `native` platforms, linking in the worker.
 - `scpm fmt`, `scpm lint` (scalafmt and scalafix in the warm worker), `scpm console`.
 - Dependency maintenance:
   - `scpm add|remove|update|outdated|dedupe`
