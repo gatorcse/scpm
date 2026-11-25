@@ -396,7 +396,7 @@ Directory-based implicit inheritance (child configs silently picking up parent-d
 - A `variants` entry may contain any module key except `name`, `extends`, `platforms`, `scala` and `variants`.
 - `toolchain.jdk` is workspace-only in v1. A module sets its Java target with `release`.
 
-**Variant ids** are `<module>@<platform>-<scala binary>` (`core@jvm-3`, `core@js-2.13`), or `<module>@jvm` for a Java-only module.
+**Variant ids** are `<module>@<platform>-<scala binary>` (`core@jvm-3`, `core@js-2.13`), or `<module>@jvm` for a Java-only module. A module's `scala` list may therefore hold at most one version per binary version; `[3.8.4, 3.9.0]` is an error.
 
 **Selectors** (keys of `variants`, and the part after `@` in filters) have the form `<platform>`, `<scala>` or `<platform>-<scala>`, where `<platform>` is `jvm`, `js` or `native`, and `<scala>` is a Scala binary version (`3`, `2.13`) or a full version (`3.9.0`, `3.8.0-RC1`, which may itself contain `-`). A variant matches if every given part matches; a selector that matches no variant is an error. In filters, `-F core` matches every variant of `core`, and globs work (`-F 'core@jvm-*'`).
 
@@ -573,7 +573,7 @@ Each variant locks four ordered classpaths:
 | `testCompileClasspath` | `compileClasspath` + `testDependencies` |
 | `testRuntimeClasspath` | `runtimeClasspath` + `providedDependencies` + `testDependencies` |
 
-- **Workspace modules** (`workspace:*`) appear as references (`{ module: util@jvm-3 }`), not artifacts: every upstream variant in the transitive closure, in dependency order, before the external artifacts, which follow coursier's order. Upstream modules contribute their `dependencies` to every list and their `runtimeDependencies` to the runtime lists, never their provided or test dependencies.
+- **Workspace modules** (`workspace:*`) appear as references (`{ module: util@jvm-3 }`), not artifacts: every upstream variant in the transitive closure, in dependency order, before the external artifacts, which follow coursier's order. A direct `workspace:*` reference lands on the lists its declaring scope feeds (table above), so one under `testDependencies` is on the test lists only. From there the closure follows each upstream module's `dependencies` on every list and its `runtimeDependencies` on the runtime lists, never its provided or test dependencies.
 - **Resolution is joint over the variant's transitive workspace closure.** A variant's external dependencies are resolved in one coursier call together with those of every upstream variant, so if A depends on B, A's classpaths hold one version of each library for both A's and B's code.
 - **Catalog ranges are resolved once per (platform, Scala binary version) for the whole workspace**, so every variant that uses that catalog entry on that platform and Scala binary version gets the same version. The selection lives in the lock's top-level `catalogs` section, keyed `<catalog>/<key>@<platform>-<scala binary>`. Re-locking a stale variant reuses an existing selection whose range is unchanged; only `scpm update` re-selects, and it then re-locks every variant that uses the entry.
 - **`specifiers`** records each direct dependency's spec as written and the version scpm selected for it (§5.5), before coursier's reconciliation, like pnpm's importers. `workspace:*` entries have no version.
@@ -645,7 +645,7 @@ Prior art:
 - **scala-steward**: `updates.cooldown.minimumAge` with `skipForVulnerabilityCheck = true` (the default). Updates that fix a known OSV vulnerability skip the cooldown.
 - **aube**: no advisory bypass at all.
 
-scpm combines them: **the bypass is automatic, but it is always written down.**
+scpm follows pnpm: **the bypass is explicit (`scpm audit --fix`) and always written down.** Resolution never calls an advisory database by default. A network lookup inside `install` would make locking depend on OSV's availability and on when an advisory happened to be published, and the lock should depend only on its inputs and the repositories. The scala-steward behaviour (security updates skip the cooldown automatically) lives in the update bot (§5.8), which runs `audit --fix` itself.
 
 ```yaml
 policy:
@@ -655,17 +655,20 @@ policy:
     - coord: com.fasterxml.jackson.core:jackson-databind@2.20.2   # exact version only
       reason: GHSA-xxxx-xxxx-xxxx                   # written by `scpm audit --fix` / the update bot
       expires: 2026-12-24                          # removed by `scpm audit --prune` once the version ages in
-  securityBypass: advisory-fixed                   # default; `off` = exemptions only by hand
+  securityBypass: off                              # default; `advisory-fixed` = also bypass during install (opt-in)
 ```
 
 How it works:
 
+0. `scpm audit` sends every locked artifact to OSV in one `querybatch` request and only reports. When `install` rejects a version for being too young, the error suggests `scpm audit --fix` but doesn't look anything up itself.
 1. `scpm audit --fix` (or the update bot, §5.8) finds the **smallest version that the advisory lists as fixed** for each vulnerable locked artifact.
 2. If the age gate blocks that version, scpm adds an **exact-version** exemption with the advisory ID and an expiry, then updates the lock. The exemption never covers a package glob or a range, so a later malicious release isn't exempted too.
 3. The exemption shows up in the PR diff, where a reviewer sees *why* a 3-hour-old jar is being pulled.
 4. A one-off override for local experiments is `scpm add … --allow-young`. It is never valid with `--frozen`.
 
-The trust anchor is the advisory database's "fixed in" data (curated GHSA/OSV), not the package author's claim. That's what makes an automatic bypass acceptable.
+The trust anchor is the advisory database's "fixed in" data (curated GHSA/OSV), not the package author's claim. That's what makes the bypass acceptable, explicit or automated.
+
+**Opt-in `securityBypass: advisory-fixed`.** For teams that want scala-steward's behaviour during ordinary installs: when the gate would block a version that is being selected, scpm queries OSV for that artifact. Results are cached briefly. If an advisory affecting the current version lists the blocked version as fixed, scpm allows it and writes the same exemption entry. Never with `--frozen`. If OSV is unreachable there is no bypass, just a warning, and the install never fails because of it.
 
 - **Compile-time code execution.** Macros and compiler plugins run arbitrary code at compile time, so an `allowBuilds` analogue can't be enforced the way npm's lifecycle scripts can. At minimum, report which deps contribute compiler plugins or annotation processors.
 
@@ -735,7 +738,7 @@ The manifest format already helps: every dependency is one `coord: version` line
    - **Groups updates by catalog entry.** One catalog bump updates every module that uses it in one PR.
    - **Applies Scalafix migrations**, reusing scala-steward's public migration list.
    - **Labels PRs by semver risk**, using `versionScheme` and MiMa against the old version.
-   - **Security fixes use the release-age bypass** (§5.6).
+   - **Security fixes skip the cooldown:** the bot runs `scpm audit --fix`, so the exemption entry appears in the PR diff (§5.6).
    - **Opens PRs** with release notes and changelog links.
    - Because it runs inside the tool, it handles the lock, ranges and policy natively. No external bot can.
 4. **Any time: upstream a scala-steward `BuildToolAlg` for scpm.** It's cheap and reaches teams who already run steward.
@@ -1044,7 +1047,7 @@ Copied from pnpm 11.11+ with JVM-specific checks added:
 - **Fixed groups** and **epics**, as pnpm defines them.
 - **`scpm publish -r`**:
   - rewrites `workspace:`, `catalog:` and ranges to concrete versions;
-  - signs with PGP or Sigstore;
+  - signs with PGP (Central requires it), optionally adding Sigstore;
   - publishes to the Central Portal Publisher API (bundle upload, then poll status), GitHub Packages or Artifactory.
   - It may embed `scala/scala-publish`.
 

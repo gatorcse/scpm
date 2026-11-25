@@ -103,9 +103,12 @@ exits with status 3; the CLI restarts it.
 
 ### `cancel`
 
-`params`: `{"requestId": 1}` → `result`: `{}`. The cancelled request then completes
-with `status: cancelled`, promptly even if it was still waiting behind another compile of the
-same `analysisFile` (compiles of one target are serialized; different targets run in parallel).
+`params`: `{"requestId": 1}` → `result`: `{}`. Cancellation is best-effort: a request
+still running then completes with `status: cancelled`, promptly even if it was still waiting
+behind another compile of the same `analysisFile` (compiles of one target are serialized;
+different targets run in parallel), unless it finished first, in which case its normal
+response stands. Cancelling an unknown or already-completed request is a no-op and still
+returns `{}`; no request ever gets a second response.
 
 ### `shutdown`
 
