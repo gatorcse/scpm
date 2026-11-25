@@ -15,7 +15,8 @@ pub enum CrossKind {
     Java,
     /// `org::name` — `_<platform><scala binary>`, e.g. `_3`, `_sjs1_2.13`.
     Binary,
-    /// `org:::name` — `_<full scala version>`, used for compiler plugins.
+    /// `org:::name` — `_<full scala version>`, used for compiler plugins. Compiler plugins run
+    /// in the JVM compiler, so there is no platform prefix on any platform.
     Full,
 }
 
@@ -67,7 +68,7 @@ impl Coord {
             CrossKind::Binary => {
                 format!("{}_{}{}", self.name, platform.artifact_prefix(), scala_binary_version(scala_version))
             }
-            CrossKind::Full => format!("{}_{}{}", self.name, platform.artifact_prefix(), scala_version),
+            CrossKind::Full => format!("{}_{}", self.name, scala_version),
         }
     }
 }
@@ -155,6 +156,9 @@ mod tests {
         assert_eq!(c.artifact_name("3.7.4", Platform::Native), "cats-core_native0.5_3");
         let full = Coord::parse("org.typelevel:::kind-projector").unwrap();
         assert_eq!(full.artifact_name("2.13.18", Platform::Jvm), "kind-projector_2.13.18");
+        let plugin = Coord::parse("org.scala-js:::scalajs-compiler").unwrap();
+        assert_eq!(plugin.artifact_name("2.13.18", Platform::Js), "scalajs-compiler_2.13.18");
+        assert_eq!(plugin.artifact_name("2.13.18", Platform::Native), "scalajs-compiler_2.13.18");
     }
 
     #[test]

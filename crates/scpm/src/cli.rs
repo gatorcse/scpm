@@ -64,7 +64,8 @@ pub enum SchemaFile {
     Module,
 }
 
-/// Exit codes: 0 success, 1 the command failed, 2 invalid configuration or usage.
+/// Exit codes: 0 success, 1 the command failed (including writing its output), 2 invalid
+/// configuration or usage.
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
@@ -72,7 +73,8 @@ pub fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Config(diags)) => {
             if json {
-                print_json(&serde_json::json!({"ok": false, "error": {"kind": "config", "diagnostics": diags}}));
+                let _ =
+                    print_json(&serde_json::json!({"ok": false, "error": {"kind": "config", "diagnostics": diags}}));
             } else {
                 eprintln!("{diags}");
             }
@@ -80,11 +82,17 @@ pub fn main() -> ExitCode {
         }
         Err(Failure::Usage(message)) => {
             if json {
-                print_json(&serde_json::json!({"ok": false, "error": {"kind": "usage", "message": message}}));
+                let _ = print_json(&serde_json::json!({"ok": false, "error": {"kind": "usage", "message": message}}));
             } else {
                 eprintln!("error: {message}");
             }
             ExitCode::from(2)
+        }
+        // A closed pipe (`scpm ls | head`) is not an error.
+        Err(Failure::Output(e)) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(Failure::Output(e)) => {
+            eprintln!("error: cannot write output: {e}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -92,6 +100,14 @@ pub fn main() -> ExitCode {
 enum Failure {
     Config(Diagnostics),
     Usage(String),
+    /// Writing to stdout failed.
+    Output(io::Error),
+}
+
+impl From<io::Error> for Failure {
+    fn from(e: io::Error) -> Self {
+        Failure::Output(e)
+    }
 }
 
 impl From<Diagnostics> for Failure {
@@ -118,8 +134,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 SchemaFile::Workspace => schemars::schema_for!(WorkspaceFile),
                 SchemaFile::Module => schemars::schema_for!(ModuleFile),
             };
-            print_json(&schema);
-            Ok(())
+            Ok(print_json(&schema)?)
         }
         Command::Ls => {
             let (ws, graph) = load(&start)?;
@@ -132,13 +147,14 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 .map(|(m, v)| LsRow { id: v.id.clone(), module: m.name.clone(), dir: m.dir.clone() })
                 .collect();
             if cli.json {
-                print_json(&rows);
+                print_json(&rows)?;
             } else {
                 let width = rows.iter().map(|r| r.id.len()).max().unwrap_or(0);
                 let mut out = io::stdout().lock();
                 for r in rows {
-                    let _ = writeln!(out, "{:width$}  {}", r.id, r.dir);
+                    writeln!(out, "{:width$}  {}", r.id, r.dir)?;
                 }
+                out.flush()?;
             }
             Ok(())
         }
@@ -149,9 +165,11 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let selected = filter::select(&ws, &graph, &selectors, &invocation_dir(&start)?)?;
             let variants: Vec<_> = ws.variants().filter(|v| selected.contains(&v.id)).collect();
             if cli.json {
-                print_json(&variants);
+                print_json(&variants)?;
             } else {
-                print!("{}", serde_yaml_ng::to_string(&variants).expect("variants serialize"));
+                let mut out = io::stdout().lock();
+                out.write_all(serde_yaml_ng::to_string(&variants).expect("variants serialize").as_bytes())?;
+                out.flush()?;
             }
             Ok(())
         }
@@ -164,7 +182,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let format = if cli.json { GraphFormat::Json } else { format };
             let mut out = io::stdout().lock();
             match format {
-                GraphFormat::Json => print_json(&serde_json::json!({"order": order, "edges": edges})),
+                GraphFormat::Json => print_json(&serde_json::json!({"order": order, "edges": edges}))?,
                 GraphFormat::Text => {
                     for id in order {
                         let deps: Vec<String> = graph
@@ -180,24 +198,25 @@ fn run(cli: Cli) -> Result<(), Failure> {
                             })
                             .collect();
                         if deps.is_empty() {
-                            let _ = writeln!(out, "{id}");
+                            writeln!(out, "{id}")?;
                         } else {
-                            let _ = writeln!(out, "{id} → {}", deps.join(", "));
+                            writeln!(out, "{id} → {}", deps.join(", "))?;
                         }
                     }
                 }
                 GraphFormat::Dot => {
-                    let _ = writeln!(out, "digraph scpm {{");
+                    writeln!(out, "digraph scpm {{")?;
                     for id in order {
-                        let _ = writeln!(out, "  \"{id}\";");
+                        writeln!(out, "  \"{id}\";")?;
                     }
                     for e in edges {
                         let style = if e.scope == workspace::Scope::Test { " [style=dashed]" } else { "" };
-                        let _ = writeln!(out, "  \"{}\" -> \"{}\"{style};", e.from, e.to);
+                        writeln!(out, "  \"{}\" -> \"{}\"{style};", e.from, e.to)?;
                     }
-                    let _ = writeln!(out, "}}");
+                    writeln!(out, "}}")?;
                 }
             }
+            out.flush()?;
             Ok(())
         }
     }
@@ -221,8 +240,9 @@ fn load(start: &std::path::Path) -> Result<(Workspace, Graph), Failure> {
     Ok((ws, graph))
 }
 
-fn print_json<T: Serialize + ?Sized>(value: &T) {
+fn print_json<T: Serialize + ?Sized>(value: &T) -> io::Result<()> {
     let mut out = io::stdout().lock();
-    let _ = serde_json::to_writer_pretty(&mut out, value);
-    let _ = writeln!(out);
+    serde_json::to_writer_pretty(&mut out, value)?;
+    writeln!(out)?;
+    out.flush()
 }

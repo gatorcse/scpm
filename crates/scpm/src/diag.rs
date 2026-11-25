@@ -84,9 +84,10 @@ impl Diagnostic {
     }
 }
 
-/// A path for output: `/`-separated on every OS.
+/// A path for output: `/`-separated on every OS. Only the platform's separator is converted;
+/// a backslash is an ordinary file name character on Unix.
 pub fn slash_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 pub fn ser_path<S: serde::Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
@@ -254,5 +255,11 @@ mod tests {
         let d = parse_err("platforms: [jmv]\n");
         assert_eq!(d.message, "unknown value `jmv`");
         assert_eq!(d.help.as_deref(), Some("did you mean `jvm`?"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn backslashes_are_file_name_characters_on_unix() {
+        assert_eq!(slash_path(Path::new("modules/a\\b")), "modules/a\\b");
     }
 }

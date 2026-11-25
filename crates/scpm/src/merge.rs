@@ -19,7 +19,8 @@ pub fn merge_module(base: &mut Value, overlay: Value) {
     match (base, overlay) {
         (Value::Mapping(base_map), Value::Mapping(overlay_map)) => {
             for (key, value) in overlay_map {
-                if value.is_null() {
+                // Only a plain null inherits; `!replace null` clears (`is_null` looks through tags).
+                if matches!(value, Value::Null) {
                     continue;
                 }
                 let is_matrix = key.as_str().is_some_and(|k| MATRIX_KEYS.contains(&k));
@@ -60,6 +61,14 @@ pub fn merge(base: &mut Value, overlay: Value) {
     }
 }
 
+/// Removes a top-level `!replace` tag; the flag says whether there was one.
+pub fn untag_replace(value: Value) -> (Value, bool) {
+    match value {
+        Value::Tagged(tagged) if tagged.tag == REPLACE_TAG => (tagged.value, true),
+        other => (other, false),
+    }
+}
+
 /// Whether `value` contains a `!replace` tag anywhere.
 pub fn has_replace_tags(value: &Value) -> bool {
     match value {
@@ -73,12 +82,26 @@ pub fn has_replace_tags(value: &Value) -> bool {
 /// The local tag prefix [`parse_with_visible_tags`] maps the `!!` handle to.
 const CORE_TAG_PREFIX: &str = "!scpm-core:";
 
+/// Whether `line` is a `%TAG` directive for the `!!` handle.
+fn is_secondary_tag_directive(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    line.starts_with('%') && words.next() == Some("%TAG") && words.next() == Some("!!")
+}
+
 /// Parses `text` so that every tag stays visible. serde_yaml_ng drops core-schema tags
 /// (`!!replace`, `!!str`, …, which libyaml resolves to `tag:yaml.org,2002:…`), so `!!replace`
 /// would otherwise read as an untagged value and silently append. A `%TAG` directive maps
-/// `!!` to a local prefix instead. Returns `None` if the rewritten text doesn't parse (e.g. the
-/// file declares its own `%TAG !!`); callers then fall back to the plain parse.
+/// `!!` to a local prefix instead; a `%TAG !!` directive the file declares itself is replaced
+/// by it. Returns `None` if the rewritten text doesn't parse; callers then fall back to the
+/// plain parse.
 pub fn parse_with_visible_tags(text: &str) -> Option<Value> {
+    // Directives start at column 0, where plain scalars can't start with `%`.
+    if text.lines().any(is_secondary_tag_directive) {
+        let directive = format!("%TAG !! {CORE_TAG_PREFIX}");
+        let rewritten: Vec<&str> =
+            text.lines().map(|l| if is_secondary_tag_directive(l) { directive.as_str() } else { l }).collect();
+        return serde_yaml_ng::from_str(&rewritten.join("\n")).ok();
+    }
     let first = text.lines().map(str::trim_start).find(|l| !l.is_empty() && !l.starts_with('#'));
     let starts_document =
         first.is_some_and(|l| l.starts_with('%') || l == "---" || l.starts_with("--- ") || l.starts_with("---\t"));
@@ -98,8 +121,9 @@ fn written_tag(tag: &Tag) -> String {
     }
 }
 
-/// Calls `found(key_path, tag)` for every tag other than exactly `!replace`, with the tag as
-/// written (`!!replace` included, when `value` comes from [`parse_with_visible_tags`]).
+/// Calls `found(key_path, tag)` for every tag on a value other than exactly `!replace`, with the
+/// tag as written (`!!replace` included, when `value` comes from [`parse_with_visible_tags`]).
+/// Tags on mapping keys are always reported: `!replace` has no meaning there.
 pub fn unknown_tags(value: &Value, path: &str, found: &mut dyn FnMut(String, String)) {
     match value {
         Value::Tagged(tagged) => {
@@ -111,13 +135,20 @@ pub fn unknown_tags(value: &Value, path: &str, found: &mut dyn FnMut(String, Str
         }
         Value::Mapping(map) => {
             for (k, v) in map {
-                let key = match k {
+                let untagged = match k {
+                    Value::Tagged(tagged) => &tagged.value,
+                    other => other,
+                };
+                let key = match untagged {
                     Value::String(s) => s.clone(),
                     Value::Number(n) => n.to_string(),
                     Value::Bool(b) => b.to_string(),
                     _ => "?".to_string(),
                 };
                 let child = if path.is_empty() { key } else { format!("{path}.{key}") };
+                if let Value::Tagged(tagged) = k {
+                    found(child.clone(), written_tag(&tagged.tag));
+                }
                 unknown_tags(v, &child, found);
             }
         }
@@ -188,6 +219,13 @@ mod tests {
     }
 
     #[test]
+    fn replace_null_clears() {
+        let mut base = yaml("{release: '17', opts: [-a]}");
+        merge_module(&mut base, yaml("{release: !replace null, opts: !replace ~}"));
+        assert_eq!(base, yaml("{release: null, opts: null}"));
+    }
+
+    #[test]
     fn null_overlays_change_nothing() {
         let mut base = yaml("{deps: {a: '1'}, opts: [-a]}");
         merge_module(&mut base, yaml("{deps: ~, opts: ~, extra: ~}"));
@@ -202,6 +240,12 @@ mod tests {
         unknown_tags(&yaml("{a: !replace [x], b: {c: [y, !foo z]}}"), "", &mut |k, t| found.push((k, t)));
         assert_eq!(found, vec![("b.c[1]".to_string(), "!foo".to_string())]);
         assert!(has_replace_tags(&yaml("{a: {b: !replace x}}")));
+        let mut found = Vec::new();
+        unknown_tags(&yaml("{env: {!typo FOO: x, !replace BAR: y}}"), "", &mut |k, t| found.push((k, t)));
+        assert_eq!(
+            found,
+            vec![("env.FOO".to_string(), "!typo".to_string()), ("env.BAR".to_string(), "!replace".to_string())]
+        );
     }
 
     fn visible_tags(text: &str) -> Vec<(String, String)> {
@@ -215,7 +259,12 @@ mod tests {
         // The plain parse drops `!!replace` entirely.
         assert_eq!(yaml("a: !!replace [x]"), yaml("a: [x]"));
         let replace = vec![("a".to_string(), "!!replace".to_string())];
-        for text in ["a: !!replace [x]", "---\na: !!replace [x]", "# c\n%YAML 1.2\n---\na: !!replace [x]"] {
+        for text in [
+            "a: !!replace [x]",
+            "---\na: !!replace [x]",
+            "# c\n%YAML 1.2\n---\na: !!replace [x]",
+            "%TAG !! tag:yaml.org,2002:\n---\na: !!replace [x]",
+        ] {
             assert_eq!(visible_tags(text), replace, "{text}");
         }
         assert_eq!(

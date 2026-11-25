@@ -697,6 +697,130 @@ fn replace_inside_variants_entries_replaces() {
 }
 
 #[test]
+fn replace_null_and_replace_variants() {
+    let ws = format!(
+        "{WS}presets:\n  lib:\n    release: '17'\n    variants: {{'3': {{scalacOptions: [-Werror]}}, jvm: {{jvmOptions: [-x]}}}}\n"
+    );
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", &ws),
+        (
+            "modules/a/scpm.yaml",
+            "extends: [lib]\nrelease: !replace null\nvariants: !replace\n  3: {scalacOptions: [-deprecation]}\n",
+        ),
+        ("modules/b/scpm.yaml", "extends: [lib]\nrelease: ~\n"),
+    ]);
+    let v = json(dir.path(), &["config", "a", "b"]);
+    assert_eq!(v[0]["release"], Value::Null, "!replace null clears");
+    assert_eq!(v[0]["scalacOptions"], serde_json::json!(["-deprecation"]));
+    assert_eq!(v[0]["jvmOptions"], Value::Null, "inherited variant entries are dropped");
+    assert_eq!(v[1]["release"], "17", "a plain null inherits");
+    assert_eq!(v[1]["scalacOptions"], serde_json::json!(["-Werror"]));
+}
+
+#[test]
+fn integer_variant_keys_with_replace_scalars() {
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", WS),
+        ("modules/a/scpm.yaml", "release: !replace '17'\nvariants:\n  3: {scalacOptions: [-three]}\n"),
+    ]);
+    let v = json(dir.path(), &["config", "a"]);
+    assert_eq!(v[0]["release"], "17");
+    assert_eq!(v[0]["scalacOptions"], serde_json::json!(["-three"]));
+
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", WS),
+        ("modules/a/scpm.yaml", "release: !replace '17'\nvariants:\n  2.13: {scalacOptions: [-x]}\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    assert!(err.contains("unquoted variant selector"), "{err}");
+}
+
+#[test]
+fn variant_keys_that_normalize_to_the_same_selector_are_errors() {
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", WS),
+        ("modules/a/scpm.yaml", "variants:\n  3: {scalacOptions: [-deprecation]}\n  '3': {javacOptions: [-Xlint]}\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    assert!(err.contains("variants.3: variant selector `3` is written twice"), "{err}");
+}
+
+#[test]
+fn tags_on_keys_and_redeclared_core_handle_are_errors() {
+    let dir = workspace(&[("scpm-workspace.yaml", WS), ("modules/a/scpm.yaml", "env: {!typo FOO: x}\n")]);
+    let err = config_error(dir.path(), &["ls"]);
+    assert!(err.contains("env.FOO: unknown YAML tag `!typo`"), "{err}");
+
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", WS),
+        ("modules/a/scpm.yaml", "%TAG !! tag:yaml.org,2002:\n---\nscalacOptions: !!replace [-a]\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    assert!(err.contains("scalacOptions: unknown YAML tag `!!replace`"), "{err}");
+}
+
+#[test]
+fn workspace_dependencies_reject_artifact_options() {
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", WS),
+        ("modules/a/scpm.yaml", "{}\n"),
+        ("modules/b/scpm.yaml", "dependencies:\n  a: {version: 'workspace:*', transitive: false}\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    assert!(err.contains("dependencies.a: `exclude`, `classifier`, `type` and `transitive` apply only"), "{err}");
+
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", WS),
+        ("modules/a/scpm.yaml", "{}\n"),
+        ("modules/b/scpm.yaml", "dependencies:\n  a: {version: 'workspace:*'}\n"),
+    ]);
+    assert_eq!(ls_ids(dir.path(), &[]), vec!["a@jvm-3", "b@jvm-3"]);
+}
+
+#[test]
+fn write_errors_fail_the_command() {
+    // `/dev/full` fails every write (Linux).
+    if !Path::new("/dev/full").exists() {
+        return;
+    }
+    let dir = workspace(&[("scpm-workspace.yaml", WS), ("modules/a/scpm.yaml", "{}\n")]);
+    let cases: [&[&str]; 4] = [&["ls"], &["--json", "ls"], &["config", "a"], &["graph", "--format", "dot"]];
+    for args in cases {
+        let out = StdCommand::new(assert_cmd::cargo::cargo_bin("scpm"))
+            .arg("-C")
+            .arg(dir.path())
+            .args(args)
+            .stdout(fs::File::create("/dev/full").unwrap())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("cannot write output"), "{args:?}");
+    }
+}
+
+#[test]
+fn module_discovery_needs_a_manifest_file() {
+    let dir = workspace(&[("scpm-workspace.yaml", WS), ("modules/a/scpm.yaml", "{}\n")]);
+    fs::create_dir_all(dir.path().join("modules/b/scpm.yaml")).unwrap();
+    assert_eq!(ls_ids(dir.path(), &[]), vec!["a@jvm-3"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn module_discovery_reports_unreadable_directories() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = workspace(&[("scpm-workspace.yaml", WS), ("modules/a/scpm.yaml", "{}\n"), ("modules/b/x", "")]);
+    let locked = dir.path().join("modules/b");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    // Root can read it anyway; only check when the permission bites.
+    if fs::read_dir(&locked).is_err() {
+        let err = config_error(dir.path(), &["ls"]);
+        assert!(err.contains("cannot search for modules"), "{err}");
+    }
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
 fn module_discovery_ignores_gitignore() {
     let dir = workspace(&[
         ("scpm-workspace.yaml", WS),

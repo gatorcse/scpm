@@ -16,7 +16,9 @@ use crate::config::{
 };
 use crate::coord::{Coord, CrossKind, VersionedCoord};
 use crate::diag::{Diagnostic, Diagnostics, closest, ser_opt_path, ser_path, ser_paths, slash_path};
-use crate::merge::{has_replace_tags, merge_module, parse_with_visible_tags, strip_replace_tags, unknown_tags};
+use crate::merge::{
+    has_replace_tags, merge_module, parse_with_visible_tags, strip_replace_tags, unknown_tags, untag_replace,
+};
 use crate::platform::Platform;
 use crate::selector::{VariantSelector, full_version_parts};
 use crate::version::{Ver, VersionSpec};
@@ -329,7 +331,13 @@ fn parse_file<T: DeserializeOwned>(root: &Path, path: &Path) -> Result<(T, Value
         // (the original one may just be the `!replace` scalar), borrowing the original error's
         // position when both point at the same key.
         Err(e) if has_replace_tags(&raw) => {
-            let untagged = strip_replace_tags(raw.clone());
+            let mut untagged = strip_replace_tags(raw.clone());
+            // The text parse reads an unquoted `variants` key (`3:`) as a string; a `Value`
+            // holds a number, so normalize the copy first.
+            let key_diags = normalize_all_variant_keys(&mut untagged);
+            if !key_diags.is_empty() {
+                return Err(Diagnostics(key_diags.into_iter().map(|d| d.in_file(display.clone())).collect()));
+            }
             match serde_path_to_error::deserialize::<_, T>(untagged) {
                 Ok(typed) => typed,
                 Err(fallback) => {
@@ -355,7 +363,13 @@ fn rel(root: &Path, path: &Path) -> PathBuf {
 /// into strings; floats are rejected because `2.10` would silently become `2.1`.
 fn normalize_variant_keys(module: &mut Value, prefix: &str) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    let Some(Value::Mapping(variants)) = module.get_mut("variants") else { return diags };
+    let Some(variants) = module.get_mut("variants") else { return diags };
+    // `variants: !replace {...}`: normalize the mapping under the tag.
+    let variants = match variants {
+        Value::Tagged(tagged) => &mut tagged.value,
+        other => other,
+    };
+    let Value::Mapping(variants) = variants else { return diags };
     for (key, value) in std::mem::take(variants) {
         let key = match key {
             Value::Number(n) if n.is_f64() => {
@@ -369,7 +383,29 @@ fn normalize_variant_keys(module: &mut Value, prefix: &str) -> Vec<Diagnostic> {
             Value::Number(n) => Value::String(n.to_string()),
             other => other,
         };
+        if variants.contains_key(&key) {
+            let shown = key.as_str().unwrap_or("?");
+            diags.push(
+                Diagnostic::new(format!("variant selector `{shown}` is written twice"))
+                    .at_key(format!("{prefix}variants.{shown}"))
+                    .with_help(format!("`{shown}` and '{shown}' are the same selector; merge the two entries")),
+            );
+            continue;
+        }
         variants.insert(key, value);
+    }
+    diags
+}
+
+/// [`normalize_variant_keys`] for a whole file: a module file's own `variants`, and those of
+/// each preset in a workspace file.
+fn normalize_all_variant_keys(file: &mut Value) -> Vec<Diagnostic> {
+    let mut diags = normalize_variant_keys(file, "");
+    if let Some(Value::Mapping(presets)) = file.get_mut("presets") {
+        for (name, preset) in presets.iter_mut() {
+            let prefix = format!("presets.{}.", name.as_str().unwrap_or("?"));
+            diags.extend(normalize_variant_keys(preset, &prefix));
+        }
     }
     diags
 }
@@ -718,8 +754,9 @@ fn discover_modules(
     for r in rest {
         builder.add(r);
     }
-    // Membership is decided by the `modules` globs alone: ignore files don't hide modules, and
-    // symlinked module directories count (symlink loops are reported by the walker and skipped).
+    // Ignore files don't hide modules, and symlinked module directories count (symlink loops
+    // and dangling symlinks are skipped; other walk errors are reported). Dot-directories are
+    // skipped, as `*` and `**` skip them in pnpm's workspace globs.
     let walker = builder
         .hidden(true)
         .git_ignore(false)
@@ -730,8 +767,22 @@ fn discover_modules(
         .follow_links(true)
         .filter_entry(|e| !matches!(e.file_name().to_str(), Some(".git" | "target" | "node_modules" | ".scpm")))
         .build();
-    for entry in walker.flatten() {
-        if entry.file_name() != MODULE_FILE {
+    for entry in walker {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if is_skippable_walk_error(&e) => continue,
+            Err(e) => {
+                let d = Diagnostic::new(format!("cannot search for modules: {e}"))
+                    .at_key("modules")
+                    .with_help("make the directory readable, or exclude it with a `!` pattern");
+                diags.push(match ws_file {
+                    Some(f) => d.in_file(f),
+                    None => d,
+                });
+                continue;
+            }
+        };
+        if entry.file_name() != MODULE_FILE || !entry.path().is_file() {
             continue;
         }
         let Some(dir) = entry.path().parent() else { continue };
@@ -744,6 +795,19 @@ fn discover_modules(
         }
     }
     dirs.into_iter().collect()
+}
+
+/// Walk errors that don't mean part of the tree went unsearched: symlink loops, and dangling
+/// symlinks or files removed mid-walk.
+fn is_skippable_walk_error(err: &ignore::Error) -> bool {
+    match err {
+        ignore::Error::Loop { .. } => true,
+        ignore::Error::WithPath { err, .. }
+        | ignore::Error::WithDepth { err, .. }
+        | ignore::Error::WithLineNumber { err, .. } => is_skippable_walk_error(err),
+        ignore::Error::Io(e) => e.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
 }
 
 /// The directory a `modules` glob can only match inside: its leading components without glob
@@ -814,7 +878,16 @@ impl Expansion {
     }
 
     fn add_variants(&mut self, variants: Option<Value>, in_module: bool) {
-        let Some(Value::Mapping(map)) = variants else { return };
+        // `variants: !replace {...}` drops the entries inherited so far.
+        let variants = match variants.map(untag_replace) {
+            Some((value, true)) => {
+                self.variants.clear();
+                value
+            }
+            Some((value, false)) => value,
+            None => return,
+        };
+        let Value::Mapping(map) = variants else { return };
         for (key, overlay) in map {
             // Invalid selectors are reported where they are written.
             let Some(key) = key.as_str() else { continue };
@@ -1096,9 +1169,24 @@ fn build_variant(
                     _ if key == name => diags.push(
                         Diagnostic::new(format!("module `{name}` cannot depend on itself")).in_file(file).at_key(at),
                     ),
-                    VersionSpec::Workspace { range } if range == "*" => {
-                        workspace_dependencies.push(WorkspaceDependency { scope, module: key.clone() })
-                    }
+                    VersionSpec::Workspace { range } if range == "*" => match spec {
+                        DepSpec::Detailed(d)
+                            if !d.exclude.is_empty()
+                                || d.classifier.is_some()
+                                || d.kind.is_some()
+                                || d.transitive.is_some() =>
+                        {
+                            diags.push(
+                                Diagnostic::new(
+                                    "`exclude`, `classifier`, `type` and `transitive` apply only to external \
+                                     dependencies",
+                                )
+                                .in_file(file)
+                                .at_key(at),
+                            )
+                        }
+                        _ => workspace_dependencies.push(WorkspaceDependency { scope, module: key.clone() }),
+                    },
                     VersionSpec::Workspace { range } => diags.push(
                         Diagnostic::new(format!("`workspace:{range}` is not supported; use `workspace:*`"))
                             .in_file(file)

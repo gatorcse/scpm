@@ -127,7 +127,16 @@ fn scala_part(s: &str, globs: bool) -> Result<ScalaPart, SelectorError> {
             help: Some("use a binary version such as 2.12 or 2.13".into()),
         }),
         [major] if numeric(major) => Ok(ScalaPart::Binary(s.to_string())),
-        [major, minor] if numeric(major) && numeric(minor) => Ok(ScalaPart::Binary(s.to_string())),
+        // The only two-part binary versions are 2.12 and 2.13; `3.7` would silently match nothing.
+        ["2", "12" | "13"] => Ok(ScalaPart::Binary(s.to_string())),
+        [major, minor] if numeric(major) && numeric(minor) => Err(SelectorError {
+            message: format!("`{s}` is not a Scala binary version"),
+            help: Some(if *major == "3" {
+                "every Scala 3 version has binary version 3: use `3`, or a full version such as 3.7.4".into()
+            } else {
+                "use a binary version such as 3, 2.12 or 2.13".into()
+            }),
+        }),
         _ if full_version_parts(s).is_some() => Ok(ScalaPart::Full(s.to_string())),
         _ => Err(SelectorError::new(format!(
             "`{s}` is neither a platform (jvm, js, native) nor a Scala version (`3`, `2.13`, `3.9.0`); \
@@ -200,13 +209,19 @@ mod tests {
 
     #[test]
     fn rejects_unknown_parts() {
-        for bad in ["foo", "jvm-foo", "jvm-", "-3", "3.x", "2.13.", "jvm-3-", "3.9.0-", "*", "2", "jvm-2", "4"] {
+        for bad in [
+            "foo", "jvm-foo", "jvm-", "-3", "3.x", "2.13.", "jvm-3-", "3.9.0-", "*", "2", "jvm-2", "4", "3.7",
+            "jvm-3.9", "2.11", "2.14",
+        ] {
             assert!(VariantSelector::parse(bad).is_err(), "{bad}");
         }
         assert!(VariantSelector::parse_glob("jvm-foo").is_err());
         assert!(VariantSelector::parse("native-2.13").is_ok());
         let err = VariantSelector::parse_glob("2").unwrap_err();
         assert_eq!(err.help(), Some("use a binary version such as 2.12 or 2.13"));
+        let err = VariantSelector::parse_glob("jvm-3.7").unwrap_err();
+        assert!(err.help().is_some_and(|h| h.contains("binary version 3")));
+        assert!(VariantSelector::parse("2.12").is_ok());
     }
 
     #[test]
