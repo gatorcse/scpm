@@ -1,7 +1,7 @@
 package scpm.worker
 
 import sbt.internal.inc.caching.ClasspathCache
-import sbt.internal.inc.{ APIs, Locate, NoopExternalLookup }
+import sbt.internal.inc.{ APIs, Analysis, Locate, NoopExternalLookup }
 import xsbti.api.AnalyzedClass
 import xsbti.compile.{ CompileAnalysis, DefinesClass, FileHash, PerClasspathEntryLookup }
 import xsbti.{ FileConverter, VirtualFile, VirtualFileRef }
@@ -9,6 +9,7 @@ import xsbti.{ FileConverter, VirtualFile, VirtualFileRef }
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.{ Files, Path }
 import java.util.Optional
+import java.util.concurrent.ConcurrentHashMap
 import scala.jdk.CollectionConverters.*
 import scala.jdk.OptionConverters.*
 import scala.util.Using
@@ -21,17 +22,37 @@ import scala.util.hashing.MurmurHash3
  */
 final class UpstreamAnalyses(upstream: Map[Path, Path], analyses: AnalysisCache, converter: FileConverter)
     extends PerClasspathEntryLookup:
+  // One compile asks for the same entry many times; upstream does not change meanwhile.
+  private val found = ConcurrentHashMap[Path, Optional[CompileAnalysis]]()
+
   def analysis(classpathEntry: VirtualFile): Optional[CompileAnalysis] =
     val classesDir = converter.toPath(classpathEntry)
-    upstream
-      .get(classesDir)
-      // A wiped classes directory makes its analysis meaningless.
-      .filter(_ => Files.isDirectory(classesDir))
-      .flatMap(analyses.read)
-      .map(_.getAnalysis)
-      .toJava
+    found.computeIfAbsent(
+      classesDir,
+      _ =>
+        upstream
+          .get(classesDir)
+          // A wiped classes directory makes its analysis meaningless.
+          .filter(_ => Files.isDirectory(classesDir))
+          .flatMap(analyses.read)
+          .map(_.getAnalysis)
+          // So does one whose class files were deleted: its API would hide that they are gone.
+          .filter(UpstreamAnalyses.productsExist(_, converter))
+          .toJava
+    )
 
   def definesClass(classpathEntry: VirtualFile): DefinesClass = Locate.definesClass(classpathEntry)
+
+object UpstreamAnalyses:
+  /** Whether every class file the analysis says its sources produced is on disk. */
+  def productsExist(analysis: CompileAnalysis, converter: FileConverter): Boolean =
+    analysis match
+      case a: Analysis =>
+        a.relations.allProducts.forall { product =>
+          try Files.exists(converter.toPath(product))
+          catch case _: RuntimeException => false
+        }
+      case _ => true
 
 /**
  * Zinc only looks for changed library classes when the classpath hash changes, and it hashes a

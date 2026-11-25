@@ -36,6 +36,17 @@ public class RunParamsTest {
   }
 
   @Test
+  public void onlyAFilterWithoutWildcardsNamesASuite() {
+    RunParams params =
+        RunParams.fromJson(
+            Map.of(
+                "target", "t", "testClassesDirs", List.of(), "filters", List.of("a.Exact", "*.Glob")));
+    assertTrue(params.names("a.Exact"));
+    assertFalse(params.names("a.Glob"));
+    assertFalse(params.names("b.Exact"));
+  }
+
+  @Test
   public void rejectsMissingFields() {
     assertThrows(IllegalArgumentException.class, () -> RunParams.fromJson(Map.of("target", "t")));
   }

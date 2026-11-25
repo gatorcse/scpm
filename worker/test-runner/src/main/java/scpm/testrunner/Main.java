@@ -33,8 +33,10 @@ public final class Main {
     RunParams params = null;
     try {
       Map<String, Object> request = asObject(Json.parse(line));
-      id = request.get("id");
-      if (!(id instanceof Long)) throw new IllegalArgumentException("'id' must be an integer");
+      Object requestId = request.get("id");
+      // Responses carry an integer id or null, never the request's malformed one.
+      if (!(requestId instanceof Long)) throw new IllegalArgumentException("'id' must be an integer");
+      id = requestId;
       if (!"run".equals(request.get("method"))) {
         Output.error(protocol, id, "unknown_method", "unknown method: " + request.get("method"));
         System.exit(2);
@@ -54,6 +56,10 @@ public final class Main {
     System.setErr(stderr);
     // Tests reading stdin get end of input instead of blocking on the CLI's pipe.
     System.setIn(new ByteArrayInputStream(new byte[0]));
+    AtomicBoolean answered = new AtomicBoolean();
+    AtomicBoolean parentGone = new AtomicBoolean();
+    // Before loading frameworks: one that blocks while starting up must not outlive the CLI either.
+    exitWhenParentGoes(stdin, answered, parentGone);
     ClassLoader loader = Main.class.getClassLoader();
     List<Framework> frameworks;
     try {
@@ -64,8 +70,6 @@ public final class Main {
     }
 
     TestRun run = new TestRun(params, frameworks, out, loader);
-    AtomicBoolean answered = new AtomicBoolean();
-    AtomicBoolean parentGone = new AtomicBoolean();
     // A run the JVM abandons (System.exit in a test, or the CLI went away) is still answered.
     ExitStatus.capture();
     Runtime.getRuntime()
@@ -83,7 +87,6 @@ public final class Main {
                               .orElse("a test called System.exit");
                   out.result(run.abort(reason));
                 }));
-    exitWhenParentGoes(stdin, answered, parentGone);
     Map<String, Object> result;
     try {
       result = run.run();

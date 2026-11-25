@@ -75,11 +75,11 @@ belong to. Unknown fields must be ignored by both sides (forward compatibility).
 | `javacOptions` | string[] | |
 | `javaHome` | string? | For javac; defaults to the worker's JVM. |
 | `rootPaths` | object? | Portable-analysis markers, e.g. `{"WS": "/abs/ws", "CACHE": "/abs/coursier/cache"}`. When present, analysis is written with paths relative to these roots (`${WS}/src/A.scala`); paths under no root stay absolute. Events always carry absolute paths. |
-| `upstreamAnalyses` | object[]? | `[{"classesDir": "/abs/core/classes", "analysisFile": "/abs/core/analysis.zip"}]`: one entry per workspace module whose classes dir is on `classpath`. `analysisFile` may not exist yet. The worker gives Zinc these analyses (as sbt does between projects), so an API change or a removed class upstream invalidates the sources that use it. Upstream must be compiled before its dependents, so its analysis matches its classes dir. Without an entry, a classes dir is treated like a jar: its class files are compared by name, size and modification time. |
+| `upstreamAnalyses` | object[]? | `[{"classesDir": "/abs/core/classes", "analysisFile": "/abs/core/analysis.zip"}]`: one entry per workspace module whose classes dir is on `classpath`. `analysisFile` may not exist yet. The worker gives Zinc these analyses (as sbt does between projects), so an API change or a removed class upstream invalidates the sources that use it. Upstream must be compiled before its dependents, so its analysis matches its classes dir; an analysis whose classes dir or any recorded class file is missing is ignored. Without an entry, a classes dir is treated like a jar: its class files are compared by name, size and modification time. |
 
 All paths must be absolute. The request is checked before it is queued: a missing compiler,
-library or bridge jar, a missing source, a relative path, or a source inside `classesDir` is a
-`bad_request` naming the field and path.
+library or bridge jar, a missing source, a relative path, or a source inside `classesDir` (after
+resolving `.`, `..` and symbolic links) is a `bad_request` naming the field and path.
 
 When `analysisFile` does not exist, `classesDir` is emptied before compiling: without an
 analysis nothing knows which class files are stale. A `failed` or `cancelled` compile leaves
@@ -131,7 +131,7 @@ CLI went away: the runner kills the processes its tests started, answers `crashe
 | `target` | string | e.g. `core@jvm-3` |
 | `testClassesDirs` | string[] | Directories to scan for test classes. |
 | `frameworks` | string[]? | Fully qualified `sbt.testing.Framework` class names. Default: auto-detect the common ones (munit, ScalaTest, weaver, ZIO Test, utest, specs2, ScalaCheck, JUnit via junit-interface). |
-| `filters` | string[]? | Glob patterns on fully qualified test class names. |
+| `filters` | string[]? | Glob patterns on fully qualified test class names. A filter without wildcards names its suite explicitly, so frameworks run it even if it opts out of discovery (ScalaTest's `@DoNotDiscover`). |
 | `testNames` | string[]? | Run only these test cases (framework support permitting). |
 
 `result`: `{"status": "ok" | "failed" | "crashed", "passed": 10, "failed": 1, "skipped": 0, "durationMs": 845}`,

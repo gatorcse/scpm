@@ -87,19 +87,23 @@ Scala 3 versions before 3.8 (`LazyVals`).
   at `analysisFile`. The analyses of up to 64 files (targets and upstreams) stay in memory and
   are reused while the file on disk is the same (modification time, size and file key), so a warm
   compile does not deserialize them again. Deleting or replacing a file is honoured. Without an
-  analysis, `classesDir` is emptied first, so stale classes from deleted sources can't satisfy
-  new code.
+  analysis, the compile starts from an empty `classesDir`, so stale classes from deleted sources
+  can't satisfy new code. The old directory is moved aside (a rename next to it) and deleted only
+  once the compile succeeds; a failed or cancelled one moves it back.
 - **Class files.** Zinc's transactional class-file manager backs up what it deletes, into a
   directory next to `classesDir` (same volume, so moves are cheap), and a failed or cancelled
   compile leaves `classesDir` as it was. The worker installs the manager itself and rolls back
   whenever the request was cancelled, because the Scala 3 bridge ends a cancelled run as a
-  success. For Scala 3, `.tasty` files are
+  success. A cancel that arrives after the manager kept the new class files is too late: the
+  compile is answered `ok` and its analysis written. For Scala 3, `.tasty` files are
   tracked with their classes (`TastyFiles`), so deleting a source deletes its TASTy too.
 - **Upstream modules.** With `upstreamAnalyses`, an upstream classes dir is looked up with its
   analysis, as sbt does between projects. Classes from it become external dependencies, and an
   API change upstream invalidates exactly the sources that use the changed names. Without one, a
   classes dir is hashed by its files' names, sizes and modification times, because Zinc hashes
-  directories as empty. A changed or deleted upstream class file then invalidates its users.
+  directories as empty. A changed or deleted upstream class file then invalidates its users. An
+  upstream analysis is ignored, as if absent, when its classes dir is missing or any class file it
+  records is gone.
 - **Classpath.** The worker compiles against `classesDir` + `scalaLibraryClasspath` + `classpath`.
   The output directory has to come first so an incremental run sees the classes of the sources it
   does not recompile.
@@ -195,9 +199,9 @@ own fingerprint check.
 
 ## Limitations
 
-- An upstream analysis is trusted while its classes dir exists. If the classes dir and analysis
-  disagree (classes deleted by hand, upstream not recompiled), dependents can miss the change.
-  The CLI always compiles upstream first.
+- An upstream analysis is trusted while all the class files it records exist. If they were
+  changed by hand without recompiling upstream, dependents can miss the change. The CLI always
+  compiles upstream first.
 - No pipelining or early output (`earlyAnalysisStore`, `earlyJarPath`) yet.
 - No Scala 2.12 (needs a bridge compiled from source) and no Scala.js or Scala Native linking.
 - Compile progress `unitsDone`/`unitsTotal` are passed through from the compiler as they are.

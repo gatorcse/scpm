@@ -121,6 +121,19 @@ await() {
     sleep 0.05
   done
 }
+# await_progress ID -> waits for the first compile.progress event of request ID
+await_progress() {
+  local deadline=$((SECONDS + 300))
+  until jq -e --argjson id "$1" 'select(.params.requestId == $id and .params.t == "compile.progress")' \
+    "$WORK/worker.out" >/dev/null 2>&1; do
+    if jq -e --argjson id "$1" 'select(.id == $id)' "$WORK/worker.out" >/dev/null 2>&1; then
+      echo "request $1 was answered before any progress: $(await "$1")" >&2; exit 1
+    fi
+    kill -0 "$WORKER_PID" 2>/dev/null || { echo "worker exited; stderr:" >&2; cat "$WORK/worker.err" >&2; exit 1; }
+    [ "$SECONDS" -lt "$deadline" ] || { echo "timed out waiting for progress of request $1" >&2; exit 1; }
+    sleep 0.05
+  done
+}
 # events ID -> the event params of request ID, as a JSON array
 events() {
   jq -sc --argjson id "$1" '[.[] | select(.method == "event" and .params.requestId == $id) | .params]' "$WORK/worker.out"
@@ -269,12 +282,18 @@ rm "$SD/src/C.scala"
 cp "$IT_DIR/fixtures/scala3-del/src/B.scala" "$SD/src/Bee.scala"
 compile del@jvm-3 "$SCALA3" "$SD"
 expect "a renamed source compiles" "$R" '.result.status == "ok" and .result.compiledSources >= 1'
+BEFORE_FULL="$(class_files "$SD")"
 rm "$SD/out/analysis.zip" "$SD/src/Bee.scala"
 compile del@jvm-3 "$SCALA3" "$SD"
 expect "without an analysis, stale classes are wiped: a deleted dependency fails the compile" "$R" \
   '.result.status == "failed"'
 expect "and is reported where it is used" "$(diagnostics "$ID")" \
   "any(.[]; .file == \"$SD/src/A.scala\" and (.message | test(\"Not found: B\")))"
+if [ "$(class_files "$SD")" = "$BEFORE_FULL" ]; then pass "a failed full compile restores the previous classesDir"
+else fail "a failed full compile restores the previous classesDir" "$(class_files "$SD")"; fi
+LEFTOVERS="$(find "$SD/out" -maxdepth 1 -name '.scpm-*')"
+if [ -z "$LEFTOVERS" ]; then pass "and leaves no temporary directories behind"
+else fail "and leaves no temporary directories behind" "$LEFTOVERS"; fi
 
 # --- Java diagnostics ---------------------------------------------------------------------
 
@@ -329,6 +348,13 @@ compile libuser@jvm-3 "$SCALA3" "$UP/libuser" "$UP/lib/out/classes" "$(with_upst
 expect "downstream module compiles against it" "$R" '.result.status == "ok"'
 compile libuser@jvm-3 "$SCALA3" "$UP/libuser" "$UP/lib/out/classes" "$(with_upstream lib)"
 expect "unchanged upstream: downstream is a no-op" "$R" '.result.noop == true'
+mv "$UP/lib/out/classes" "$UP/lib/out/classes.keep"
+mkdir "$UP/lib/out/classes"
+compile libuser@jvm-3 "$SCALA3" "$UP/libuser" "$UP/lib/out/classes" "$(with_upstream lib)"
+expect "upstream class files gone but its analysis kept: the dependent fails, not a no-op" "$R" \
+  '.result.status == "failed"'
+rm -rf "$UP/lib/out/classes"
+mv "$UP/lib/out/classes.keep" "$UP/lib/out/classes"
 cp "$UP/lib/edits/Names.renamed.scala" "$UP/lib/src/Names.scala"
 compile lib@jvm-3 "$SCALA3" "$UP/lib" "" "$UP_ROOTS"
 expect "upstream API change compiles" "$R" '.result.status == "ok"'
@@ -367,8 +393,7 @@ for i in $(seq 1 400); do
 done
 send compile "$(compile_params big@jvm-3 "$SCALA3" "$BIG")"
 BIG_ID=$ID
-until jq -e --argjson id "$BIG_ID" 'select(.params.requestId == $id and .params.t == "compile.progress")' \
-  "$WORK/worker.out" >/dev/null 2>&1; do sleep 0.05; done
+await_progress "$BIG_ID"
 send cancel "{\"requestId\": $BIG_ID}"
 expect "cancel is acknowledged" "$(await "$ID")" '.result == {}'
 expect "cancelled compile reports status cancelled" "$(await "$BIG_ID")" '.result.status == "cancelled"'
@@ -398,8 +423,7 @@ BEFORE_BIG="$(class_files "$BIG")"
 perl -pi -e 's/List\[Int\]/Seq[Int]/' "$BIG"/src/*.scala
 send compile "$(compile_params big@jvm-3 "$SCALA3" "$BIG")"
 CHANGED=$ID
-until jq -e --argjson id "$CHANGED" 'select(.params.requestId == $id and .params.t == "compile.progress")' \
-  "$WORK/worker.out" >/dev/null 2>&1; do sleep 0.05; done
+await_progress "$CHANGED"
 send cancel "{\"requestId\": $CHANGED}"
 expect "cancelling a 400-file API change answers cancelled" "$(await "$CHANGED")" '.result.status == "cancelled"'
 if [ "$(class_files "$BIG")" = "$BEFORE_BIG" ]; then pass "a cancelled compile leaves classesDir as before"
@@ -431,7 +455,9 @@ start_runner() {
 # arrives (as the CLI does); sets RUN_RESULT, RUN_EVENTS, RUN_LOGS (log messages) and RUN_EXIT
 run_tests() {
   start_runner "$@"
+  local deadline=$((SECONDS + 300))
   until jq -e 'select(has("id"))' "$WORK/$1.out" >/dev/null 2>&1 || ! kill -0 "$RUNNER_PID" 2>/dev/null; do
+    [ "$SECONDS" -lt "$deadline" ] || { kill "$RUNNER_PID"; echo "timed out waiting for test run $1" >&2; exit 1; }
     sleep 0.05
   done
   exec 4>&-
@@ -489,7 +515,11 @@ expect "System.exit in a test: suite is closed and named in the log" "$RUN_EVENT
     all(.[]; .t != "log" or (.message | test("parent went away") | not))'
 
 start_runner munit-orphan "$MUNIT_CP" "$(run_params '{filters: ["*.SleepSuite"]}')"
+deadline=$((SECONDS + 300))
 until jq -e 'select(.params.message? // "" | startswith("child pid"))' "$WORK/munit-orphan.out" >/dev/null 2>&1; do
+  kill -0 "$RUNNER_PID" 2>/dev/null ||
+    { echo "test runner exited before its test started a process:" >&2; cat "$WORK/munit-orphan.out" >&2; exit 1; }
+  [ "$SECONDS" -lt "$deadline" ] || { kill "$RUNNER_PID"; echo "timed out waiting for the SleepSuite child" >&2; exit 1; }
   sleep 0.05
 done
 exec 4>&-
@@ -515,6 +545,10 @@ run_tests munit-missing "$MUNIT_CP" "$(run_params '{frameworks: ["no.such.Framew
 expect "a named framework that is not on the classpath is a bad request" "$RUN_RESULT" \
   '.error == {code: "bad_request", message: "framework no.such.Framework is not on the classpath"}'
 expect "and the runner exits 2" "$RUN_EXIT" '. == 2'
+BAD_ID="$(jq -nc '{id: "x", method: "run", params: {}}' |
+  java $JVM_FLAGS -cp "$RUNNER_JAR:$RUNNER_DEPS" scpm.testrunner.Main 2>/dev/null || true)"
+expect "a request whose id is not an integer is answered with a null id" "$BAD_ID" \
+  '.id == null and .error.code == "bad_request"'
 
 section "test runner: JUnit 4 via junit-interface $JUNIT_INTERFACE"
 SJ="$WORK/junit"
@@ -542,8 +576,7 @@ section "shutdown"
 rm "$BIG/out/analysis.zip"
 send compile "$(compile_params big@jvm-3 "$SCALA3" "$BIG")"
 RUNNING=$ID
-until jq -e --argjson id "$RUNNING" 'select(.params.requestId == $id and .params.t == "compile.progress")' \
-  "$WORK/worker.out" >/dev/null 2>&1; do sleep 0.05; done
+await_progress "$RUNNING"
 send shutdown '{}'
 expect "shutdown is acknowledged" "$(await "$ID")" '.result == {}'
 expect "a compile running at shutdown is answered cancelled" "$(await "$RUNNING")" '.result.status == "cancelled"'

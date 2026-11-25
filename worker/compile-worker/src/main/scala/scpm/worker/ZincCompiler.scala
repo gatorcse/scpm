@@ -18,7 +18,7 @@ import xsbti.compile.{
 }
 import xsbti.{ VirtualFile, VirtualFileRef }
 
-import java.nio.file.{ Files, Path }
+import java.nio.file.{ Files, LinkOption, Path }
 import java.util.Optional
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
@@ -54,11 +54,13 @@ final class ZincCompiler extends CompileService:
       lazy val toolchain = Toolchain.of(params)
       try
         val compiledSources = CompiledSources()
-        val zincResult = scalaCompilers.use(toolchain) { scalac =>
+        val (zincResult, kept) = scalaCompilers.use(toolchain) { scalac =>
           run(id, params, scalac, toolchain, analysisFile, cancelled, compiledSources, emit)
         }
-        // The Scala 3 bridge stops a cancelled run without throwing; its partial analysis is discarded.
-        if cancelled.get then result(CompileStatus.Cancelled)
+        // The Scala 3 bridge stops a cancelled run without throwing; its class files were rolled
+        // back and its partial analysis is discarded. A cancel that came after the class files were
+        // kept is too late: the run finished, and its analysis must match its class files.
+        if !kept then result(CompileStatus.Cancelled)
         else if !zincResult.hasModified then result(CompileStatus.Ok, noop = true)
         else
           analyses.write(analysisFile, AnalysisContents.create(zincResult.analysis, zincResult.setup))
@@ -89,7 +91,7 @@ final class ZincCompiler extends CompileService:
       cancelled: AtomicBoolean,
       compiledSources: CompiledSources,
       emit: Event => Unit
-  ): xsbti.compile.CompileResult =
+  ): (xsbti.compile.CompileResult, Boolean) =
     val converter = MappedFileConverter(params.rootPaths.map((k, v) => k -> Path.of(v)), allowMachinePath = true)
     def virtual(xs: Seq[String]): Array[VirtualFile] = xs.map(x => converter.toVirtualFile(Path.of(x))).toArray
     val logger = EventLogger(id, params.target, emit)
@@ -107,61 +109,68 @@ final class ZincCompiler extends CompileService:
     )
     val classesDir = Path.of(params.classesDir)
     val previous = analyses.read(analysisFile)
-    // Without an analysis nothing knows which class files are stale, so start from nothing.
-    if previous.isEmpty then IO.delete(classesDir.toFile)
-    Files.createDirectories(classesDir)
-
-    // Scala 3 writes a .tasty file next to each class; they must go when their source does.
-    val auxiliaryFiles: Array[AuxiliaryClassFiles] = if toolchain.isScala3 then Array(TastyFiles.instance) else Array()
-    // Failed and cancelled runs restore the previous class files from this backup, on the same volume.
-    val backup = Files.createTempDirectory(classesDir.toAbsolutePath.getParent, ".scpm-backup-")
-    val classFiles = RollbackOnCancel(
-      ClassFileManager.transactional(backup, auxiliaryFiles, sbt.util.Logger.xlog2Log(logger)),
-      cancelled
-    )
-    val options = IncOptions
-      .of()
-      .withAuxiliaryClassFiles(auxiliaryFiles)
-      .withExternalHooks(
-        DefaultExternalHooks(Optional.of(ClassDirectoryHashing(converter, classesDir)), Optional.of(classFiles))
-          .withInvalidationProfiler(compiledSources)
+    // Without an analysis nothing knows which class files are stale, so start from an empty
+    // directory. The old one is moved aside, not deleted, until the run is known to be kept.
+    val setAside = Option.when(previous.isEmpty && Files.exists(classesDir, LinkOption.NOFOLLOW_LINKS))(ZincCompiler.setAside(classesDir))
+    var kept = false
+    try
+      Files.createDirectories(classesDir)
+      // Scala 3 writes a .tasty file next to each class; they must go when their source does.
+      val auxiliaryFiles: Array[AuxiliaryClassFiles] = if toolchain.isScala3 then Array(TastyFiles.instance) else Array()
+      // Failed and cancelled runs restore the previous class files from this backup, on the same volume.
+      val backup = Files.createTempDirectory(classesDir.toAbsolutePath.getParent, ".scpm-backup-")
+      val classFiles = RollbackOnCancel(
+        ClassFileManager.transactional(backup, auxiliaryFiles, sbt.util.Logger.xlog2Log(logger)),
+        cancelled
       )
-    val setup = incremental.setup(
-      lookup = UpstreamAnalyses(
-        params.upstreamAnalyses.map(u => Path.of(u.classesDir) -> Path.of(u.analysisFile)).toMap,
-        analyses,
-        converter
-      ),
-      skip = false,
-      cacheFile = analysisFile,
-      cache = FreshCompilerCache(),
-      incOptions = options,
-      reporter = reporter,
-      progress = Some(ProgressReporter(id, params.target, cancelled, emit)),
-      earlyAnalysisStore = None,
-      extra = Array.empty
-    )
-    val inputs = incremental.inputs(
-      // The output directory comes first: an incremental run compiles only some sources, and
-      // they see the rest through their class files.
-      classpath = virtual(params.classesDir :: params.scalaLibraryClasspath ++ params.classpath),
-      sources = virtual(params.sources),
-      classesDirectory = classesDir,
-      earlyJarPath = None,
-      scalacOptions = params.scalacOptions.toArray,
-      javacOptions = params.javacOptions.toArray,
-      maxErrors = 100,
-      sourcePositionMappers = Array.empty,
-      order = CompileOrder.Mixed,
-      compilers = ZincUtil.compilers(javaTools, scalac),
-      setup = setup,
-      pr = previous.fold(incremental.emptyPreviousResult)(incremental.previousResult),
-      temporaryClassesDirectory = Optional.empty,
-      converter = converter,
-      stampReader = Stamps.timeWrapBinaryStamps(converter)
-    )
-    try incremental.compile(inputs, logger)
-    finally IO.delete(backup.toFile)
+      val options = IncOptions
+        .of()
+        .withAuxiliaryClassFiles(auxiliaryFiles)
+        .withExternalHooks(
+          DefaultExternalHooks(Optional.of(ClassDirectoryHashing(converter, classesDir)), Optional.of(classFiles))
+            .withInvalidationProfiler(compiledSources)
+        )
+      val setup = incremental.setup(
+        lookup = UpstreamAnalyses(
+          params.upstreamAnalyses.map(u => Path.of(u.classesDir) -> Path.of(u.analysisFile)).toMap,
+          analyses,
+          converter
+        ),
+        skip = false,
+        cacheFile = analysisFile,
+        cache = FreshCompilerCache(),
+        incOptions = options,
+        reporter = reporter,
+        progress = Some(ProgressReporter(id, params.target, cancelled, emit)),
+        earlyAnalysisStore = None,
+        extra = Array.empty
+      )
+      val inputs = incremental.inputs(
+        // The output directory comes first: an incremental run compiles only some sources, and
+        // they see the rest through their class files.
+        classpath = virtual(params.classesDir :: params.scalaLibraryClasspath ++ params.classpath),
+        sources = virtual(params.sources),
+        classesDirectory = classesDir,
+        earlyJarPath = None,
+        scalacOptions = params.scalacOptions.toArray,
+        javacOptions = params.javacOptions.toArray,
+        maxErrors = 100,
+        sourcePositionMappers = Array.empty,
+        order = CompileOrder.Mixed,
+        compilers = ZincUtil.compilers(javaTools, scalac),
+        setup = setup,
+        pr = previous.fold(incremental.emptyPreviousResult)(incremental.previousResult),
+        temporaryClassesDirectory = Optional.empty,
+        converter = converter,
+        stampReader = Stamps.timeWrapBinaryStamps(converter)
+      )
+      try
+        val zincResult = incremental.compile(inputs, logger)
+        // Zinc calls `complete` at the end of every run; this is the decision it made.
+        kept = classFiles.kept.getOrElse(!cancelled.get)
+        (zincResult, kept)
+      finally IO.delete(backup.toFile)
+    finally setAside.foreach(old => if kept then IO.delete(old.toFile) else ZincCompiler.restore(old, classesDir))
   end run
 
 object ZincCompiler:
@@ -174,6 +183,20 @@ object ZincCompiler:
       if !proceed then lock.unlock()
       proceed
     else lockUnlessCancelled(lock, cancelled)
+
+  /**
+   * Moves `dir` into a new sibling directory (a rename on the same volume, so it either happens
+   * or throws) and returns its new path.
+   */
+  private def setAside(dir: Path): Path =
+    val aside = Files.createTempDirectory(dir.toAbsolutePath.getParent, ".scpm-clean-")
+    Files.move(dir, aside.resolve(dir.getFileName))
+
+  /** Puts a directory moved by [[setAside]] back in place of whatever is at `dir` now. */
+  private def restore(old: Path, dir: Path): Unit =
+    IO.delete(dir.toFile)
+    Files.move(old, dir)
+    IO.delete(old.getParent.toFile)
 
   /** Missing or incompatible classes mean the toolchain's jars are wrong; don't keep its loaders. */
   private def isBrokenToolchain(e: Throwable): Boolean =
@@ -194,7 +217,15 @@ private final class RollbackOnCancel(underlying: XClassFileManager, cancelled: A
   def delete(classes: Array[java.io.File]): Unit = underlying.delete(classes)
   @deprecated("Zinc calls the VirtualFile variants", "2.1.0")
   def generated(classes: Array[java.io.File]): Unit = underlying.generated(classes)
-  def complete(success: Boolean): Unit = underlying.complete(success && !cancelled.get)
+  @volatile private var decision: Option[Boolean] = None
+
+  /** Whether the run's class files were kept, once Zinc has completed the run. */
+  def kept: Option[Boolean] = decision
+
+  def complete(success: Boolean): Unit =
+    val keep = success && !cancelled.get
+    decision = Some(keep)
+    underlying.complete(keep)
 
 /** Counts the sources Zinc (re)compiles in a run, across all incremental cycles. */
 private final class CompiledSources extends InvalidationProfiler:

@@ -101,7 +101,7 @@ final class TestRun {
             .ifPresent(
                 fp -> {
                   claimed.add(className);
-                  taskDefs.add(new TaskDef(testName, fp, false, selectors()));
+                  taskDefs.add(new TaskDef(testName, fp, params.names(testName), selectors()));
                 });
       }
       if (!taskDefs.isEmpty()) runFramework(framework, taskDefs);

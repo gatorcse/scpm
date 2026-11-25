@@ -29,6 +29,14 @@ record RunParams(
         || filterPatterns.stream().anyMatch(p -> p.matcher(className).matches());
   }
 
+  /**
+   * Whether a filter names the suite exactly, without wildcards. Frameworks run such a suite even
+   * when it opts out of discovery (ScalaTest's {@code @DoNotDiscover}).
+   */
+  boolean names(String testName) {
+    return filters.contains(testName);
+  }
+
   /** {@code *} matches any run of characters, {@code ?} any single character. */
   static Pattern glob(String glob) {
     StringBuilder regex = new StringBuilder();

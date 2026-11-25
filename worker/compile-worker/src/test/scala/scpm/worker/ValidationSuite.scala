@@ -39,3 +39,20 @@ class ValidationSuite extends munit.FunSuite:
     val problems = Validation.compile(valid.copy(classesDir = src.getParent.toString))
     assert(problems.exists(_.contains("inside classesDir")), problems)
   }
+
+  test("sources inside classesDir are refused however classesDir is spelled") {
+    val dir = src.getParent
+    val link = Files.createTempDirectory("scpm-link").resolve("out")
+    Files.createSymbolicLink(link, dir)
+    for classesDir <- List(dir.resolve("."), dir.resolve("sub/.."), link, dir.resolve(s"../${dir.getFileName}")) do
+      val problems = Validation.compile(valid.copy(classesDir = classesDir.toString))
+      assert(problems.exists(_.contains("inside classesDir")), s"$classesDir: $problems")
+  }
+
+  test("a classesDir next to the sources is fine, even before it exists") {
+    val dir = Files.createTempDirectory("scpm-ws")
+    val source = Files.createDirectories(dir.resolve("src")).resolve("A.scala")
+    Files.writeString(source, "object A")
+    val params = valid.copy(sources = List(source.toString), classesDir = dir.resolve("out/../outx/classes").toString)
+    assertEquals(Validation.compile(params), Nil)
+  }

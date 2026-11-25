@@ -1,6 +1,8 @@
 package scpm.worker
 
+import java.io.IOException
 import java.nio.file.{ Files, InvalidPathException, Path }
+import scala.annotation.tailrec
 
 /** Checks a request before it is queued, so path mistakes come back as `bad_request`. */
 object Validation:
@@ -20,7 +22,8 @@ object Validation:
     val sourceInsideOutput =
       for
         dir <- classesDir.toOption.toList
-        source <- sources.flatMap(_.toOption) if source.startsWith(dir)
+        canonicalDir = canonical(dir)
+        source <- sources.flatMap(_.toOption) if canonical(source).startsWith(canonicalDir)
       yield s"sources: $source is inside classesDir, which is wiped for full compiles"
     val checked =
       List(classesDir, absolute("analysisFile", p.analysisFile), existing("compilerBridge", p.compilerBridge)) ++
@@ -34,3 +37,15 @@ object Validation:
         all("upstreamAnalyses.analysisFile", p.upstreamAnalyses.map(_.analysisFile), absolute)
     val emptyCompiler = Option.when(p.scalaCompilerClasspath.isEmpty)("scalaCompilerClasspath: empty")
     checked.flatMap(_.left.toOption) ++ sourceInsideOutput ++ emptyCompiler
+
+  /**
+   * `path` with symbolic links, `.` and `..` resolved, so that different spellings of one
+   * location compare equal. A part that does not exist yet is only normalized.
+   */
+  private[worker] def canonical(path: Path): Path =
+    @tailrec def resolve(existing: Path, rest: List[Path]): Path =
+      if existing == null then path.normalize
+      else if Files.exists(existing) then rest.foldLeft(existing.toRealPath())(_.resolve(_)).normalize
+      else resolve(existing.getParent, existing.getFileName :: rest)
+    try resolve(path, Nil)
+    catch case _: IOException => path.normalize
