@@ -17,7 +17,7 @@ use std::process::Command;
 use globset::GlobBuilder;
 
 use crate::graph::Graph;
-use crate::selector::VariantSelector;
+use crate::selector::{SelectorError, VariantSelector};
 use crate::workspace::{Variant, Workspace};
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -95,11 +95,19 @@ fn parse(raw: &str) -> Result<Selector, FilterError> {
             return Err(invalid("missing module name before `@`"));
         }
         if let Some(v) = &variant {
-            VariantSelector::parse_glob(v).map_err(|e| invalid(&e.to_string()))?;
+            VariantSelector::parse_glob(v).map_err(|e| invalid(&selector_error(&e)))?;
         }
         Core::Name { module, variant }
     };
     Ok(Selector { raw: raw.to_string(), exclude, core, include_self, dependencies, dependents })
+}
+
+/// A variant selector error as one line, with its help appended.
+fn selector_error(e: &SelectorError) -> String {
+    match e.help() {
+        Some(help) => format!("{e}; {help}"),
+        None => e.to_string(),
+    }
 }
 
 /// Applies `selectors` and returns matching variant ids. No selectors (or only exclusions)
@@ -159,8 +167,11 @@ fn match_core(ws: &Workspace, core: &Core, raw: &str, cwd: &Path) -> Result<BTre
     match core {
         Core::Name { module, variant } => {
             let module_glob = glob(module)?;
-            let selector =
-                variant.as_deref().map(VariantSelector::parse_glob).transpose().map_err(|e| invalid(e.to_string()))?;
+            let selector = variant
+                .as_deref()
+                .map(VariantSelector::parse_glob)
+                .transpose()
+                .map_err(|e| invalid(selector_error(&e)))?;
             Ok(ids(&|v, _| {
                 module_glob.is_match(&v.module)
                     && selector.as_ref().is_none_or(|s| s.matches(v.platform, v.scala.as_ref()))

@@ -35,8 +35,22 @@ enum ScalaPart {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct SelectorError(String);
+#[error("{message}")]
+pub struct SelectorError {
+    message: String,
+    help: Option<String>,
+}
+
+impl SelectorError {
+    fn new(message: impl Into<String>) -> Self {
+        SelectorError { message: message.into(), help: None }
+    }
+
+    /// A hint on how to fix the selector, if there is one.
+    pub fn help(&self) -> Option<&str> {
+        self.help.as_deref()
+    }
+}
 
 impl VariantSelector {
     /// Parses a selector without globs, as used for `variants` keys.
@@ -68,7 +82,7 @@ impl VariantSelector {
 
 fn parse(s: &str, globs: bool) -> Result<VariantSelector, SelectorError> {
     if s.is_empty() {
-        return Err(SelectorError("empty selector".into()));
+        return Err(SelectorError::new("empty selector"));
     }
     if is_platform_part(s, globs) {
         return Ok(VariantSelector { platform: Some(platform_part(s)?), scala: None });
@@ -107,10 +121,15 @@ fn scala_part(s: &str, globs: bool) -> Result<ScalaPart, SelectorError> {
     let numeric = |p: &str| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit());
     let parts: Vec<&str> = s.split('.').collect();
     match parts.as_slice() {
+        // Only Scala 3 has a one-part binary version; `2` would silently match nothing.
+        [major] if numeric(major) && *major != "3" => Err(SelectorError {
+            message: format!("`{s}` is not a Scala binary version"),
+            help: Some("use a binary version such as 2.12 or 2.13".into()),
+        }),
         [major] if numeric(major) => Ok(ScalaPart::Binary(s.to_string())),
         [major, minor] if numeric(major) && numeric(minor) => Ok(ScalaPart::Binary(s.to_string())),
         _ if full_version_parts(s).is_some() => Ok(ScalaPart::Full(s.to_string())),
-        _ => Err(SelectorError(format!(
+        _ => Err(SelectorError::new(format!(
             "`{s}` is neither a platform (jvm, js, native) nor a Scala version (`3`, `2.13`, `3.9.0`); \
              selectors are `<platform>`, `<scala>` or `<platform>-<scala>`"
         ))),
@@ -118,7 +137,7 @@ fn scala_part(s: &str, globs: bool) -> Result<ScalaPart, SelectorError> {
 }
 
 fn glob(s: &str) -> Result<GlobMatcher, SelectorError> {
-    GlobBuilder::new(s).build().map(|g| g.compile_matcher()).map_err(|e| SelectorError(e.to_string()))
+    GlobBuilder::new(s).build().map(|g| g.compile_matcher()).map_err(|e| SelectorError::new(e.to_string()))
 }
 
 /// Splits a full version `major.minor.patch[-qualifier]` into its numeric parts and qualifier.
@@ -164,7 +183,6 @@ mod tests {
         assert!(!matches("js", Jvm, Some(&s3)));
         assert!(matches("3", Jvm, Some(&s3)));
         assert!(!matches("3", Jvm, None), "a Scala part never matches a Java-only variant");
-        assert!(!matches("2", Jvm, Some(&s213)), "`2` is not a binary version");
         assert!(matches("2.13", Js, Some(&s213)));
         assert!(!matches("2.13", Jvm, Some(&s3)));
         assert!(matches("3.9.0", Jvm, Some(&s3)));
@@ -182,11 +200,13 @@ mod tests {
 
     #[test]
     fn rejects_unknown_parts() {
-        for bad in ["foo", "jvm-foo", "jvm-", "-3", "3.x", "2.13.", "jvm-3-", "3.9.0-", "*"] {
+        for bad in ["foo", "jvm-foo", "jvm-", "-3", "3.x", "2.13.", "jvm-3-", "3.9.0-", "*", "2", "jvm-2", "4"] {
             assert!(VariantSelector::parse(bad).is_err(), "{bad}");
         }
         assert!(VariantSelector::parse_glob("jvm-foo").is_err());
         assert!(VariantSelector::parse("native-2.13").is_ok());
+        let err = VariantSelector::parse_glob("2").unwrap_err();
+        assert_eq!(err.help(), Some("use a binary version such as 2.12 or 2.13"));
     }
 
     #[test]

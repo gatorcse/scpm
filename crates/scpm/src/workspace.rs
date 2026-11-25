@@ -16,7 +16,7 @@ use crate::config::{
 };
 use crate::coord::{Coord, CrossKind, VersionedCoord};
 use crate::diag::{Diagnostic, Diagnostics, closest, ser_opt_path, ser_path, ser_paths, slash_path};
-use crate::merge::{has_replace_tags, merge_module, strip_replace_tags, unknown_tags};
+use crate::merge::{has_replace_tags, merge_module, parse_with_visible_tags, strip_replace_tags, unknown_tags};
 use crate::platform::Platform;
 use crate::selector::{VariantSelector, full_version_parts};
 use crate::version::{Ver, VersionSpec};
@@ -250,10 +250,15 @@ fn load_at(root: &Path, workspace_file: Option<PathBuf>) -> Result<Workspace, Di
     validate_workspace(&ctx, &mut diags);
 
     let mut modules = Vec::new();
+    // Modules that failed to load: dependents get no extra "unknown workspace module" error.
+    let mut failed = BTreeSet::new();
     for dir in discover_modules(root, &config, ctx.ws_file.as_deref(), &mut diags) {
         match load_module(&ctx, &dir) {
             Ok(m) => modules.push(m),
-            Err(d) => diags.0.extend(d.0),
+            Err((name, d)) => {
+                failed.insert(name);
+                diags.0.extend(d.0);
+            }
         }
     }
     modules.sort_by(|a, b| a.name.cmp(&b.name));
@@ -269,7 +274,7 @@ fn load_at(root: &Path, workspace_file: Option<PathBuf>) -> Result<Workspace, Di
         }
     }
     let ws = Workspace { root: root.to_path_buf(), workspace_file, config, modules };
-    validate_workspace_deps(&ws, &mut diags);
+    validate_workspace_deps(&ws, &failed, &mut diags);
     diags.dedup();
     diags.into_result(ws)
 }
@@ -302,10 +307,15 @@ fn parse_file<T: DeserializeOwned>(root: &Path, path: &Path) -> Result<(T, Value
     let raw: Value = serde_yaml_ng::from_str(&text).map_err(|e| Diagnostic::from_yaml_syntax(&display, e))?;
     let raw = if raw.is_null() { Value::Mapping(Default::default()) } else { raw };
     let mut diags = Diagnostics::default();
-    unknown_tags(&raw, "", &mut |key, tag| {
-        let d = Diagnostic::new(format!("unknown YAML tag `{tag}`"))
-            .in_file(display.clone())
-            .with_help("the only supported tag is `!replace`");
+    // The plain parse drops `!!` tags, so look for tags in a parse that keeps them.
+    let visible = if text.contains("!!") { parse_with_visible_tags(&text) } else { None };
+    unknown_tags(visible.as_ref().unwrap_or(&raw), "", &mut |key, tag| {
+        let help = if tag == "!!replace" {
+            "write `!replace` with a single `!`"
+        } else {
+            "the only supported tag is `!replace`"
+        };
+        let d = Diagnostic::new(format!("unknown YAML tag `{tag}`")).in_file(display.clone()).with_help(help);
         diags.push(if key.is_empty() { d } else { d.at_key(key) });
     });
     if !diags.is_empty() {
@@ -315,8 +325,12 @@ fn parse_file<T: DeserializeOwned>(root: &Path, path: &Path) -> Result<(T, Value
     let typed = match serde_path_to_error::deserialize::<_, T>(de) {
         Ok(typed) => typed,
         // `!replace` on a scalar (`release: !replace '17'`) reads as an enum in the typed parse;
-        // validate the untagged value instead (without source positions).
-        Err(_) if has_replace_tags(&raw) => from_value(&strip_replace_tags(raw.clone()), &display)?,
+        // validate the untagged value instead. If that fails too, the original error has a
+        // source position, so report it.
+        Err(e) if has_replace_tags(&raw) => match from_value(&strip_replace_tags(raw.clone()), &display) {
+            Ok(typed) => typed,
+            Err(_) => return Err(Diagnostic::from_yaml(&display, e).into()),
+        },
         Err(e) => return Err(Diagnostic::from_yaml(&display, e).into()),
     };
     Ok((typed, raw))
@@ -408,6 +422,7 @@ fn validate_workspace(ctx: &Ctx, diags: &mut Diagnostics) {
     }
     let policy = &config.policy;
     let unsupported = [
+        (config.scpm.is_some(), "scpm", 3),
         (!config.tasks.is_empty(), "tasks", 3),
         (!config.pipelines.is_empty(), "pipelines", 3),
         (config.pipeline_base.is_some(), "pipelineBase", 3),
@@ -427,7 +442,7 @@ fn validate_workspace(ctx: &Ctx, diags: &mut Diagnostics) {
     let names: Vec<&str> = config.presets.keys().map(String::as_str).collect();
     for (name, preset) in &config.presets {
         let prefix = format!("presets.{name}.");
-        for d in module_checks(preset, &prefix, Kind::Preset) {
+        for d in module_checks(preset, &prefix, Kind::Preset, None) {
             diags.push(ctx.in_ws(d));
         }
         let others: Vec<&str> = names.iter().copied().filter(|n| n != name).collect();
@@ -499,8 +514,9 @@ enum Kind {
 }
 
 /// Checks on a module file, a preset, or a `variants` entry, as written. Keys are prefixed with
-/// `prefix` (e.g. `presets.library.`); the caller sets the file.
-fn module_checks(m: &ModuleFile, prefix: &str, kind: Kind) -> Vec<Diagnostic> {
+/// `prefix` (e.g. `presets.library.`); the caller sets the file. `depth` is the number of
+/// directories between the workspace root and the module (unknown for presets).
+fn module_checks(m: &ModuleFile, prefix: &str, kind: Kind, depth: Option<usize>) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     let at = |key: &str| format!("{prefix}{key}");
     if kind == Kind::Preset && m.name.is_some() {
@@ -545,45 +561,86 @@ fn module_checks(m: &ModuleFile, prefix: &str, kind: Kind) -> Vec<Diagnostic> {
     ];
     for (key, list) in dirs {
         for (i, dir) in list.iter().flatten().enumerate() {
-            if !stays_inside(dir) {
-                out.push(
-                    Diagnostic::new(format!("`{dir}` is not inside the module"))
-                        .at_key(at(&format!("{key}[{i}]")))
-                        .with_help("source and resource directories are relative to the module and stay inside it"),
-                );
+            if let Some(d) = check_source_dir(dir, depth) {
+                out.push(d.at_key(at(&format!("{key}[{i}]"))));
             }
         }
     }
     if kind != Kind::Variant {
         for (selector, entry) in &m.variants {
             if let Err(e) = VariantSelector::parse(selector) {
-                out.push(
-                    Diagnostic::new(format!("invalid variant selector `{selector}`: {e}"))
-                        .at_key(at(&format!("variants.{selector}"))),
-                );
+                let d = Diagnostic::new(format!("invalid variant selector `{selector}`: {e}"))
+                    .at_key(at(&format!("variants.{selector}")));
+                out.push(match e.help() {
+                    Some(help) => d.with_help(help),
+                    None => d,
+                });
             }
-            out.extend(module_checks(entry, &format!("{prefix}variants.{selector}."), Kind::Variant));
+            out.extend(module_checks(entry, &format!("{prefix}variants.{selector}."), Kind::Variant, depth));
         }
     }
     out
 }
 
-/// A relative path that does not climb out of its base directory with `..`.
-fn stays_inside(dir: &str) -> bool {
-    let path = Path::new(dir);
-    if path.has_root() || dir.starts_with(['/', '\\']) {
-        return false;
+/// Source and resource directories are relative to the module and may point anywhere inside the
+/// workspace (`../shared` is a common sbt layout), but not outside it. With `depth` unknown (a
+/// preset), only absolute paths are rejected.
+fn check_source_dir(dir: &str, depth: Option<usize>) -> Option<Diagnostic> {
+    if is_absolute(dir) {
+        return Some(
+            Diagnostic::new(format!("`{dir}` is an absolute path"))
+                .with_help("source and resource directories are relative to the module directory"),
+        );
     }
-    let mut depth = 0usize;
-    for component in path.components() {
+    depth
+        .filter(|&d| leaves_root(dir, d))
+        .map(|_| Diagnostic::new(format!("`{dir}` is outside the workspace")).with_help(INSIDE_WORKSPACE))
+}
+
+const INSIDE_WORKSPACE: &str =
+    "source and resource directories are relative to the module and may point anywhere inside the workspace root";
+
+fn is_absolute(dir: &str) -> bool {
+    let path = Path::new(dir);
+    path.has_root() || dir.starts_with(['/', '\\']) || matches!(path.components().next(), Some(Component::Prefix(_)))
+}
+
+/// Whether the relative path `dir`, taken from a module `depth` directories below the workspace
+/// root, climbs out of the root with `..`.
+fn leaves_root(dir: &str, mut depth: usize) -> bool {
+    for component in Path::new(dir).components() {
         match component {
             Component::Normal(_) => depth += 1,
             Component::CurDir => {}
-            Component::ParentDir if depth > 0 => depth -= 1,
-            _ => return false,
+            Component::ParentDir => match depth.checked_sub(1) {
+                Some(d) => depth = d,
+                None => return true,
+            },
+            Component::RootDir | Component::Prefix(_) => return true,
         }
     }
-    true
+    false
+}
+
+/// Resolves `.` and `..` lexically (`modules/a/../shared` → `modules/shared`), matching how
+/// [`leaves_root`] checks paths.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(out.components().next_back(), Some(Component::Normal(_))) => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    if out.as_os_str().is_empty() { PathBuf::from(".") } else { out }
+}
+
+/// Directories between the workspace root and `rel_dir`.
+fn depth_of(rel_dir: &Path) -> usize {
+    rel_dir.components().filter(|c| matches!(c, Component::Normal(_))).count()
 }
 
 /// Module directories, relative to the root, in a stable order.
@@ -602,6 +659,9 @@ fn discover_modules(
     }
     let mut include = GlobSetBuilder::new();
     let mut exclude = GlobSetBuilder::new();
+    // Only the literal prefix of each include glob is walked (`modules/*` walks `modules/`), so
+    // large trees elsewhere in the workspace are never traversed.
+    let mut walk_roots = BTreeSet::new();
     for pattern in &config.modules {
         let (negated, pat) = match pattern.strip_prefix('!') {
             Some(p) => (true, p),
@@ -611,10 +671,11 @@ fn discover_modules(
         match GlobBuilder::new(pat).literal_separator(true).build() {
             Ok(glob) => {
                 if negated {
-                    exclude.add(glob)
+                    exclude.add(glob);
                 } else {
-                    include.add(glob)
-                };
+                    include.add(glob);
+                    walk_roots.extend(literal_prefix(pat));
+                }
             }
             Err(e) => {
                 let d = Diagnostic::new(format!("invalid glob `{pattern}`: {e}")).at_key("modules");
@@ -627,9 +688,21 @@ fn discover_modules(
     }
     let (include, exclude): (GlobSet, GlobSet) =
         (include.build().unwrap_or_default(), exclude.build().unwrap_or_default());
+    // A root nested in another is walked as part of it.
+    let walk_roots: Vec<PathBuf> = walk_roots
+        .iter()
+        .filter(|r| !walk_roots.iter().any(|other| other != *r && r.starts_with(other)))
+        .map(|r| root.join(r))
+        .filter(|r| r.is_dir())
+        .collect();
+    let Some((first, rest)) = walk_roots.split_first() else { return dirs.into_iter().collect() };
+    let mut builder = ignore::WalkBuilder::new(first);
+    for r in rest {
+        builder.add(r);
+    }
     // Membership is decided by the `modules` globs alone: ignore files don't hide modules, and
     // symlinked module directories count (symlink loops are reported by the walker and skipped).
-    let walker = ignore::WalkBuilder::new(root)
+    let walker = builder
         .hidden(true)
         .git_ignore(false)
         .git_exclude(false)
@@ -653,6 +726,24 @@ fn discover_modules(
         }
     }
     dirs.into_iter().collect()
+}
+
+/// The directory a `modules` glob can only match inside: its leading components without glob
+/// characters (`modules/*` → `modules`, `*` → the root). `None` for globs that climb out of the
+/// root, which can't match a module directory.
+fn literal_prefix(pattern: &str) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    for part in pattern.split('/') {
+        if part.contains(['*', '?', '[', ']', '{', '}', '\\']) {
+            break;
+        }
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            _ => prefix.push(part),
+        }
+    }
+    Some(prefix)
 }
 
 /// Where a module's effective `scala` came from, so errors point at the right file.
@@ -736,11 +827,31 @@ fn split_module(mut value: Value) -> (Value, Option<Value>) {
     (value, variants)
 }
 
-fn load_module(ctx: &Ctx, rel_dir: &Path) -> Result<Module, Diagnostics> {
+/// Loads one module. On failure, also returns the module's name (from `name:` if the file has
+/// one, else the directory) so that its dependents aren't reported as depending on an unknown
+/// module.
+fn load_module(ctx: &Ctx, rel_dir: &Path) -> Result<Module, (String, Diagnostics)> {
+    expand_module(ctx, rel_dir).map_err(|d| {
+        let declared = fs::read_to_string(ctx.root.join(rel_dir).join(MODULE_FILE))
+            .ok()
+            .and_then(|text| serde_yaml_ng::from_str::<Value>(&text).ok())
+            .and_then(|raw| raw.get("name").and_then(Value::as_str).map(str::to_string));
+        (declared.unwrap_or_else(|| dir_name(ctx.root, rel_dir)), d)
+    })
+}
+
+/// The module name implied by its directory.
+fn dir_name(root: &Path, rel_dir: &Path) -> String {
+    let dir = if rel_dir.as_os_str().is_empty() { root } else { rel_dir };
+    dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+fn expand_module(ctx: &Ctx, rel_dir: &Path) -> Result<Module, Diagnostics> {
     let file = rel_dir.join(MODULE_FILE);
     let (typed, mut raw): (ModuleFile, Value) = parse_file(ctx.root, &ctx.root.join(&file))?;
     let mut diags = Diagnostics::default();
-    for d in normalize_variant_keys(&mut raw, "").into_iter().chain(module_checks(&typed, "", Kind::Module)) {
+    let checks = module_checks(&typed, "", Kind::Module, Some(depth_of(rel_dir)));
+    for d in normalize_variant_keys(&mut raw, "").into_iter().chain(checks) {
         diags.push(d.in_file(&file));
     }
 
@@ -777,10 +888,7 @@ fn load_module(ctx: &Ctx, rel_dir: &Path) -> Result<Module, Diagnostics> {
     let base: ModuleFile = from_value(&exp.effective, &file)?;
     let (name, from_dir) = match &base.name {
         Some(n) => (n.clone(), false),
-        None => {
-            let dir = if rel_dir.as_os_str().is_empty() { ctx.root } else { rel_dir };
-            (dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), true)
-        }
+        None => (dir_name(ctx.root, rel_dir), true),
     };
     if !valid_module_name(&name) {
         let rules = "module names use lowercase letters, digits, `-`, `_` and `.`, starting with a letter or digit";
@@ -1014,10 +1122,29 @@ fn build_variant(
             boms.push(b);
         }
     }
+    // The module's own directories were checked as written; any that leave the workspace here
+    // came from a preset, which can't know the module's depth.
+    let depth = depth_of(rel_dir);
+    let dir_lists = [
+        ("sources", &cfg.sources),
+        ("resources", &cfg.resources),
+        ("testSources", &cfg.test_sources),
+        ("testResources", &cfg.test_resources),
+    ];
+    for (key, list) in dir_lists {
+        for dir in list.iter().flatten().filter(|d| !is_absolute(d) && leaves_root(d, depth)) {
+            diags.push(
+                Diagnostic::new(format!("`{dir}` (from a preset) is outside the workspace for this module"))
+                    .in_file(file)
+                    .at_key(key)
+                    .with_help(INSIDE_WORKSPACE),
+            );
+        }
+    }
     let module_root = rel_dir.to_path_buf();
     let resolve_dirs = |explicit: &Option<Vec<String>>, defaults: &[&str], scope_dir: &str| -> Vec<PathBuf> {
         match explicit {
-            Some(list) => list.iter().map(|d| module_root.join(d)).collect(),
+            Some(list) => list.iter().map(|d| normalize(&module_root.join(d))).collect(),
             None => {
                 let mut dirs: Vec<PathBuf> = defaults.iter().map(|d| module_root.join(d)).collect();
                 if defaults.iter().any(|d| d.ends_with("scala")) {
@@ -1113,16 +1240,19 @@ fn external_dependency(
     Ok(Dependency { scope, coord, spec: spec.version().0.clone(), version, exclude, classifier, kind, transitive })
 }
 
-fn validate_workspace_deps(ws: &Workspace, diags: &mut Diagnostics) {
-    let names: Vec<_> = ws.modules.iter().map(|m| m.name.as_str()).collect();
+/// Reports dependencies on modules that don't exist. `failed` holds the names of modules that
+/// exist but failed to load; their errors are reported already.
+fn validate_workspace_deps(ws: &Workspace, failed: &BTreeSet<String>, diags: &mut Diagnostics) {
+    let names: Vec<_> = ws.modules.iter().map(|m| m.name.as_str()).chain(failed.iter().map(String::as_str)).collect();
     for module in &ws.modules {
         for variant in &module.variants {
             for dep in &variant.workspace_dependencies {
-                if ws.module(&dep.module).is_none() {
+                if ws.module(&dep.module).is_none() && !failed.contains(&dep.module) {
                     let mut d = Diagnostic::new(format!("unknown workspace module `{}`", dep.module))
                         .in_file(module_file(module))
                         .at_key(format!("{}.{}", dep.scope.key(), dep.module));
-                    if let Some(b) = closest(&dep.module, names.iter().copied()) {
+                    let others = names.iter().copied().filter(|n| *n != module.name);
+                    if let Some(b) = closest(&dep.module, others) {
                         d = d.with_help(format!("did you mean `{b}`?"));
                     }
                     diags.push(d);
@@ -1152,12 +1282,30 @@ mod tests {
     }
 
     #[test]
-    fn source_dirs_stay_inside_the_module() {
+    fn module_globs_walk_their_literal_prefix() {
+        let prefix = |p: &str| literal_prefix(p).map(|p| slash_path(&p));
+        assert_eq!(prefix("modules/*"), Some("modules".into()));
+        assert_eq!(prefix("libs/core/**"), Some("libs/core".into()));
+        assert_eq!(prefix("modules/a"), Some("modules/a".into()));
+        assert_eq!(prefix("*"), Some("".into()));
+        assert_eq!(prefix("**/x"), Some("".into()));
+        assert_eq!(prefix("mod{a,b}/*"), Some("".into()));
+        assert_eq!(prefix("../x/*"), None);
+    }
+
+    #[test]
+    fn source_dirs_stay_inside_the_workspace() {
         for ok in ["src/main/scala", "./gen", "a/../b"] {
-            assert!(stays_inside(ok), "{ok}");
+            assert!(!leaves_root(ok, 0), "{ok}");
         }
-        for bad in ["/abs", "../shared", "a/../../b", "\\\\server\\share"] {
-            assert!(!stays_inside(bad), "{bad}");
+        assert!(!leaves_root("../shared", 1));
+        assert!(!leaves_root("../../shared/src", 2));
+        for bad in ["../shared", "a/../../b"] {
+            assert!(leaves_root(bad, 0), "{bad}");
+        }
+        assert!(leaves_root("../../x", 1));
+        for abs in ["/abs", "\\\\server\\share"] {
+            assert!(is_absolute(abs), "{abs}");
         }
     }
 }

@@ -30,6 +30,7 @@ Kill the riskiest assumptions with throwaway code before committing to the archi
 **Config and dependencies**
 - The full v1 schema (design §4) is accepted. Keys for features not built yet are an error, "`<key>` is not supported yet (planned for Phase N)", whenever they would change behaviour; never silently ignored.
 - Workspace + module config: catalogs (default and named), BOMs, overrides, the `workspace:*` protocol, presets with the normative resolution order (§4.4), and four dependency scopes.
+- Semver ranges (§5.5) in dependencies and catalogs, resolved to exact versions at lock time.
 - Module settings: sbt/Maven source layout plus `sources`/`resources`/`testSources`/`testResources`, `scala: none` (Java-only), `compilerPlugins`, `javacOptions`, `release`, `mainClass`, `jvmOptions`, `env`. (`generatedSources` comes with tasks in Phase 3.)
 - `scpm install` / `--frozen` and `scpm-lock.yaml` (§5.4): variant ids even for single-variant modules, four classpaths per variant, joint resolution over the workspace closure, per-variant `specifiers` and `inputsHash`, a fixed resolution context, the boot section, sha256 values.
 - Stale lock: locally `compile`/`test`/`run` install first and print what changed; with `CI=true` or `--frozen` it is an error. `scpm ci` = `scpm install --frozen`, then `compile` and `test` over the whole workspace (it switches to `scpm pipeline` in Phase 3).
@@ -63,7 +64,7 @@ Kill the riskiest assumptions with throwaway code before committing to the archi
 - `scpm fmt`, `scpm lint` (scalafmt and scalafix in the warm worker), `scpm console`.
 - Dependency maintenance:
   - `scpm add|remove|update|outdated|dedupe`
-  - semver ranges (§5.5) and `versionScheme` conflict checks
+  - `versionScheme` conflict checks
 - MCP write tools: `add_dependency`, `remove_dependency`, `update`, `outdated`.
 - `scpm import sbt` covering the common plugin mappings.
 - Renovate preset (JSONata manager) plus a lock fix-up GitHub Action that works with the free hosted Renovate app (design §5.8).

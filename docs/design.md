@@ -208,7 +208,7 @@ A lone `scpm.yaml` with no workspace file is a valid single-module project, just
 ```yaml
 # scpm-workspace.yaml
 $schema: https://scpm.dev/schema/workspace-1.json
-scpm: 0.4.2                       # pinned tool version; older/newer binaries re-exec this one
+scpm: 0.4.2                       # Phase 3: pinned tool version; older/newer binaries re-exec this one
 
 modules:
   - modules/*
@@ -345,7 +345,7 @@ Notes:
       dependencies:
         org.typelevel::cats-core: catalog:scala213   # looks up org.typelevel::cats-core in catalogs.scala213
   ```
-- **Source layout** is sbt/Maven's by default: `src/main/scala`, `src/main/java`, `src/main/resources`, `src/test/scala`, `src/test/java`, `src/test/resources`. Version- and platform-specific directories (`src/main/scala-2`, `scala-3`, `scala-2.13`, `scala-jvm`, `scala-js`, `scala-native`, and their `src/test/…` twins) are added automatically for the variants they match. `sources`, `resources`, `testSources` and `testResources` (lists of directories relative to the module) replace the defaults.
+- **Source layout** is sbt/Maven's by default: `src/main/scala`, `src/main/java`, `src/main/resources`, `src/test/scala`, `src/test/java`, `src/test/resources`. Version- and platform-specific directories (`src/main/scala-2`, `scala-3`, `scala-2.13`, `scala-jvm`, `scala-js`, `scala-native`, and their `src/test/…` twins) are added automatically for the variants they match. `sources`, `resources`, `testSources` and `testResources` (lists of directories relative to the module) replace the defaults. They may point anywhere inside the workspace (a shared `../shared` directory is a common sbt layout); absolute paths and paths that leave the workspace root are errors.
 - **`${outDir}`** is `.scpm/out/<variant-id>/`. `generatedSources` lists directories relative to it; tasks write them and they join the compile sources. Because tasks arrive in Phase 3, so does `generatedSources`; until then both are "not supported yet". In the sketches above, `tasks`, `pipelines`, `pipelineBase`, `generatedSources`, `policy` and `versioning` are later-phase keys.
 - **`scala: none`** marks a Java-only module: no suffix, no scala-library, variant id `<name>@jvm`.
 - **`compilerPlugins`** maps a coordinate to a spec, like dependencies. `:::` coordinates are resolved full-cross (`_<full Scala version>`). Every plugin jar is passed as `-Xplugin:<jar>`, Scala 3 plugins included.

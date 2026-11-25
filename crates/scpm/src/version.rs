@@ -102,7 +102,9 @@ impl VersionSpec {
         let is_range = s.starts_with(['^', '~', '>', '<', '=', '[', '('])
             || s.contains(' ')
             || s.contains('*')
-            || s.contains(".x");
+            || s.contains(".x")
+            // Ivy dynamic revisions: `1.2.+`, `1.2+`, `+`.
+            || s.ends_with('+');
         if is_range {
             VersionSpec::Range { range: s.to_string() }
         } else {
@@ -134,6 +136,8 @@ mod tests {
         assert_eq!(VersionSpec::parse("^0.14.10"), VersionSpec::Range { range: "^0.14.10".into() });
         assert_eq!(VersionSpec::parse("[1.0,2.0)"), VersionSpec::Range { range: "[1.0,2.0)".into() });
         assert_eq!(VersionSpec::parse(">=1.2 <2"), VersionSpec::Range { range: ">=1.2 <2".into() });
+        assert_eq!(VersionSpec::parse("1.2.+"), VersionSpec::Range { range: "1.2.+".into() });
+        assert_eq!(VersionSpec::parse("1.0.0+build.5"), VersionSpec::Exact { version: "1.0.0+build.5".into() });
         assert_eq!(VersionSpec::parse("catalog"), VersionSpec::Catalog { catalog: None });
         assert_eq!(VersionSpec::parse("catalog:"), VersionSpec::Catalog { catalog: None });
         assert_eq!(VersionSpec::parse("catalog:default"), VersionSpec::Catalog { catalog: None });

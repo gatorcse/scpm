@@ -741,14 +741,33 @@ fn module_name_errors_show_the_value() {
 }
 
 #[test]
-fn source_directories_stay_inside_the_module() {
+fn source_directories_may_point_anywhere_inside_the_workspace() {
     let dir = workspace(&[
         ("scpm-workspace.yaml", WS),
-        ("modules/a/scpm.yaml", "sources: [src, ../shared]\ntestResources: [/etc]\n"),
+        ("modules/a/scpm.yaml", "sources: [src, ../shared, ../../common]\ntestResources: [./res]\n"),
+    ]);
+    let v = json(dir.path(), &["config", "a"]);
+    assert_eq!(v[0]["sources"], serde_json::json!(["modules/a/src", "modules/shared", "common"]));
+    assert_eq!(v[0]["testResources"], serde_json::json!(["modules/a/res"]));
+
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", WS),
+        ("modules/a/scpm.yaml", "sources: [src, ../../../outside]\ntestResources: [/etc]\n"),
     ]);
     let err = config_error(dir.path(), &["ls"]);
-    once(&err, "modules/a/scpm.yaml: sources[1]: `../shared` is not inside the module");
-    once(&err, "modules/a/scpm.yaml: testResources[0]: `/etc` is not inside the module");
+    once(&err, "modules/a/scpm.yaml: sources[1]: `../../../outside` is outside the workspace");
+    once(&err, "modules/a/scpm.yaml: testResources[0]: `/etc` is an absolute path");
+
+    // A preset's directories are checked against each module that uses it.
+    let ws = format!("{WS}presets:\n  lib: {{resources: ['../res']}}\n");
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", &ws),
+        ("scpm.yaml", "name: root\nextends: [lib]\n"),
+        ("modules/a/scpm.yaml", "extends: [lib]\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    once(&err, "scpm.yaml: resources: `../res` (from a preset) is outside the workspace for this module");
+    assert!(!err.contains("modules/a/scpm.yaml"), "{err}");
 }
 
 #[test]
@@ -773,4 +792,132 @@ fn graph_errors_point_at_modules() {
         ),
         "{err}"
     );
+}
+
+#[test]
+fn modules_that_fail_to_load_are_not_unknown_to_their_dependents() {
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", WS),
+        ("modules/b/scpm.yaml", "platforms: [js]\n"),
+        ("modules/a/scpm.yaml", "dependencies: {b: 'workspace:*'}\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    once(&err, "modules/b/scpm.yaml: platforms: the `js` platform is not supported yet (planned for Phase 2)");
+    assert!(!err.contains("unknown workspace module"), "{err}");
+
+    // The name comes from `name:` when the file has one, even if the file doesn't validate.
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", WS),
+        ("modules/b/scpm.yaml", "name: lib\nscalacOptoins: [-x]\n"),
+        ("modules/a/scpm.yaml", "dependencies: {lib: 'workspace:*'}\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    once(&err, "modules/b/scpm.yaml");
+    assert!(!err.contains("unknown workspace module"), "{err}");
+}
+
+#[test]
+fn unknown_workspace_modules_never_suggest_the_depending_module() {
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", WS),
+        ("modules/core/scpm.yaml", "dependencies: {cor: 'workspace:*'}\n"),
+        ("modules/util/scpm.yaml", "{}\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    once(&err, "modules/core/scpm.yaml: dependencies.cor: unknown workspace module `cor`");
+    assert!(!err.contains("did you mean"), "{err}");
+}
+
+#[test]
+fn scpm_version_pin_is_not_supported_yet() {
+    let ws = format!("scpm: 0.4.2\n{WS}");
+    let dir = workspace(&[("scpm-workspace.yaml", &ws), ("modules/a/scpm.yaml", "{}\n")]);
+    let err = config_error(dir.path(), &["ls"]);
+    once(&err, "scpm-workspace.yaml: scpm: `scpm` is not supported yet (planned for Phase 3)");
+}
+
+#[test]
+fn ivy_dynamic_revisions_are_ranges() {
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", WS),
+        ("modules/a/scpm.yaml", "dependencies: {'org.foo:bar': 1.2.+, 'org.foo:baz': 1.2.3}\n"),
+    ]);
+    let v = json(dir.path(), &["config", "a"]);
+    let deps = &v[0]["dependencies"];
+    assert_eq!(deps[0]["version"], serde_json::json!({"kind": "range", "range": "1.2.+"}));
+    assert_eq!(deps[1]["version"], serde_json::json!({"kind": "exact", "version": "1.2.3"}));
+}
+
+#[test]
+fn double_bang_tags_are_errors() {
+    let ws = format!("{WS}presets:\n  lib: {{scalacOptions: [-a, -Werror]}}\n");
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", &ws),
+        ("modules/a/scpm.yaml", "extends: [lib]\nscalacOptions: !!replace [-a]\nrelease: !!str 17\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    once(
+        &err,
+        "modules/a/scpm.yaml: scalacOptions: unknown YAML tag `!!replace`\n  help: write `!replace` with a single `!`",
+    );
+    once(&err, "modules/a/scpm.yaml: release: unknown YAML tag `!!str`");
+
+    // Also when the file starts with a document marker.
+    let dir =
+        workspace(&[("scpm-workspace.yaml", &ws), ("modules/a/scpm.yaml", "---\nscalacOptions: !!replace [-a]\n")]);
+    let err = config_error(dir.path(), &["ls"]);
+    once(&err, "modules/a/scpm.yaml: scalacOptions: unknown YAML tag `!!replace`");
+}
+
+#[test]
+fn lone_scala_majors_other_than_3_are_invalid_selectors() {
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", CROSS_WS),
+        ("modules/core/scpm.yaml", "extends: [cross]\nvariants:\n  '2': {scalacOptions: [-x]}\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    once(
+        &err,
+        "modules/core/scpm.yaml: variants.2: invalid variant selector `2`: `2` is not a Scala binary version\n  help: use a binary version such as 2.12 or 2.13",
+    );
+
+    let dir = workspace(&[("scpm-workspace.yaml", CROSS_WS), ("modules/core/scpm.yaml", "extends: [cross]\n")]);
+    scpm(dir.path()).args(["ls", "-F", "core@2"]).assert().code(2).stderr(predicate::str::contains(
+        "invalid selector `core@2`: `2` is not a Scala binary version; use a binary version such as 2.12 or 2.13",
+    ));
+    assert_eq!(ls_ids(dir.path(), &["-F", "core@3"]), vec!["core@jvm-3"]);
+}
+
+#[test]
+fn failed_replace_fallback_reports_the_positioned_error() {
+    let ws = format!("{WS}presets:\n  lib: {{release: '11'}}\n");
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", &ws),
+        ("modules/a/scpm.yaml", "extends: [lib]\nmainClass: [x]\nrelease: !replace '17'\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    assert!(err.contains("modules/a/scpm.yaml:2:12: mainClass: "), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn module_discovery_walks_only_the_glob_prefixes() {
+    let dir = workspace(&[("scpm-workspace.yaml", WS), ("modules/a/scpm.yaml", "{}\n")]);
+    // Outside `modules/`: a tree of symlinks that takes 8^8 steps to walk with links followed.
+    let fan = dir.path().join("fan");
+    for level in 0..=8 {
+        fs::create_dir_all(fan.join(format!("d{level}"))).unwrap();
+    }
+    for level in 0..8 {
+        for i in 0..8 {
+            let link = fan.join(format!("d{level}/l{i}"));
+            std::os::unix::fs::symlink(fan.join(format!("d{}", level + 1)), link).unwrap();
+        }
+    }
+    scpm(dir.path())
+        .args(["ls"])
+        .timeout(std::time::Duration::from_secs(20))
+        .assert()
+        .success()
+        .stdout("a@jvm-3  modules/a\n");
 }
