@@ -1,0 +1,7 @@
+/target
+**/target/
+.scpm/
+.bsp/
+.metals/
+.idea/
+.DS_Store
