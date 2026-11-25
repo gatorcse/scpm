@@ -30,8 +30,10 @@ Responses (helper → CLI), exactly one per request id:
 {"id": 1, "error": {"code": "bad_request", "message": "..."}}
 ```
 
-Error codes: `bad_request` (malformed JSON or params; `id` is `null` if the request itself could
-not be parsed), `unknown_method`, `unsupported_protocol`, `internal`.
+Error codes: `bad_request` (malformed JSON, missing or invalid params; answered with the
+request's own `id` whenever an integer `id` can be read, `null` otherwise), `unknown_method`,
+`unsupported_protocol`, `internal` (a bug in the helper; the request still gets exactly this one
+response).
 
 Notifications (helper → CLI), any number, interleaved:
 
@@ -73,6 +75,15 @@ belong to. Unknown fields must be ignored by both sides (forward compatibility).
 | `javacOptions` | string[] | |
 | `javaHome` | string? | For javac; defaults to the worker's JVM. |
 | `rootPaths` | object? | Portable-analysis markers, e.g. `{"WS": "/abs/ws", "CACHE": "/abs/coursier/cache"}`. When present, analysis is written with paths relative to these roots (`${WS}/src/A.scala`); paths under no root stay absolute. Events always carry absolute paths. |
+| `upstreamAnalyses` | object[]? | `[{"classesDir": "/abs/core/classes", "analysisFile": "/abs/core/analysis.zip"}]`: one entry per workspace module whose classes dir is on `classpath`. `analysisFile` may not exist yet. The worker gives Zinc these analyses (as sbt does between projects), so an API change or a removed class upstream invalidates the sources that use it. Upstream must be compiled before its dependents, so its analysis matches its classes dir. Without an entry, a classes dir is treated like a jar: its class files are compared by name, size and modification time. |
+
+All paths must be absolute. The request is checked before it is queued: a missing compiler,
+library or bridge jar, a missing source, a relative path, or a source inside `classesDir` is a
+`bad_request` naming the field and path.
+
+When `analysisFile` does not exist, `classesDir` is emptied before compiling: without an
+analysis nothing knows which class files are stale. A `failed` or `cancelled` compile leaves
+`classesDir` as it was before the request.
 
 `result`:
 
@@ -82,12 +93,17 @@ belong to. Unknown fields must be ignored by both sides (forward compatibility).
 
 `status` is one of `ok`, `failed` (compile errors), `cancelled`, `crashed` (internal
 error; details in `message`, a string field present only then). `compiledSources` counts the
-sources compiled in this run; `noop` is true when nothing had to be compiled.
+sources Zinc compiled in this run (changed plus invalidated, across all incremental cycles);
+`noop` is true when nothing had to be compiled.
+
+A compile hitting a fatal JVM error (`VirtualMachineError`, e.g. a stack overflow) is answered
+`crashed`, then the worker exits with status 3; the CLI restarts it.
 
 ### `cancel`
 
 `params`: `{"requestId": 1}` → `result`: `{}`. The cancelled request then completes
-with `status: cancelled`.
+with `status: cancelled`, promptly even if it was still waiting behind another compile of the
+same `analysisFile` (compiles of one target are serialized; different targets run in parallel).
 
 ### `shutdown`
 
@@ -98,7 +114,9 @@ same way, without a response.
 ## Methods: test runner
 
 The test runner is started as `java -cp <runner jar + deps + test classpath> scpm.testrunner.Main`
-and receives exactly one `run` request, then exits.
+and receives exactly one `run` request, then exits. The CLI keeps the runner's stdin open for
+the whole run: end of input means the CLI went away, and the runner logs that and exits with
+status 4. Tests themselves see an empty stdin.
 
 ### `run`
 
@@ -106,7 +124,7 @@ and receives exactly one `run` request, then exits.
 |---|---|---|
 | `target` | string | e.g. `core@jvm-3` |
 | `testClassesDirs` | string[] | Directories to scan for test classes. |
-| `frameworks` | string[]? | Fully qualified `sbt.testing.Framework` class names. Default: auto-detect the common ones (munit, ScalaTest, weaver, ZIO Test, specs2, JUnit via junit-interface, utest). |
+| `frameworks` | string[]? | Fully qualified `sbt.testing.Framework` class names. Default: auto-detect the common ones (munit, ScalaTest, weaver, ZIO Test, utest, specs2, ScalaCheck, JUnit via junit-interface). |
 | `filters` | string[]? | Glob patterns on fully qualified test class names. |
 | `testNames` | string[]? | Run only these test cases (framework support permitting). |
 
@@ -114,8 +132,16 @@ and receives exactly one `run` request, then exits.
 
 `failed` counts `failed` and `error` cases; `skipped` counts `skipped`, `ignored`, `canceled`
 and `pending`. The process exits 0 once the response is written and 2 if the request is
-malformed (after an error response). The runner is plain Java with no dependency beyond
-`test-interface`, so it can share a flat classpath with Scala 2 or Scala 3 tests.
+malformed (after an error response). A framework named in `frameworks` that is not on the
+classpath is a `bad_request` ("framework X is not on the classpath"). `filters` that match no
+suite give an `ok` result with zero counts and a `warn` log event.
+
+If a test ends the JVM (`System.exit`), the runner still emits `test.suite.end` for the running
+suite, an `error` log naming it, and a `crashed` result with the counts so far, from a shutdown
+hook. The CLI enforces timeouts by killing the runner's process group.
+
+The runner is plain Java with no dependency beyond `test-interface`, so it can share a flat
+classpath with Scala 2 or Scala 3 tests.
 
 ## Events
 
@@ -129,8 +155,8 @@ Every event has `t` (type), `requestId`, and `target`.
 {"t": "diagnostic", "requestId": 1, "target": "core@jvm-3",
  "severity": "error",                 // error | warning | info
  "file": "/abs/path/Foo.scala",       // absolute, or null for global diagnostics
- "range": {"start": {"line": 41, "col": 7}, "end": {"line": 41, "col": 19}},   // 1-based lines and columns; null if unknown
- "code": "E007",                       // Scala 3 error code if present, else null
+ "range": {"start": {"line": 41, "col": 7}, "end": {"line": 41, "col": 19}},   // 1-based lines and columns, end exclusive; null if unknown
+ "code": "E007",                       // Scala 3 error code if present, else null (Scala 2, javac, Scala 3 messages without an id)
  "message": "Found: Int\nRequired: String",
  "rendered": "...",                    // the compiler's own rendering, if available
  "actions": [{"title": "...", "edits": [{"file": "...", "range": {...}, "newText": "..."}]}]}
@@ -149,8 +175,11 @@ Every event has `t` (type), `requestId`, and `target`.
 
 Notes:
 
-- Diagnostic `message` is plain text; `rendered` is the compiler's own output and may contain
-  ANSI colours.
+- Diagnostic `message` is plain text, including javac's detail lines (`symbol: ...`) for both
+  in-process and forked javac; `rendered` is the compiler's own output and may contain ANSI
+  colours.
+- A range's `end` is exclusive. When the compiler reports only a caret (javac), the range covers
+  that one character; when it reports only a line, the range is the start of that line.
 - A test failure's `file` is the source path relative to its source root (package directory plus
   the file name recorded in the class file) because bytecode does not record absolute paths. It
   is `null` when no stack frame points into the suite. The CLI resolves it against the target's
@@ -169,4 +198,16 @@ the helper jars via `SCPM_WORKER_JAR` and `SCPM_TEST_RUNNER_JAR`, or in the sbt 
 directory of the repo checkout next to the binary:
 `worker/target/out/jvm/scala-*/scpm-compile-worker/scpm-compile-worker_3-*.jar` and
 `worker/target/out/jvm/u/scpm-test-runner/scpm-test-runner-*.jar` (ignore `*-tests.jar`).
-See `worker/README.md` for launch flags.
+
+### Required launch flags
+
+The CLI launches both helpers with:
+
+```
+-XX:+DisplayVMOutputToStderr -Xlog:disable -Xlog:all=warning:stderr -XX:+ExitOnOutOfMemoryError
+```
+
+The first three keep HotSpot's own messages (warnings, crash notices, unified logging) off
+stdout, which carries protocol messages only. The last makes an out-of-memory JVM exit
+instead of answering requests in a broken state. `worker/README.md` lists two more optional flags
+that silence JDK 25 warnings on stderr.
