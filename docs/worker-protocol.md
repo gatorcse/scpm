@@ -96,8 +96,10 @@ error; details in `message`, a string field present only then). `compiledSources
 sources Zinc compiled in this run (changed plus invalidated, across all incremental cycles);
 `noop` is true when nothing had to be compiled.
 
-A compile hitting a fatal JVM error (`VirtualMachineError`, e.g. a stack overflow) is answered
-`crashed`, then the worker exits with status 3; the CLI restarts it.
+A compile that overflows the stack is answered `crashed` and the worker keeps serving. Any other
+fatal JVM error (`VirtualMachineError`: `InternalError`, `OutOfMemoryError` when
+`-XX:+ExitOnOutOfMemoryError` did not already end the JVM) is answered `crashed`, then the worker
+exits with status 3; the CLI restarts it.
 
 ### `cancel`
 
@@ -114,9 +116,10 @@ same way, without a response.
 ## Methods: test runner
 
 The test runner is started as `java -cp <runner jar + deps + test classpath> scpm.testrunner.Main`
-and receives exactly one `run` request, then exits. The CLI keeps the runner's stdin open for
-the whole run: end of input means the CLI went away, and the runner logs that and exits with
-status 4. Tests themselves see an empty stdin.
+and receives exactly one `run` request, then exits. The CLI keeps the runner's stdin open until
+it has the response, and may close it right after. End of input before the response means the
+CLI went away: the runner kills the processes its tests started, answers `crashed` (message
+`parent went away (stdin closed)`) and exits with status 4. Tests themselves see an empty stdin.
 
 ### `run`
 
@@ -128,7 +131,8 @@ status 4. Tests themselves see an empty stdin.
 | `filters` | string[]? | Glob patterns on fully qualified test class names. |
 | `testNames` | string[]? | Run only these test cases (framework support permitting). |
 
-`result`: `{"status": "ok" | "failed" | "crashed", "passed": 10, "failed": 1, "skipped": 0, "durationMs": 845}`
+`result`: `{"status": "ok" | "failed" | "crashed", "passed": 10, "failed": 1, "skipped": 0, "durationMs": 845}`,
+plus a `message` string when the run was abandoned (`crashed`).
 
 `failed` counts `failed` and `error` cases; `skipped` counts `skipped`, `ignored`, `canceled`
 and `pending`. The process exits 0 once the response is written and 2 if the request is
@@ -137,8 +141,8 @@ classpath is a `bad_request` ("framework X is not on the classpath"). `filters` 
 suite give an `ok` result with zero counts and a `warn` log event.
 
 If a test ends the JVM (`System.exit`), the runner still emits `test.suite.end` for the running
-suite, an `error` log naming it, and a `crashed` result with the counts so far, from a shutdown
-hook. The CLI enforces timeouts by killing the runner's process group.
+suite, an `error` log naming it, and a `crashed` result with the counts so far and the message
+`a test called System.exit(<status>)` (the status is known on JDK 21+), from a shutdown hook. The CLI enforces timeouts by killing the runner's process group.
 
 The runner is plain Java with no dependency beyond `test-interface`, so it can share a flat
 classpath with Scala 2 or Scala 3 tests.

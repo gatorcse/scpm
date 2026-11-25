@@ -62,8 +62,8 @@ compiler, library and bridge jars for Scala 3 and 2.13.
 - `-XX:+DisplayVMOutputToStderr -Xlog:disable -Xlog:all=warning:stderr` keep HotSpot's own
   output (VM warnings, unified logging) off stdout, which must carry protocol JSON only.
 - `-XX:+ExitOnOutOfMemoryError`: a JVM that has run out of memory exits and is restarted
-  rather than limping on. The worker itself answers `crashed` and exits 3 on other fatal JVM
-  errors.
+  rather than limping on. The worker answers `crashed` and exits 3 on other fatal JVM errors,
+  except a stack overflow, which only fails that compile.
 
 Two more are optional. On JDK 25, `--enable-native-access=ALL-UNNAMED` silences a stderr warning
 from Zinc's file watcher library (swoval), and `--sun-misc-unsafe-memory-access=allow` one from
@@ -89,8 +89,11 @@ Scala 3 versions before 3.8 (`LazyVals`).
   compile does not deserialize them again. Deleting or replacing a file is honoured. Without an
   analysis, `classesDir` is emptied first, so stale classes from deleted sources can't satisfy
   new code.
-- **Class files.** Zinc's transactional class-file manager backs up what it deletes, so a
-  failed or cancelled compile leaves `classesDir` as it was. For Scala 3, `.tasty` files are
+- **Class files.** Zinc's transactional class-file manager backs up what it deletes, into a
+  directory next to `classesDir` (same volume, so moves are cheap), and a failed or cancelled
+  compile leaves `classesDir` as it was. The worker installs the manager itself and rolls back
+  whenever the request was cancelled, because the Scala 3 bridge ends a cancelled run as a
+  success. For Scala 3, `.tasty` files are
   tracked with their classes (`TastyFiles`), so deleting a source deletes its TASTy too.
 - **Upstream modules.** With `upstreamAnalyses`, an upstream classes dir is looked up with its
   analysis, as sbt does between projects. Classes from it become external dependencies, and an
@@ -153,9 +156,12 @@ Scala 3 versions before 3.8 (`LazyVals`).
   by line. Framework loggers map to `debug`/`info`/`warn`/`error`. The process exits 0 once the
   response is written, even if a framework left non-daemon threads behind, and exits 2 on a
   malformed request.
-- **Lifetime.** Tests get an empty `System.in`. A daemon thread watches the real stdin and exits
-  with status 4 when it closes, so a killed CLI never leaves a runner behind. If a test calls
-  `System.exit`, a shutdown hook closes the running suite and answers `crashed`. The request
+- **Lifetime.** Tests get an empty `System.in`. A daemon thread watches the real stdin. If it
+  closes before the response (the CLI went away), the runner kills the processes its tests
+  started and exits with status 4, so nothing outlives the CLI. Closing stdin after the response
+  is normal and silent. If a test calls `System.exit`, a shutdown hook closes the running suite
+  and answers `crashed` with `a test called System.exit(<status>)`. On JDK 21+ the status comes
+  from the JDK's `Runtime.exit` logging. The request
   parser caps JSON nesting at 64 levels.
 
 ## Measurements
@@ -165,11 +171,11 @@ Worker-reported `durationMs` from `it/run.sh`, three runs on an Apple M2 Pro (10
 it includes class loading and JIT warm-up of the compiler. "Warm" is a later compile after a source
 change, in the same worker.
 
-| Fixture | Cold | Warm (after change) | No-op |
+| Fixture | Cold | Warm (after change) | No-op ² |
 |---|---|---|---|
-| Scala 3.9.0, 2 files (body change in 1) | 1404–1536 ms | 105–119 ms | 18–19 ms |
-| Scala 2.13.18, 1 Scala + 1 Java (Java change) | 1187–1229 ms | 37–38 ms | 5–7 ms |
-| Scala 3.9.0 + cats-core, 1 file | 423–494 ms ¹ | 300–357 ms | 6–20 ms |
+| Scala 3.9.0, 2 files (body change in 1) | 1404–1536 ms | 105–119 ms | 11–22 ms |
+| Scala 2.13.18, 1 Scala + 1 Java (Java change) | 1187–1229 ms | 37–38 ms | 4 ms |
+| Scala 3.9.0 + cats-core, 1 file | 423–494 ms ¹ | 300–357 ms | 4–14 ms |
 | Scala 3.9.0, 400 generated files (1 file changed) | 1642–1930 ms ¹ | 191–202 ms | — |
 
 ¹ These run after the 2-file Scala 3.9 fixture in the same worker, so the compiler is already
@@ -177,10 +183,15 @@ loaded and partly warm. The first-ever compile is not cold here, and the gap fro
 fixture's 1.4 s shows what the warm worker saves. The 400-file "cold" figure is a full compile in
 an already warm worker.
 
+² From a later set of runs, after the target's own `classesDir` was excluded from directory
+hashing, on a machine busy with other builds; the cold and warm columns of those runs were
+30–40% slower across the board, so they are not shown.
+
 These match the shape of the design doc's measurements: the first compile in a JVM costs about a
 second of fixed warm-up, an incremental compile in a warm worker costs tens to hundreds of
-milliseconds, and a no-op takes a few to about 20 milliseconds (it now also hashes the class
-directories on the classpath and sets up the transactional backup). The CLI is meant to skip even that with its own fingerprint check.
+milliseconds, and a no-op takes a few to about 20 milliseconds (it hashes upstream class
+directories and sets up the transactional backup). The CLI is meant to skip even that with its
+own fingerprint check.
 
 ## Limitations
 
