@@ -645,7 +645,7 @@ Prior art:
 - **scala-steward**: `updates.cooldown.minimumAge` with `skipForVulnerabilityCheck = true` (the default). Updates that fix a known OSV vulnerability skip the cooldown.
 - **aube**: no advisory bypass at all.
 
-scpm combines them: **the bypass is automatic, but it is always written down.**
+scpm follows pnpm: **the bypass is explicit (`scpm audit --fix`) and always written down.** Resolution never calls an advisory database by default. A network lookup inside `install` would make locking depend on OSV's availability and on when an advisory happened to be published, and the lock should depend only on its inputs and the repositories. The scala-steward behaviour (security updates skip the cooldown automatically) lives in the update bot (§5.8), which runs `audit --fix` itself.
 
 ```yaml
 policy:
@@ -655,17 +655,20 @@ policy:
     - coord: com.fasterxml.jackson.core:jackson-databind@2.20.2   # exact version only
       reason: GHSA-xxxx-xxxx-xxxx                   # written by `scpm audit --fix` / the update bot
       expires: 2026-12-24                          # removed by `scpm audit --prune` once the version ages in
-  securityBypass: advisory-fixed                   # default; `off` = exemptions only by hand
+  securityBypass: off                              # default; `advisory-fixed` = also bypass during install (opt-in)
 ```
 
 How it works:
 
+0. `scpm audit` sends every locked artifact to OSV in one `querybatch` request and only reports. When `install` rejects a version for being too young, the error suggests `scpm audit --fix` but doesn't look anything up itself.
 1. `scpm audit --fix` (or the update bot, §5.8) finds the **smallest version that the advisory lists as fixed** for each vulnerable locked artifact.
 2. If the age gate blocks that version, scpm adds an **exact-version** exemption with the advisory ID and an expiry, then updates the lock. The exemption never covers a package glob or a range, so a later malicious release isn't exempted too.
 3. The exemption shows up in the PR diff, where a reviewer sees *why* a 3-hour-old jar is being pulled.
 4. A one-off override for local experiments is `scpm add … --allow-young`. It is never valid with `--frozen`.
 
-The trust anchor is the advisory database's "fixed in" data (curated GHSA/OSV), not the package author's claim. That's what makes an automatic bypass acceptable.
+The trust anchor is the advisory database's "fixed in" data (curated GHSA/OSV), not the package author's claim. That's what makes the bypass acceptable, explicit or automated.
+
+**Opt-in `securityBypass: advisory-fixed`.** For teams that want scala-steward's behaviour during ordinary installs: when the gate would block a version that is being selected, scpm queries OSV for that artifact. Results are cached briefly. If an advisory affecting the current version lists the blocked version as fixed, scpm allows it and writes the same exemption entry. Never with `--frozen`. If OSV is unreachable there is no bypass, just a warning, and the install never fails because of it.
 
 - **Compile-time code execution.** Macros and compiler plugins run arbitrary code at compile time, so an `allowBuilds` analogue can't be enforced the way npm's lifecycle scripts can. At minimum, report which deps contribute compiler plugins or annotation processors.
 
@@ -735,7 +738,7 @@ The manifest format already helps: every dependency is one `coord: version` line
    - **Groups updates by catalog entry.** One catalog bump updates every module that uses it in one PR.
    - **Applies Scalafix migrations**, reusing scala-steward's public migration list.
    - **Labels PRs by semver risk**, using `versionScheme` and MiMa against the old version.
-   - **Security fixes use the release-age bypass** (§5.6).
+   - **Security fixes skip the cooldown:** the bot runs `scpm audit --fix`, so the exemption entry appears in the PR diff (§5.6).
    - **Opens PRs** with release notes and changelog links.
    - Because it runs inside the tool, it handles the lock, ranges and policy natively. No external bot can.
 4. **Any time: upstream a scala-steward `BuildToolAlg` for scpm.** It's cheap and reaches teams who already run steward.
