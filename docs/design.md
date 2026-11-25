@@ -219,7 +219,7 @@ organization: com.acme           # default groupId for publishing
 
 toolchain:
   jdk: temurin:25                # fetched via coursier's JVM index, cached
-  scala: catalog:scala3          # default Scala version for modules
+  scala: catalog:                # default Scala version for modules (key `scala` in the default catalog)
 
 repositories:
   - central
@@ -228,7 +228,7 @@ repositories:
     credentials: env:ARTIFACTORY_TOKEN     # or coursier credentials.properties
 
 catalog:                         # default catalog → referenced as `catalog:`
-  scala3: 3.7.4
+  scala: 3.7.4                   # the key is the field's natural key: `scala` here, the coordinate for deps
   org.typelevel::cats-core: 2.13.0
   org.typelevel::cats-effect: ^3.6.0
   org.scalameta::munit: 1.2.1
@@ -251,9 +251,7 @@ presets:                         # named, mergeable fragments; modules opt in wi
     publish: true
     versionScheme: early-semver
   cross-213-3:
-    variants:
-      - { scala: catalog:scala3 }
-      - { scala: catalog:scala213:scala }
+    scala: [catalog:, catalog:scala213]   # a list = cross-build over these Scala versions
 
 tasks:                           # pnpm-style task defaults, inherited by every module
   compile: { dependsOn: ['^compile'] }
@@ -301,8 +299,8 @@ testDependencies:
 boms:
   - com.acme:platform-bom:2026.11.0
 
-variants:                        # per-variant overrides, only when needed
-  scala213:
+variants:                        # per-variant overrides, keyed by variant selector, only when needed
+  '2.13':                        # matches every variant on Scala 2.13 (also: 'js', 'jvm-3', …)
     scalacOptions: [-Xsource:3]
 
 tasks:
@@ -316,6 +314,7 @@ Notes:
 
 - **Dependency syntax** keeps the Scala convention (`::` cross-version, `:::` full version, `:` plain Java). Keys are coordinates and values are version specs, so Renovate and agents can edit a single line. Bare names (`util:`) refer to workspace modules.
 - **Scopes**: `dependencies`, `providedDependencies` (compile-only), `runtimeDependencies`, `testDependencies`. Four is deliberately small; no Ivy configurations.
+- **Catalog references** look up the field's natural key: for a dependency, its coordinate (`catalog:` → default catalog, `catalog:spark` → the `spark` catalog); for `scala`, the key `scala`. A catalog entry may itself be a range (`^3.6.0`).
 - **Exclusions and classifiers** use an expanded object form when needed:
   ```yaml
   dependencies:
@@ -331,7 +330,7 @@ pnpm has almost no inheritance; it relies on catalogs and root-level settings. W
 
 1. **Catalogs.** Versions, defined once and referenced everywhere. Named catalogs replace sbt's `val catsVersion = …` idiom and double as cross-build sets.
 2. **Root `tasks:`.** Defaults inherited by every module and overridable per module (pnpm 12 semantics: an unconfigured task defaults to `dependsOn: ['^self']`).
-3. **Presets + `extends:`.** Named fragments merged into the module in order. Lists append, maps merge deeply, scalars override, and `!replace` opts out of merging. This is bleep's templates idea, but the presets live in the root and are referenced from leaves.
+3. **Presets + `extends:`.** Named fragments merged into the module in order. Lists append (deduplicated), maps merge deeply, scalars override, and a `!replace` YAML tag on a value (`scalacOptions: !replace [-deprecation]`) replaces instead of merging. This is bleep's templates idea, but the presets live in the root and are referenced from leaves.
 4. **Config dependencies** (later). Presets and catalogs published as a Maven artifact (`com.acme:scpm-presets:1.4.0`) and pinned in the lockfile's boot section, so an org can share them across repos. This mirrors pnpm's `configDependencies`.
 
 Directory-based implicit inheritance (child configs silently picking up parent-directory config) is **not** supported: everything a module gets is visible from its own file plus `extends:`. `scpm config core --resolved [--json]` prints the fully expanded result, and `scpm config core --explain scalacOptions` shows where each value came from (as `aube config explain` does).
