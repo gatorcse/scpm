@@ -889,14 +889,40 @@ fn lone_scala_majors_other_than_3_are_invalid_selectors() {
 }
 
 #[test]
-fn failed_replace_fallback_reports_the_positioned_error() {
+fn failed_replace_fallback_reports_the_real_error() {
     let ws = format!("{WS}presets:\n  lib: {{release: '11'}}\n");
+    let module_error = |text: &str| {
+        let dir = workspace(&[("scpm-workspace.yaml", &ws), ("modules/a/scpm.yaml", text)]);
+        config_error(dir.path(), &["ls"])
+    };
+
+    // The `!replace` scalar comes first and is valid: the error is the typo after it.
+    let err = module_error("extends: [lib]\nrelease: !replace 17\nscalacOption: [-z]\n");
+    assert!(
+        err.contains("modules/a/scpm.yaml: unknown key `scalacOption`\n  help: did you mean `scalacOptions`?"),
+        "{err}"
+    );
+    assert!(!err.contains("release"), "{err}");
+
+    // … or a value of the wrong type after it (no position: it's from the untagged value).
+    let err = module_error("extends: [lib]\nrelease: !replace 17\nmainClass: [x]\n");
+    assert!(err.contains("modules/a/scpm.yaml: mainClass: invalid type"), "{err}");
+    assert!(!err.contains("release"), "{err}");
+
+    // The same key in both parses keeps the original position.
+    let err = module_error("extends: [lib]\nmainClass: [x]\nrelease: !replace '17'\n");
+    assert!(err.contains("modules/a/scpm.yaml:2:12: mainClass: invalid type"), "{err}");
+}
+
+#[test]
+fn drive_letter_source_directories_are_absolute_everywhere() {
     let dir = workspace(&[
-        ("scpm-workspace.yaml", &ws),
-        ("modules/a/scpm.yaml", "extends: [lib]\nmainClass: [x]\nrelease: !replace '17'\n"),
+        ("scpm-workspace.yaml", WS),
+        ("modules/a/scpm.yaml", "sources: ['C:/src']\nresources: ['c:\\res']\n"),
     ]);
     let err = config_error(dir.path(), &["ls"]);
-    assert!(err.contains("modules/a/scpm.yaml:2:12: mainClass: "), "{err}");
+    once(&err, "modules/a/scpm.yaml: sources[0]: `C:/src` is an absolute path");
+    once(&err, "modules/a/scpm.yaml: resources[0]: `c:\\res` is an absolute path");
 }
 
 #[cfg(unix)]

@@ -325,12 +325,23 @@ fn parse_file<T: DeserializeOwned>(root: &Path, path: &Path) -> Result<(T, Value
     let typed = match serde_path_to_error::deserialize::<_, T>(de) {
         Ok(typed) => typed,
         // `!replace` on a scalar (`release: !replace '17'`) reads as an enum in the typed parse;
-        // validate the untagged value instead. If that fails too, the original error has a
-        // source position, so report it.
-        Err(e) if has_replace_tags(&raw) => match from_value(&strip_replace_tags(raw.clone()), &display) {
-            Ok(typed) => typed,
-            Err(_) => return Err(Diagnostic::from_yaml(&display, e).into()),
-        },
+        // validate the untagged value instead. If that fails too, report the fallback's error
+        // (the original one may just be the `!replace` scalar), borrowing the original error's
+        // position when both point at the same key.
+        Err(e) if has_replace_tags(&raw) => {
+            let untagged = strip_replace_tags(raw.clone());
+            match serde_path_to_error::deserialize::<_, T>(untagged) {
+                Ok(typed) => typed,
+                Err(fallback) => {
+                    let original = Diagnostic::from_yaml(&display, e);
+                    let mut d = Diagnostic::from_value_error(&display, fallback);
+                    if d.key == original.key {
+                        (d.line, d.column) = (original.line, original.column);
+                    }
+                    return Err(d.into());
+                }
+            }
+        }
         Err(e) => return Err(Diagnostic::from_yaml(&display, e).into()),
     };
     Ok((typed, raw))
@@ -600,9 +611,16 @@ fn check_source_dir(dir: &str, depth: Option<usize>) -> Option<Diagnostic> {
 const INSIDE_WORKSPACE: &str =
     "source and resource directories are relative to the module and may point anywhere inside the workspace root";
 
+/// Absolute on any OS, so a config is valid or invalid everywhere: a leading `/` or `\`, or a
+/// drive letter (`C:`, `C:/…`, `C:\…`).
 fn is_absolute(dir: &str) -> bool {
     let path = Path::new(dir);
-    path.has_root() || dir.starts_with(['/', '\\']) || matches!(path.components().next(), Some(Component::Prefix(_)))
+    let drive = matches!(dir.as_bytes(), [letter, b':', rest @ ..]
+        if letter.is_ascii_alphabetic() && matches!(rest.first(), None | Some(b'/' | b'\\')));
+    drive
+        || path.has_root()
+        || dir.starts_with(['/', '\\'])
+        || matches!(path.components().next(), Some(Component::Prefix(_)))
 }
 
 /// Whether the relative path `dir`, taken from a module `depth` directories below the workspace
@@ -1304,8 +1322,11 @@ mod tests {
             assert!(leaves_root(bad, 0), "{bad}");
         }
         assert!(leaves_root("../../x", 1));
-        for abs in ["/abs", "\\\\server\\share"] {
+        for abs in ["/abs", "\\\\server\\share", "C:/src", "c:\\src", "D:"] {
             assert!(is_absolute(abs), "{abs}");
+        }
+        for rel in ["src", "C", "ab:/x", "1:/x"] {
+            assert!(!is_absolute(rel), "{rel}");
         }
     }
 }
