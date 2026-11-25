@@ -12,6 +12,7 @@ class ServerSuite extends munit.FunSuite:
       params.target match
         case "boom" => throw IllegalStateException("boom")
         case "oom"  => throw OutOfMemoryError("fake")
+        case "soe"  => throw StackOverflowError()
         case _      => CompileResult(CompileStatus.Ok, 1, 1, noop = false)
 
   private def serve(lines: String*): (List[String], List[Int]) =
@@ -62,6 +63,13 @@ class ServerSuite extends munit.FunSuite:
       responses,
       List("""{"id":1,"error":{"code":"internal","message":"java.lang.IllegalStateException: boom"}}""")
     )
+    assertEquals(exits, Nil)
+  }
+
+  test("a stack overflow is answered with crashed and the worker keeps serving") {
+    val (responses, exits) = serve(compile(1, "soe"), compile(2, "ok"))
+    assert(responses.exists(_.startsWith("""{"id":1,"result":{"status":"crashed"""")), responses)
+    assert(responses.exists(_.startsWith("""{"id":2,"result":{"status":"ok"""")), responses)
     assertEquals(exits, Nil)
   }
 

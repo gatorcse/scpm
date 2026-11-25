@@ -39,7 +39,7 @@ final class UpstreamAnalyses(upstream: Map[Path, Path], analyses: AnalysisCache,
  * times of their files, so that an upstream classes directory without an analysis still
  * invalidates dependents when its class files change or disappear.
  */
-final class ClassDirectoryHashing(converter: FileConverter) extends NoopExternalLookup:
+final class ClassDirectoryHashing(converter: FileConverter, classesDir: Path) extends NoopExternalLookup:
   // Let Zinc find external classes through the upstream analyses.
   override def lookupAnalyzedClass(binaryClassName: String, file: Option[VirtualFileRef]): Option[AnalyzedClass] =
     Some(APIs.emptyAnalyzedClass)
@@ -47,7 +47,8 @@ final class ClassDirectoryHashing(converter: FileConverter) extends NoopExternal
   override def hashClasspath(classpath: Array[VirtualFile]): Optional[Array[FileHash]] =
     Optional.of(classpath.map { entry =>
       val path = converter.toPath(entry)
-      if Files.isDirectory(path) then FileHash.of(path, ClassDirectoryHashing.hashDirectory(path))
+      // The target's own output changes on every compile; Zinc tracks its classes as products.
+      if path != classesDir && Files.isDirectory(path) then FileHash.of(path, ClassDirectoryHashing.hashDirectory(path))
       else ClasspathCache.hashClasspath(Seq(path)).head
     })
 

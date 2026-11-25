@@ -21,8 +21,9 @@ object Main:
     System.exit(0)
 
 /**
- * Dispatches requests. Every request gets exactly one response; a fatal JVM error during a
- * compile is answered with `crashed` and then ends the process through `exit`.
+ * Dispatches requests. Every request gets exactly one response. A stack overflow in a compile
+ * is answered `crashed`; any other fatal JVM error is answered `crashed` and then ends the process
+ * through `exit`, since the worker is shared and cannot be trusted afterwards.
  */
 final class Server(out: Output, compiler: CompileService, exit: Int => Unit):
   private final class Job(val thread: Thread, val cancelled: AtomicBoolean)
@@ -100,14 +101,18 @@ final class Server(out: Output, compiler: CompileService, exit: Int => Unit):
     val start = System.nanoTime()
     try out.result(id, compiler.compile(id, params, cancelled, out.event))
     catch
+      case e: StackOverflowError =>
+        e.printStackTrace()
+        out.result(id, CompileResult(CompileStatus.Crashed, elapsedMs(start), 0, noop = false, Some(e.toString)))
       case e: VirtualMachineError =>
-        val elapsed = (System.nanoTime() - start).nanos.toMillis
-        out.result(id, CompileResult(CompileStatus.Crashed, elapsed, 0, noop = false, Some(e.toString)))
+        out.result(id, CompileResult(CompileStatus.Crashed, elapsedMs(start), 0, noop = false, Some(e.toString)))
         exit(3)
       case e: Throwable =>
         e.printStackTrace()
         out.error(Some(id), "internal", e.toString)
     finally jobs.remove(id)
+
+  private def elapsedMs(startNanos: Long) = (System.nanoTime() - startNanos).nanos.toMillis
 
   private def stopJobs(): Unit =
     val running = jobs.values.asScala.toList

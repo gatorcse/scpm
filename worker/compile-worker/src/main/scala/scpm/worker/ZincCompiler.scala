@@ -12,8 +12,9 @@ import xsbti.compile.{
   IncOptions,
   InvalidationProfiler,
   RunProfiler,
-  TastyFiles,
-  TransactionalManagerType
+  AuxiliaryClassFiles,
+  ClassFileManager as XClassFileManager,
+  TastyFiles
 }
 import xsbti.{ VirtualFile, VirtualFileRef }
 
@@ -50,9 +51,9 @@ final class ZincCompiler extends CompileService:
     val lock = targetLocks.computeIfAbsent(analysisFile, _ => ReentrantLock())
     if !ZincCompiler.lockUnlessCancelled(lock, cancelled) then result(CompileStatus.Cancelled)
     else
-      val toolchain = Toolchain.of(params)
-      val compiledSources = CompiledSources()
+      lazy val toolchain = Toolchain.of(params)
       try
+        val compiledSources = CompiledSources()
         val zincResult = scalaCompilers.use(toolchain) { scalac =>
           run(id, params, scalac, toolchain, analysisFile, cancelled, compiledSources, emit)
         }
@@ -66,7 +67,11 @@ final class ZincCompiler extends CompileService:
         case _: xsbti.CompileCancelled               => result(CompileStatus.Cancelled)
         case _: xsbti.CompileFailed if cancelled.get => result(CompileStatus.Cancelled)
         case _: xsbti.CompileFailed                  => result(CompileStatus.Failed)
-        case e: VirtualMachineError                  => throw e
+        // A stack overflow is the compiled code's problem; the worker stays healthy.
+        case e: StackOverflowError =>
+          e.printStackTrace()
+          result(CompileStatus.Crashed, message = Some(e.toString))
+        case e: VirtualMachineError => throw e
         case e: Throwable                            =>
           if ZincCompiler.isBrokenToolchain(e) then scalaCompilers.evict(toolchain)
           e.printStackTrace()
@@ -100,13 +105,25 @@ final class ZincCompiler extends CompileService:
       path => converter.toPath(VirtualFileRef.of(path)).toString,
       emit
     )
-    // Failed and cancelled runs restore the previous class files from this backup.
-    val backup = Files.createTempDirectory("scpm-zinc-backup-")
+    val classesDir = Path.of(params.classesDir)
+    val previous = analyses.read(analysisFile)
+    // Without an analysis nothing knows which class files are stale, so start from nothing.
+    if previous.isEmpty then IO.delete(classesDir.toFile)
+    Files.createDirectories(classesDir)
+
+    // Scala 3 writes a .tasty file next to each class; they must go when their source does.
+    val auxiliaryFiles: Array[AuxiliaryClassFiles] = if toolchain.isScala3 then Array(TastyFiles.instance) else Array()
+    // Failed and cancelled runs restore the previous class files from this backup, on the same volume.
+    val backup = Files.createTempDirectory(classesDir.toAbsolutePath.getParent, ".scpm-backup-")
+    val classFiles = RollbackOnCancel(
+      ClassFileManager.transactional(backup, auxiliaryFiles, sbt.util.Logger.xlog2Log(logger)),
+      cancelled
+    )
     val options = IncOptions
       .of()
-      .withClassfileManagerType(TransactionalManagerType.of(backup.toFile, logger))
+      .withAuxiliaryClassFiles(auxiliaryFiles)
       .withExternalHooks(
-        DefaultExternalHooks(Optional.of(ClassDirectoryHashing(converter)), Optional.empty)
+        DefaultExternalHooks(Optional.of(ClassDirectoryHashing(converter, classesDir)), Optional.of(classFiles))
           .withInvalidationProfiler(compiledSources)
       )
     val setup = incremental.setup(
@@ -118,18 +135,12 @@ final class ZincCompiler extends CompileService:
       skip = false,
       cacheFile = analysisFile,
       cache = FreshCompilerCache(),
-      // Scala 3 writes a .tasty file next to each class; they must go when their source does.
-      incOptions = if toolchain.isScala3 then options.withAuxiliaryClassFiles(Array(TastyFiles.instance)) else options,
+      incOptions = options,
       reporter = reporter,
       progress = Some(ProgressReporter(id, params.target, cancelled, emit)),
       earlyAnalysisStore = None,
       extra = Array.empty
     )
-    val previous = analyses.read(analysisFile)
-    val classesDir = Path.of(params.classesDir)
-    // Without an analysis nothing knows which class files are stale, so start from nothing.
-    if previous.isEmpty then IO.delete(classesDir.toFile)
-    Files.createDirectories(classesDir)
     val inputs = incremental.inputs(
       // The output directory comes first: an incremental run compiles only some sources, and
       // they see the rest through their class files.
@@ -170,6 +181,20 @@ object ZincCompiler:
       case _: LinkageError | _: ClassNotFoundException => true
       case _                                           => false
     }
+
+/**
+ * Zinc's transactional class-file manager, except that a cancelled run is rolled back even when
+ * the compiler reports success: the Scala 3 bridge stops a cancelled run without failing it.
+ */
+private final class RollbackOnCancel(underlying: XClassFileManager, cancelled: AtomicBoolean)
+    extends XClassFileManager:
+  override def delete(classes: Array[VirtualFile]): Unit = underlying.delete(classes)
+  override def generated(classes: Array[VirtualFile]): Unit = underlying.generated(classes)
+  @deprecated("Zinc calls the VirtualFile variants", "2.1.0")
+  def delete(classes: Array[java.io.File]): Unit = underlying.delete(classes)
+  @deprecated("Zinc calls the VirtualFile variants", "2.1.0")
+  def generated(classes: Array[java.io.File]): Unit = underlying.generated(classes)
+  def complete(success: Boolean): Unit = underlying.complete(success && !cancelled.get)
 
 /** Counts the sources Zinc (re)compiles in a run, across all incremental cycles. */
 private final class CompiledSources extends InvalidationProfiler:
