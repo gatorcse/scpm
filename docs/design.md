@@ -19,7 +19,7 @@
 | CLI language | **Rust.** It owns everything that does not need a JVM: config, graph, hashing, no-op detection, lockfile fetch, cache restore, reporting. |
 | Compiler side | A **Scala JVM worker** (“`scpmd`”) that embeds **Zinc 2.1** directly — *not* Bloop. Narrow protocol: compile/test/run requests in, structured events out. All scheduling stays in Rust. |
 | Daemon? | **Yes locally** (one shared per-user daemon per `(scpm version, worker JDK)`, idle-timeout, serves every workspace and worktree). **In CI, the same worker runs in the foreground for the life of the job** with a JDK 25 AOT cache. Zinc cannot be made fast enough cold: JIT warmup is 3.4–5× (*measured*). |
-| Dependencies | **Coursier owns resolution and the cache.** Phase 1: spawn native `cs`. Phase 2: a small native-image resolver sidecar on the coursier API (JSON-lines over stdio). Never reimplement Maven resolution in Rust. |
+| Dependencies | **Coursier owns resolution and the cache.** Phase 1: spawn native `cs`. Phase 3: a small native-image resolver sidecar on the coursier API (JSON-lines over stdio). Never reimplement Maven resolution in Rust. |
 | Lockfile | **Yes**, our own (`scpm-lock.yaml`), because nothing in the Scala ecosystem has one. Restoring from the lock needs no resolver, only intransitive downloads with sha256 verification, so the Rust CLI does it itself from Phase 1, writing a coursier-compatible cache layout. |
 | Semver ranges | Allowed **only in manifests, only for direct deps, resolved at lock time**. Published POMs never contain ranges. `^`/`~` are translated with Scala's early-semver rules and the dependency's `info.versionScheme`. |
 | Agents | **`scpm mcp`** is a first-class front-end from Phase 1. It is a thin layer over `--json` and the event stream, owns a foreground worker in Phase 1 and uses the shared daemon from Phase 2, and is token-frugal by default (§9.3). |
@@ -110,7 +110,7 @@ flowchart TB
 
     subgraph jvm["Out-of-process helpers"]
         direction LR
-        resolver["Resolver<br/>Phase 1: cs CLI<br/>Phase 2: native-image sidecar<br/>Runs only when the lock is stale"]
+        resolver["Resolver<br/>Phase 1: cs CLI<br/>Phase 3: native-image sidecar<br/>Runs only when the lock is stale"]
         scpmd["scpmd: Scala on the worker JDK (25+)<br/>Zinc 2.1, scalafmt, scalafix, JS/Native linkers<br/>Shared daemon locally, foreground in CI"]
         testjvm["Forked test/run JVM<br/>project JDK, sbt test-interface"]
     end
@@ -219,7 +219,7 @@ organization: com.acme           # default groupId for publishing
 
 toolchain:
   jdk: temurin:25                # project JDK: release target, runs tests and `run` (§6.3); workspace-only
-  scala: catalog:                # default Scala version for modules (key `scala` in the default catalog)
+  scala: catalog                 # default Scala version for modules (key `scala` in the default catalog)
 
 repositories:
   - central
@@ -230,7 +230,7 @@ repositories:
 lock:
   resolutionContext: { os: linux, arch: x86_64, jdk: 25 }   # the default (jdk = project JDK major); §5.4
 
-catalog:                         # default catalog → referenced as `catalog:`
+catalog:                         # default catalog → referenced as `catalog`
   scala: 3.9.0                   # the key is the field's natural key: `scala` here, the coordinate for deps
   org.typelevel::cats-core: 2.13.0
   org.typelevel::cats-effect: ^3.6.0
@@ -255,7 +255,7 @@ presets:                         # named, mergeable fragments; modules opt in wi
     publish: true
     versionScheme: early-semver
   cross-213-3:
-    scala: [catalog:, catalog:scala213]   # a list = cross-build over these Scala versions
+    scala: [catalog, catalog:scala213]    # a list = cross-build over these Scala versions
 
 tasks:                           # pnpm-style task defaults, inherited by every module
   compile: { dependsOn: ['^compile'] }   # built-in tasks need no `run:`
@@ -291,7 +291,7 @@ extends: [library, cross-213-3]
 platforms: [jvm, js]             # variants = platforms × scala versions → core@jvm-3, core@js-2.13, …
 
 dependencies:
-  org.typelevel::cats-core: catalog:
+  org.typelevel::cats-core: catalog
   io.circe::circe-core: ^0.14.10             # range: resolved at lock time, see §5.5
   util: workspace:*                          # another module in this workspace
   com.acme:auth-client: 3.2.1                # plain Java artifact (single colon)
@@ -300,7 +300,7 @@ providedDependencies:
   org.apache.spark::spark-sql: catalog:spark
 
 testDependencies:
-  org.scalameta::munit: catalog:
+  org.scalameta::munit: catalog
 
 boms:
   - com.acme:platform-bom:2026.11.0
@@ -338,7 +338,7 @@ Notes:
 
 - **Dependency syntax** keeps the Scala convention (`::` cross-version, `:::` full version, `:` plain Java). Keys are coordinates and values are version specs, so Renovate and agents can edit a single line. Bare names (`util:`) refer to workspace modules.
 - **Scopes**: `dependencies`, `providedDependencies` (compile-only), `runtimeDependencies`, `testDependencies`. Four is deliberately small; no Ivy configurations.
-- **Catalog references** look up the field's natural key: for a dependency, its coordinate (`catalog:` → default catalog, `catalog:spark` → the `spark` catalog); for `scala`, the key `scala`. A catalog entry may itself be a range (`^3.6.0`); it is resolved once per (platform, Scala binary version) for the whole workspace (§5.4). A variant that needs a different version uses a `variants` override:
+- **Catalog references** look up the field's natural key: for a dependency, its coordinate (`catalog` → default catalog, `catalog:spark` → the `spark` catalog). The default catalog is written as a bare `catalog` (also accepted: `catalog:default`, or a quoted `'catalog:'`) because a trailing `:` is not valid in a YAML value; pnpm can use `catalog:` only because package.json is JSON; for `scala`, the key `scala`. A catalog entry may itself be a range (`^3.6.0`); it is resolved once per (platform, Scala binary version) for the whole workspace (§5.4). A variant that needs a different version uses a `variants` override:
   ```yaml
   variants:
     '2.13':
@@ -459,7 +459,7 @@ Unknown keys are **errors** with did-you-mean suggestions, matching pnpm 12's `E
 | Option | Verdict |
 |---|---|
 | Spawn native `cs` and parse `fetch -j` JSON | **Phase 1.** Zero build cost. `cs fetch` gives the graph as JSON; `cs resolve` is text only; versions come via `cs complete-dep org:name:` (text). There are hidden but real flags: `--bom`, `-V`, `--intransitive`, `--reconciliation`, `--strict`, `--rule`, `--checksum`, `-m offline`. The limitation is that errors are only stderr text. |
-| Own resolver sidecar: a small Scala app on the coursier API, built with GraalVM native-image, JSON-lines over stdio | **Phase 2.** Structured errors, sha256 and repository per artifact, metadata-only resolution, version listing, and it can stay alive for a session. It uses coursier's own native-image configuration. |
+| Own resolver sidecar: a small Scala app on the coursier API, built with GraalVM native-image, JSON-lines over stdio | **Phase 3.** Structured errors, sha256 and repository per artifact, metadata-only resolution, version listing, and it can stay alive for a session. It uses coursier's own native-image configuration. |
 | Host the resolver inside `scpmd` | A fine alternative once the daemon exists; but resolution should not *require* a warm JVM in CI, so keep the sidecar. |
 | JNI or GraalVM `--shared` C library | Possible but adds little over a sidecar process. Skip. |
 | Reimplement in Rust | **No.** The long tail costs months: profiles, BOM import cycles, relocations, Gradle variant matching, coursier's deliberate latest-wins semantics. The result would also diverge from sbt/Mill/scala-cli on the same inputs. Existing Rust crates (`jbuild`, `deps-maven`, `mvn`) are immature. |
@@ -572,7 +572,7 @@ Each variant locks four ordered classpaths:
 
 - **Workspace modules** (`workspace:*`) appear as references (`{ module: util@jvm-3 }`), not artifacts: every upstream variant in the transitive closure, in dependency order, before the external artifacts, which follow coursier's order. Upstream modules contribute their `dependencies` to every list and their `runtimeDependencies` to the runtime lists, never their provided or test dependencies.
 - **Resolution is joint over the variant's transitive workspace closure.** A variant's external dependencies are resolved in one coursier call together with those of every upstream variant, so if A depends on B, A's classpaths hold one version of each library for both A's and B's code.
-- **Catalog ranges are resolved once per (platform, Scala binary version) for the whole workspace**, so every variant that uses that `catalog:` entry on that platform and Scala binary version gets the same version.
+- **Catalog ranges are resolved once per (platform, Scala binary version) for the whole workspace**, so every variant that uses that catalog entry on that platform and Scala binary version gets the same version.
 - **`specifiers`** records each direct dependency's spec as written and the version scpm selected for it (§5.5), before coursier's reconciliation, like pnpm's importers. `workspace:*` entries have no version.
 - **`inputsHash`** is a sha256 over the variant's *effective* config after presets and `variants` (§4.4): dependencies (catalog references replaced by their entries), BOMs, overrides, toolchain and repositories, plus the same for every upstream variant in its workspace closure, since those are resolved jointly.
 - A variant with `compilerPlugins` also has an ordered `compilerPlugins` list.
@@ -607,7 +607,7 @@ The risk is that ranges in **published** POMs are bad for Maven consumers: they 
 1. **Manifest syntax:**
    - exact: `1.2.3`, the default; `scpm add` writes exact versions unless `--save-range` is given
    - `^1.2.3`, `~1.2.3`, `>=1.2 <2`
-   - `catalog:`, `workspace:*` (publishing always writes concrete versions, so there is no `workspace:^` or `workspace:~`)
+   - `catalog`/`catalog:<name>`, `workspace:*` (publishing always writes concrete versions, so there is no `workspace:^` or `workspace:~`)
 2. **Bounds use Scala's early-semver rules**, or the dependency's `info.versionScheme` when it declares one:
    - `^1.2.3` → `>=1.2.3 <2.0.0`
    - `^0.14.10` → `>=0.14.10 <0.15.0`
@@ -666,7 +666,7 @@ The trust anchor is the advisory database's "fixed in" data (curated GHSA/OSV), 
 
 ### 5.7 Enterprise repositories (optional fast paths)
 
-**Credentials.** A repository's `credentials` is either `env:VAR` (sent as a bearer token) or `{user: env:U, password: env:P}` (basic auth). Phase 1's Rust fetcher reads those, plus coursier's `COURSIER_CREDENTIALS` / `credentials.properties` for matching hosts.
+**Credentials.** A repository's `credentials` is either `env:VAR` (sent as a bearer token) or `{user: env:U, password: env:P}` (basic auth). Phase 1's Rust fetcher reads those, plus coursier's `COURSIER_CREDENTIALS` / `credentials.properties` for matching hosts. Coursier's credential sources only express basic auth, so when `cs` resolves a stale lock scpm passes a bearer token as a basic-auth password (which Artifactory and GitHub Packages accept) **[verify per repository type in Phase 1]**.
 
 Correctness always comes from coursier. These only speed up `outdated`, version listing and checksums:
 
