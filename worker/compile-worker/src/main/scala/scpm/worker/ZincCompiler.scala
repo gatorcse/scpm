@@ -2,76 +2,93 @@ package scpm.worker
 
 import sbt.internal.inc.*
 import sbt.internal.inc.javac.JavaTools
+import sbt.io.IO
 import xsbti.compile.{
+  APIChange,
   AnalysisContents,
-  CompileAnalysis,
   CompileOrder,
   CompileProgress,
-  DefinesClass,
+  DefaultExternalHooks,
   IncOptions,
-  PerClasspathEntryLookup
+  InvalidationProfiler,
+  RunProfiler,
+  TastyFiles,
+  TransactionalManagerType
 }
 import xsbti.{ VirtualFile, VirtualFileRef }
 
 import java.nio.file.{ Files, Path }
 import java.util.Optional
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.ReentrantLock
+import java.util.concurrent.{ ConcurrentHashMap, TimeUnit }
 import java.util.function.Supplier
+import scala.annotation.tailrec
 import scala.concurrent.duration.*
 
-/** Runs Zinc incremental compilations. One instance serves all requests of the worker. */
-final class ZincCompiler:
+/** Compiles one `compile` request. */
+trait CompileService:
+  def compile(id: Long, params: CompileParams, cancelled: AtomicBoolean, emit: Event => Unit): CompileResult
+
+/**
+ * Runs Zinc incremental compilations. One instance serves all requests of the worker.
+ * Fatal JVM errors ([[VirtualMachineError]]) propagate; everything else becomes a result.
+ */
+final class ZincCompiler extends CompileService:
   private val incremental = IncrementalCompilerImpl()
   private val scalaCompilers = ScalaCompilers()
   private val analyses = AnalysisCache()
   // Requests for the same analysis file (same target) must not overlap; different targets may.
-  private val targetLocks = ConcurrentHashMap[Path, AnyRef]()
+  private val targetLocks = ConcurrentHashMap[Path, ReentrantLock]()
 
   def compile(id: Long, params: CompileParams, cancelled: AtomicBoolean, emit: Event => Unit): CompileResult =
     val startNanos = System.nanoTime()
     def result(status: CompileStatus, compiled: Int = 0, noop: Boolean = false, message: Option[String] = None) =
       CompileResult(status, (System.nanoTime() - startNanos).nanos.toMillis, compiled, noop, message)
 
-    val analysisFile = Path.of(params.analysisFile).toAbsolutePath
-    targetLocks.computeIfAbsent(analysisFile, _ => Object()).synchronized {
+    val analysisFile = Path.of(params.analysisFile)
+    val lock = targetLocks.computeIfAbsent(analysisFile, _ => ReentrantLock())
+    if !ZincCompiler.lockUnlessCancelled(lock, cancelled) then result(CompileStatus.Cancelled)
+    else
+      val toolchain = Toolchain.of(params)
+      val compiledSources = CompiledSources()
       try
+        val zincResult = scalaCompilers.use(toolchain) { scalac =>
+          run(id, params, scalac, toolchain, analysisFile, cancelled, compiledSources, emit)
+        }
+        // The Scala 3 bridge stops a cancelled run without throwing; its partial analysis is discarded.
         if cancelled.get then result(CompileStatus.Cancelled)
+        else if !zincResult.hasModified then result(CompileStatus.Ok, noop = true)
         else
-          val since = System.currentTimeMillis()
-          val zincResult = run(id, params, analysisFile, cancelled, emit)
-          // The Scala 3 bridge stops a cancelled run without throwing; its partial analysis is discarded.
-          if cancelled.get then result(CompileStatus.Cancelled)
-          else if !zincResult.hasModified then result(CompileStatus.Ok, noop = true)
-          else
-            analyses.write(analysisFile, AnalysisContents.create(zincResult.analysis, zincResult.setup))
-            result(CompileStatus.Ok, compiled = ZincCompiler.compiledSince(zincResult.analysis, since))
+          analyses.write(analysisFile, AnalysisContents.create(zincResult.analysis, zincResult.setup))
+          result(CompileStatus.Ok, compiled = compiledSources.count)
       catch
         case _: xsbti.CompileCancelled               => result(CompileStatus.Cancelled)
         case _: xsbti.CompileFailed if cancelled.get => result(CompileStatus.Cancelled)
         case _: xsbti.CompileFailed                  => result(CompileStatus.Failed)
+        case e: VirtualMachineError                  => throw e
         case e: Throwable                            =>
+          if ZincCompiler.isBrokenToolchain(e) then scalaCompilers.evict(toolchain)
           e.printStackTrace()
           result(CompileStatus.Crashed, message = Some(e.toString))
-    }
+      finally lock.unlock()
+    end if
+  end compile
 
   private def run(
       id: Long,
       params: CompileParams,
+      scalac: AnalyzingCompiler,
+      toolchain: Toolchain,
       analysisFile: Path,
       cancelled: AtomicBoolean,
+      compiledSources: CompiledSources,
       emit: Event => Unit
   ): xsbti.compile.CompileResult =
-    def paths(xs: Seq[String]) = xs.map(Path.of(_))
     val converter = MappedFileConverter(params.rootPaths.map((k, v) => k -> Path.of(v)), allowMachinePath = true)
-    def virtual(xs: Seq[String]): Array[VirtualFile] = paths(xs).map(converter.toVirtualFile).toArray
+    def virtual(xs: Seq[String]): Array[VirtualFile] = xs.map(x => converter.toVirtualFile(Path.of(x))).toArray
+    val logger = EventLogger(id, params.target, emit)
 
-    val scalac = scalaCompilers.get(
-      params.scalaVersion,
-      paths(params.scalaCompilerClasspath),
-      paths(params.scalaLibraryClasspath),
-      Path.of(params.compilerBridge)
-    )
     val javaTools = JavaTools.directOrFork(
       scalac.scalaInstance,
       scalac.classpathOptions,
@@ -83,19 +100,36 @@ final class ZincCompiler:
       path => converter.toPath(VirtualFileRef.of(path)).toString,
       emit
     )
+    // Failed and cancelled runs restore the previous class files from this backup.
+    val backup = Files.createTempDirectory("scpm-zinc-backup-")
+    val options = IncOptions
+      .of()
+      .withClassfileManagerType(TransactionalManagerType.of(backup.toFile, logger))
+      .withExternalHooks(
+        DefaultExternalHooks(Optional.of(ClassDirectoryHashing(converter)), Optional.empty)
+          .withInvalidationProfiler(compiledSources)
+      )
     val setup = incremental.setup(
-      lookup = ZincCompiler.NoUpstreamAnalysis,
+      lookup = UpstreamAnalyses(
+        params.upstreamAnalyses.map(u => Path.of(u.classesDir) -> Path.of(u.analysisFile)).toMap,
+        analyses,
+        converter
+      ),
       skip = false,
       cacheFile = analysisFile,
       cache = FreshCompilerCache(),
-      incOptions = IncOptions.of(),
+      // Scala 3 writes a .tasty file next to each class; they must go when their source does.
+      incOptions = if toolchain.isScala3 then options.withAuxiliaryClassFiles(Array(TastyFiles.instance)) else options,
       reporter = reporter,
       progress = Some(ProgressReporter(id, params.target, cancelled, emit)),
       earlyAnalysisStore = None,
       extra = Array.empty
     )
-    val previous = analyses.read(analysisFile).fold(incremental.emptyPreviousResult)(incremental.previousResult)
-    val classesDir = Files.createDirectories(Path.of(params.classesDir))
+    val previous = analyses.read(analysisFile)
+    val classesDir = Path.of(params.classesDir)
+    // Without an analysis nothing knows which class files are stale, so start from nothing.
+    if previous.isEmpty then IO.delete(classesDir.toFile)
+    Files.createDirectories(classesDir)
     val inputs = incremental.inputs(
       // The output directory comes first: an incremental run compiles only some sources, and
       // they see the rest through their class files.
@@ -110,29 +144,51 @@ final class ZincCompiler:
       order = CompileOrder.Mixed,
       compilers = ZincUtil.compilers(javaTools, scalac),
       setup = setup,
-      pr = previous,
+      pr = previous.fold(incremental.emptyPreviousResult)(incremental.previousResult),
       temporaryClassesDirectory = Optional.empty,
       converter = converter,
       stampReader = Stamps.timeWrapBinaryStamps(converter)
     )
-    incremental.compile(inputs, EventLogger(id, params.target, emit))
+    try incremental.compile(inputs, logger)
+    finally IO.delete(backup.toFile)
   end run
 
 object ZincCompiler:
-  /**
-   * The protocol does not pass upstream analyses, so upstream class directories are treated like
-   * library jars: changes are detected from their class files.
-   */
-  private object NoUpstreamAnalysis extends PerClasspathEntryLookup:
-    def analysis(classpathEntry: VirtualFile): Optional[CompileAnalysis] = Optional.empty
-    def definesClass(classpathEntry: VirtualFile): DefinesClass = Locate.definesClass(classpathEntry)
+  /** Waits for the target's lock, giving up as soon as the request is cancelled. */
+  @tailrec
+  private def lockUnlessCancelled(lock: ReentrantLock, cancelled: AtomicBoolean): Boolean =
+    if cancelled.get then false
+    else if lock.tryLock(50, TimeUnit.MILLISECONDS) then
+      val proceed = !cancelled.get
+      if !proceed then lock.unlock()
+      proceed
+    else lockUnlessCancelled(lock, cancelled)
 
-  /** Sources with at least one class whose API was extracted at or after `since` (epoch millis). */
-  private def compiledSince(analysis: CompileAnalysis, since: Long): Int =
-    val a = analysis.asInstanceOf[Analysis]
-    a.relations.allSources.count { src =>
-      a.relations.classNames(src).exists(a.apis.internalAPI(_).compilationTimestamp >= since)
+  /** Missing or incompatible classes mean the toolchain's jars are wrong; don't keep its loaders. */
+  private def isBrokenToolchain(e: Throwable): Boolean =
+    Iterator.iterate(e)(_.getCause).takeWhile(_ != null).exists {
+      case _: LinkageError | _: ClassNotFoundException => true
+      case _                                           => false
     }
+
+/** Counts the sources Zinc (re)compiles in a run, across all incremental cycles. */
+private final class CompiledSources extends InvalidationProfiler:
+  private val sources = ConcurrentHashMap.newKeySet[String]()
+
+  def count: Int = sources.size
+
+  def profileRun(): RunProfiler = new RunProfiler.DelegatingRunProfiler:
+    def profiler(): RunProfiler = RunProfiler.EMPTY.INSTANCE
+    override def registerCycle(
+        invalidatedClasses: Array[String],
+        invalidatedPackageObjects: Array[String],
+        initialSources: Array[VirtualFileRef],
+        invalidatedSources: Array[VirtualFileRef],
+        recompiledClasses: Array[String],
+        changesAfterRecompilation: Array[APIChange],
+        nextInvalidations: Array[String],
+        shouldCompileIncrementally: Boolean
+    ): Unit = invalidatedSources.foreach(s => sources.add(s.id))
 
 /** Emits `compile.progress` (at most every 100 ms, plus on every phase change) and polls for cancellation. */
 private final class ProgressReporter(id: Long, target: String, cancelled: AtomicBoolean, emit: Event => Unit)

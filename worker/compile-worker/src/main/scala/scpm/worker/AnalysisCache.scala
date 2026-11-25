@@ -4,35 +4,53 @@ import sbt.internal.inc.consistent.ConsistentFileAnalysisStore
 import xsbti.compile.AnalysisContents
 import xsbti.compile.analysis.ReadWriteMappers
 
-import java.nio.file.attribute.FileTime
-import java.nio.file.{ Files, Path }
-import java.util.concurrent.ConcurrentHashMap
+import java.nio.file.attribute.{ BasicFileAttributes, FileTime }
+import java.nio.file.{ Files, NoSuchFileException, Path }
 import scala.jdk.OptionConverters.*
 
-/**
- * Zinc analysis files, with the last analysis read or written kept in memory so that a warm
- * worker does not deserialize it again. An entry is reused only while the file on disk is the
- * one it came from, so deleting or replacing the file (e.g. a remote cache restore) is honoured.
- */
-final class AnalysisCache:
-  private final case class Entry(modified: FileTime, contents: AnalysisContents)
-  private val entries = ConcurrentHashMap[Path, Entry]()
+/** Zinc analysis files, read through a [[FileCache]] so a warm worker does not deserialize them again. */
+final class AnalysisCache(capacity: Int = 64):
+  private val cache = FileCache[AnalysisContents](capacity, file => store(file).get.toScala)
 
-  def read(file: Path): Option[AnalysisContents] =
-    if !Files.exists(file) then
-      entries.remove(file)
-      None
-    else
-      val modified = Files.getLastModifiedTime(file)
-      Option(entries.get(file)).filter(_.modified == modified).map(_.contents).orElse {
-        val contents = store(file).get.toScala
-        contents.foreach(c => entries.put(file, Entry(modified, c)))
-        contents
-      }
+  def read(file: Path): Option[AnalysisContents] = cache.read(file)
 
   def write(file: Path, contents: AnalysisContents): Unit =
     store(file).set(contents)
-    entries.put(file, Entry(Files.getLastModifiedTime(file), contents))
+    cache.put(file, contents)
 
   private def store(file: Path) =
     ConsistentFileAnalysisStore.binary(file.toFile, ReadWriteMappers.getEmptyMappers)
+
+/**
+ * The parsed contents of up to `maxEntries` files, least recently used first out. An entry is
+ * reused only while the file is the one it came from: same modification time, size and file key
+ * (inode), so a file that was deleted, replaced or rewritten is read again.
+ */
+final class FileCache[A](maxEntries: Int, load: Path => Option[A]):
+  private final case class Version(modified: FileTime, size: Long, key: Option[AnyRef])
+  private final case class Entry(version: Version, value: A)
+
+  private val entries = new java.util.LinkedHashMap[Path, Entry](16, 0.75f, true):
+    override def removeEldestEntry(eldest: java.util.Map.Entry[Path, Entry]): Boolean = size > maxEntries
+
+  def read(file: Path): Option[A] =
+    version(file) match
+      case None =>
+        synchronized(entries.remove(file))
+        None
+      case Some(current) =>
+        synchronized(Option(entries.get(file))).filter(_.version == current).map(_.value).orElse {
+          val value = load(file)
+          value.foreach(v => synchronized(entries.put(file, Entry(current, v))))
+          value
+        }
+
+  /** Records `value` as the contents of `file`, which was just written. */
+  def put(file: Path, value: A): Unit =
+    version(file).foreach(v => synchronized(entries.put(file, Entry(v, value))))
+
+  private def version(file: Path): Option[Version] =
+    try
+      val attrs = Files.readAttributes(file, classOf[BasicFileAttributes])
+      Some(Version(attrs.lastModifiedTime, attrs.size, Option(attrs.fileKey)))
+    catch case _: NoSuchFileException => None

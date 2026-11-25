@@ -30,6 +30,11 @@ final case class Request(id: Long, method: String, params: RawJson = RawJson.Emp
 object Request:
   given JsonValueCodec[Request] = JsonCodecMaker.make
 
+/** Just the id of a request, to answer a request that is otherwise malformed. */
+final case class RequestId(id: Long)
+object RequestId:
+  given JsonValueCodec[RequestId] = JsonCodecMaker.make
+
 final case class ResultResponse(id: Long, result: RawJson)
 object ResultResponse:
   given JsonValueCodec[ResultResponse] = JsonCodecMaker.make
@@ -69,8 +74,12 @@ final case class CompileParams(
     scalacOptions: List[String] = Nil,
     javacOptions: List[String] = Nil,
     javaHome: Option[String] = None,
-    rootPaths: Map[String, String] = Map.empty
+    rootPaths: Map[String, String] = Map.empty,
+    upstreamAnalyses: List[UpstreamAnalysis] = Nil
 )
+
+/** An upstream module on the classpath: its classes directory and analysis file (may not exist yet). */
+final case class UpstreamAnalysis(classesDir: String, analysisFile: String)
 object CompileParams:
   given JsonValueCodec[CompileParams] = JsonCodecMaker.make
 

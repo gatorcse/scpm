@@ -6,6 +6,7 @@ import java.io.{ BufferedReader, FileDescriptor, FileOutputStream, InputStream, 
 import java.nio.charset.StandardCharsets.UTF_8
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
@@ -16,13 +17,16 @@ object Main:
     // plugins, Zinc) goes to stderr, which the CLI keeps as a log.
     val protocolOut = FileOutputStream(FileDescriptor.out)
     System.setOut(System.err)
-    Server(Output(protocolOut)).serve(System.in)
+    Server(Output(protocolOut), ZincCompiler(), System.exit).serve(System.in)
     System.exit(0)
 
-final class Server(out: Output):
+/**
+ * Dispatches requests. Every request gets exactly one response; a fatal JVM error during a
+ * compile is answered with `crashed` and then ends the process through `exit`.
+ */
+final class Server(out: Output, compiler: CompileService, exit: Int => Unit):
   private final class Job(val thread: Thread, val cancelled: AtomicBoolean)
 
-  private val compiler = ZincCompiler()
   private val jobs = ConcurrentHashMap[Long, Job]()
 
   /** Handles requests until `shutdown` or end of input, then waits for running compilations. */
@@ -46,11 +50,16 @@ final class Server(out: Output):
       .foreach(_ => ())
     stopJobs()
 
+  /** Decodes a request line. A malformed request is answered with its own id when it has one. */
   private def parse(line: String): Option[Request] =
-    try Some(readFromString[Request](line, RawJson.readerConfig))
+    def decode[A: JsonValueCodec]: A = readFromString[A](line, RawJson.readerConfig)
+    try Some(decode[Request])
     catch
       case e: JsonReaderException =>
-        out.error(None, "bad_request", s"malformed request: ${e.getMessage}")
+        val id =
+          try Some(decode[RequestId].id)
+          catch case _: JsonReaderException => None
+        out.error(id, "bad_request", s"malformed request: ${e.getMessage}")
         None
 
   private def handle(request: Request): Unit =
@@ -66,7 +75,11 @@ final class Server(out: Output):
               id,
               InitializeResult(Protocol.Version, Server.workerVersion, Runtime.version.toString, ProcessHandle.current.pid)
             )
-        case "compile" => startCompile(id, request.params.decode[CompileParams])
+        case "compile" =>
+          val params = request.params.decode[CompileParams]
+          Validation.compile(params) match
+            case Nil      => startCompile(id, params)
+            case problems => out.error(Some(id), "bad_request", problems.mkString("; "))
         case "cancel" =>
           Option(jobs.get(request.params.decode[CancelParams].requestId)).foreach(_.cancelled.set(true))
           out.result(id, Empty())
@@ -77,17 +90,24 @@ final class Server(out: Output):
 
   private def startCompile(id: Long, params: CompileParams): Unit =
     val cancelled = AtomicBoolean()
-    val thread = Thread(
-      null,
-      () =>
-        try out.result(id, compiler.compile(id, params, cancelled, out.event))
-        finally jobs.remove(id),
-      s"compile-$id-${params.target}",
-      Server.CompilerStackSize
-    )
+    val thread =
+      Thread(null, () => runCompile(id, params, cancelled), s"compile-$id-${params.target}", Server.StackSize)
     if jobs.putIfAbsent(id, Job(thread, cancelled)) != null then
       out.error(Some(id), "bad_request", s"request id $id is already running")
     else thread.start()
+
+  private def runCompile(id: Long, params: CompileParams, cancelled: AtomicBoolean): Unit =
+    val start = System.nanoTime()
+    try out.result(id, compiler.compile(id, params, cancelled, out.event))
+    catch
+      case e: VirtualMachineError =>
+        val elapsed = (System.nanoTime() - start).nanos.toMillis
+        out.result(id, CompileResult(CompileStatus.Crashed, elapsed, 0, noop = false, Some(e.toString)))
+        exit(3)
+      case e: Throwable =>
+        e.printStackTrace()
+        out.error(Some(id), "internal", e.toString)
+    finally jobs.remove(id)
 
   private def stopJobs(): Unit =
     val running = jobs.values.asScala.toList
@@ -96,6 +116,6 @@ final class Server(out: Output):
 
 object Server:
   /** scalac recurses deeply on large expressions; give compile threads a generous stack. */
-  private val CompilerStackSize = 64L * 1024 * 1024
+  private val StackSize = 64L * 1024 * 1024
 
   private val workerVersion = Option(getClass.getPackage.getImplementationVersion).getOrElse("dev")
