@@ -107,7 +107,7 @@ final class TestRun {
       if (!taskDefs.isEmpty()) runFramework(framework, taskDefs);
     }
     if (claimed.isEmpty() && !params.filters().isEmpty()) {
-      out.log("warn", "no test suites match the filters " + params.filters());
+      out.log("warn", "no test suites match the filters " + String.join(", ", params.filters()));
     }
     return result(crashed ? "crashed" : failed > 0 ? "failed" : "ok");
   }
@@ -124,18 +124,21 @@ final class TestRun {
   }
 
   /**
-   * Ends a run that the JVM is abandoning, typically because a test called {@code System.exit}:
-   * closes the running suite and returns a {@code crashed} result. Called from a shutdown hook.
+   * Ends a run that the JVM is abandoning (a test called {@code System.exit}, or the CLI went
+   * away): closes the running suite and returns a {@code crashed} result whose {@code message} is
+   * {@code reason}. Called from a shutdown hook.
    */
-  Map<String, Object> abort() {
+  Map<String, Object> abort(String reason) {
     String suite = runningSuite;
     if (suite == null) {
-      out.log("error", "the JVM exited before the test run finished");
+      out.log("error", reason);
     } else {
-      out.log("error", "the JVM exited while suite " + suite + " was running (System.exit in a test?)");
+      out.log("error", reason + " while suite " + suite + " was running");
       endSuite(suite, runningSuiteStart);
     }
-    return result("crashed");
+    Map<String, Object> result = result("crashed");
+    result.put("message", reason);
+    return result;
   }
 
   private Selector[] selectors() {

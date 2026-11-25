@@ -65,14 +65,25 @@ public final class Main {
 
     TestRun run = new TestRun(params, frameworks, out, loader);
     AtomicBoolean answered = new AtomicBoolean();
-    // A test that calls System.exit still gets the run answered, as crashed.
+    AtomicBoolean parentGone = new AtomicBoolean();
+    // A run the JVM abandons (System.exit in a test, or the CLI went away) is still answered.
+    ExitStatus.capture();
     Runtime.getRuntime()
         .addShutdownHook(
             new Thread(
                 () -> {
-                  if (answered.compareAndSet(false, true)) out.result(run.abort());
+                  if (!answered.compareAndSet(false, true)) return;
+                  String reason =
+                      parentGone.get()
+                          ? PARENT_GONE
+                          : ExitStatus.last()
+                              .stream()
+                              .mapToObj(status -> "a test called System.exit(" + status + ")")
+                              .findFirst()
+                              .orElse("a test called System.exit");
+                  out.result(run.abort(reason));
                 }));
-    exitWhenParentGoes(stdin, out);
+    exitWhenParentGoes(stdin, answered, parentGone);
     Map<String, Object> result;
     try {
       result = run.run();
@@ -88,11 +99,14 @@ public final class Main {
     System.exit(0);
   }
 
+  private static final String PARENT_GONE = "parent went away (stdin closed)";
+
   /**
-   * The CLI keeps stdin open for the whole run. End of input means it went away, and the runner
-   * must not outlive it.
+   * The CLI keeps stdin open until the run is answered. End of input before that means it went
+   * away: the runner and anything the tests started must not outlive it.
    */
-  private static void exitWhenParentGoes(BufferedReader stdin, Output out) {
+  private static void exitWhenParentGoes(
+      BufferedReader stdin, AtomicBoolean answered, AtomicBoolean parentGone) {
     Thread watcher =
         new Thread(
             () -> {
@@ -103,7 +117,9 @@ public final class Main {
               } catch (IOException e) {
                 // treated like end of input
               }
-              out.log("error", "parent went away (stdin closed), exiting");
+              if (answered.get()) return;
+              parentGone.set(true);
+              ProcessHandle.current().descendants().forEach(ProcessHandle::destroyForcibly);
               System.exit(4);
             },
             "scpm-stdin-watcher");

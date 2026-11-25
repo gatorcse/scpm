@@ -9,20 +9,24 @@ record RunParams(
     String target,
     List<String> testClassesDirs,
     List<String> frameworks,
-    List<Pattern> filters,
+    List<String> filters,
+    List<Pattern> filterPatterns,
     List<String> testNames) {
 
   static RunParams fromJson(Map<String, Object> params) {
+    List<String> filters = strings(params, "filters", false);
     return new RunParams(
         string(params, "target"),
         strings(params, "testClassesDirs", true),
         strings(params, "frameworks", false),
-        strings(params, "filters", false).stream().map(RunParams::glob).toList(),
+        filters,
+        filters.stream().map(RunParams::glob).toList(),
         strings(params, "testNames", false));
   }
 
   boolean selects(String className) {
-    return filters.isEmpty() || filters.stream().anyMatch(p -> p.matcher(className).matches());
+    return filterPatterns.isEmpty()
+        || filterPatterns.stream().anyMatch(p -> p.matcher(className).matches());
   }
 
   /** {@code *} matches any run of characters, {@code ?} any single character. */
