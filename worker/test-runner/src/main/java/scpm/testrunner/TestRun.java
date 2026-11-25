@@ -34,25 +34,60 @@ final class TestRun {
           "zio.test.sbt.ZTestFramework",
           "utest.runner.Framework",
           "org.specs2.runner.Specs2Framework",
+          "org.scalacheck.ScalaCheckFramework",
           "com.novocode.junit.JUnitFramework");
 
   private final RunParams params;
+  private final List<Framework> frameworks;
   private final Output out;
   private final ClassLoader loader;
+  private final long start = System.nanoTime();
   private int passed;
   private int failed;
   private int skipped;
   private boolean crashed;
+  private volatile String runningSuite;
+  private volatile long runningSuiteStart;
 
-  TestRun(RunParams params, Output out, ClassLoader loader) {
+  TestRun(RunParams params, List<Framework> frameworks, Output out, ClassLoader loader) {
     this.params = params;
+    this.frameworks = frameworks;
     this.out = out;
     this.loader = loader;
   }
 
-  Map<String, Object> run() throws ReflectiveOperationException {
-    long start = System.nanoTime();
-    List<Framework> frameworks = frameworks();
+  /**
+   * The frameworks to run: the named ones, or every known one on the classpath.
+   *
+   * @throws IllegalArgumentException if a named framework is missing or cannot be created
+   */
+  static List<Framework> frameworks(List<String> names, ClassLoader loader) {
+    List<Framework> frameworks = new ArrayList<>();
+    for (String name : names) {
+      try {
+        frameworks.add(instantiate(name, loader));
+      } catch (ClassNotFoundException | NoClassDefFoundError e) {
+        throw new IllegalArgumentException("framework " + name + " is not on the classpath");
+      } catch (ReflectiveOperationException | LinkageError | ClassCastException e) {
+        throw new IllegalArgumentException("cannot create framework " + name + ": " + e);
+      }
+    }
+    if (!names.isEmpty()) return frameworks;
+    for (String name : KNOWN_FRAMEWORKS) {
+      try {
+        frameworks.add(instantiate(name, loader));
+      } catch (ReflectiveOperationException | LinkageError e) {
+        // not on the test classpath
+      }
+    }
+    return frameworks;
+  }
+
+  private static Framework instantiate(String name, ClassLoader loader) throws ReflectiveOperationException {
+    return (Framework) Class.forName(name, true, loader).getDeclaredConstructor().newInstance();
+  }
+
+  Map<String, Object> run() {
     Discovery discovery = new Discovery(loader);
     List<String> classNames = Discovery.classNames(params.testClassesDirs());
     Set<String> claimed = new HashSet<>();
@@ -71,8 +106,16 @@ final class TestRun {
       }
       if (!taskDefs.isEmpty()) runFramework(framework, taskDefs);
     }
+    if (claimed.isEmpty() && !params.filters().isEmpty()) {
+      out.log("warn", "no test suites match the filters " + params.filters());
+    }
+    return result(crashed ? "crashed" : failed > 0 ? "failed" : "ok");
+  }
+
+  /** The {@code run} result with the counts so far, keys in protocol order. */
+  synchronized Map<String, Object> result(String status) {
     Map<String, Object> result = new LinkedHashMap<>();
-    result.put("status", crashed ? "crashed" : failed > 0 ? "failed" : "ok");
+    result.put("status", status);
     result.put("passed", passed);
     result.put("failed", failed);
     result.put("skipped", skipped);
@@ -80,24 +123,19 @@ final class TestRun {
     return result;
   }
 
-  private List<Framework> frameworks() throws ReflectiveOperationException {
-    List<Framework> frameworks = new ArrayList<>();
-    if (!params.frameworks().isEmpty()) {
-      for (String name : params.frameworks()) frameworks.add(instantiate(name));
-      return frameworks;
+  /**
+   * Ends a run that the JVM is abandoning, typically because a test called {@code System.exit}:
+   * closes the running suite and returns a {@code crashed} result. Called from a shutdown hook.
+   */
+  Map<String, Object> abort() {
+    String suite = runningSuite;
+    if (suite == null) {
+      out.log("error", "the JVM exited before the test run finished");
+    } else {
+      out.log("error", "the JVM exited while suite " + suite + " was running (System.exit in a test?)");
+      endSuite(suite, runningSuiteStart);
     }
-    for (String name : KNOWN_FRAMEWORKS) {
-      try {
-        frameworks.add(instantiate(name));
-      } catch (ClassNotFoundException | LinkageError e) {
-        // not on the test classpath
-      }
-    }
-    return frameworks;
-  }
-
-  private Framework instantiate(String name) throws ReflectiveOperationException {
-    return (Framework) Class.forName(name, true, loader).getDeclaredConstructor().newInstance();
+    return result("crashed");
   }
 
   private Selector[] selectors() {
@@ -116,19 +154,26 @@ final class TestRun {
       startEvent.put("suite", suite);
       out.event(startEvent);
       long start = System.nanoTime();
+      runningSuiteStart = start;
+      runningSuite = suite;
       try {
         queue.addAll(Arrays.asList(task.execute(event -> report(event, suite), loggers)));
       } catch (Throwable t) {
         crashed = true;
         out.log("error", "suite " + suite + " crashed:\n" + stackTrace(t));
       }
-      Map<String, Object> endEvent = out.newEvent("test.suite.end");
-      endEvent.put("suite", suite);
-      endEvent.put("durationMs", (System.nanoTime() - start) / 1_000_000);
-      out.event(endEvent);
+      runningSuite = null;
+      endSuite(suite, start);
     }
     String summary = runner.done();
     if (summary != null && !summary.isBlank()) out.log("info", summary);
+  }
+
+  private void endSuite(String suite, long startNanos) {
+    Map<String, Object> endEvent = out.newEvent("test.suite.end");
+    endEvent.put("suite", suite);
+    endEvent.put("durationMs", (System.nanoTime() - startNanos) / 1_000_000);
+    out.event(endEvent);
   }
 
   /**

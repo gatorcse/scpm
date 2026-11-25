@@ -18,6 +18,11 @@ public class DiscoveryTest {
 
   public abstract static class AbstractSuite extends BaseSuite {}
 
+  /** Shaped like a Scala object's class: name ends in $, private constructor. */
+  public static final class Module$ extends BaseSuite {
+    private Module$() {}
+  }
+
   public static class NoDefaultConstructor extends BaseSuite {
     public NoDefaultConstructor(int x) {}
   }
@@ -65,6 +70,12 @@ public class DiscoveryTest {
   @Test
   public void moduleFingerprintsOnlyMatchObjects() {
     assertTrue(discovery.match(P + "ConcreteSuite", new Fingerprint[] {subclass(true)}).isEmpty());
+  }
+
+  @Test
+  public void objectsMatchDespiteTheirPrivateConstructor() {
+    Fingerprint fp = subclass(true);
+    assertEquals(Optional.of(fp), discovery.match(P + "Module$", new Fingerprint[] {fp}));
   }
 
   @Test

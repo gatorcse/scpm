@@ -45,4 +45,12 @@ public class JsonTest {
     assertThrows(IllegalArgumentException.class, () -> Json.parse("[1, 2"));
     assertThrows(IllegalArgumentException.class, () -> Json.parse("{} extra"));
   }
+
+  @Test
+  public void capsNestingDepth() {
+    String ok = "[".repeat(Json.MAX_DEPTH) + "]".repeat(Json.MAX_DEPTH);
+    assertEquals(Json.parse(ok), Json.parse(ok));
+    String deep = "[".repeat(100_000) + "]".repeat(100_000);
+    assertThrows(IllegalArgumentException.class, () -> Json.parse(deep));
+  }
 }

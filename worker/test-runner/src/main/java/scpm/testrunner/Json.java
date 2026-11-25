@@ -13,6 +13,9 @@ import java.util.Map;
  * or {@code Double}, {@code Boolean} and {@code null}.
  */
 final class Json {
+  /** Deeper documents are rejected rather than risking a stack overflow. */
+  static final int MAX_DEPTH = 64;
+
   private Json() {}
 
   static Object parse(String text) {
@@ -83,6 +86,7 @@ final class Json {
   private static final class Parser {
     private final String s;
     private int pos;
+    private int depth;
 
     Parser(String s) {
       this.s = s;
@@ -103,12 +107,18 @@ final class Json {
       };
     }
 
+    private void enter() {
+      if (++depth > MAX_DEPTH) throw error("nested deeper than " + MAX_DEPTH);
+      pos++;
+    }
+
     private Map<String, Object> object() {
       Map<String, Object> map = new LinkedHashMap<>();
-      pos++;
+      enter();
       skipWhitespace();
       if (peek() == '}') {
         pos++;
+        depth--;
         return map;
       }
       while (true) {
@@ -123,6 +133,7 @@ final class Json {
           pos++;
         } else {
           expect('}');
+          depth--;
           return map;
         }
       }
@@ -130,10 +141,11 @@ final class Json {
 
     private List<Object> array() {
       List<Object> list = new ArrayList<>();
-      pos++;
+      enter();
       skipWhitespace();
       if (peek() == ']') {
         pos++;
+        depth--;
         return list;
       }
       while (true) {
@@ -143,6 +155,7 @@ final class Json {
           pos++;
         } else {
           expect(']');
+          depth--;
           return list;
         }
       }

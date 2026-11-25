@@ -57,7 +57,8 @@ final class Discovery {
       if (fp instanceof SubclassFingerprint sub
           && sub.isModule() == isModule
           && isSubclass(cls, sub.superclassName())
-          && (!sub.requireNoArgConstructor() || hasNoArgConstructor(cls))) {
+          // An object is instantiated through its MODULE$ field, never its constructor.
+          && (isModule || !sub.requireNoArgConstructor() || hasNoArgConstructor(cls))) {
         return Optional.of(fp);
       }
       if (fp instanceof AnnotatedFingerprint ann
