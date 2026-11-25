@@ -23,6 +23,10 @@ pub fn merge_module(base: &mut Value, overlay: Value) {
                 if matches!(value, Value::Null) {
                     continue;
                 }
+                if is_replace_null(&value) {
+                    base_map.remove(&key);
+                    continue;
+                }
                 let is_matrix = key.as_str().is_some_and(|k| MATRIX_KEYS.contains(&k));
                 match base_map.get_mut(&key) {
                     Some(existing) if !is_matrix => merge(existing, value),
@@ -45,6 +49,10 @@ pub fn merge(base: &mut Value, overlay: Value) {
         }
         (Value::Mapping(base_map), Value::Mapping(overlay_map)) => {
             for (key, value) in overlay_map {
+                if is_replace_null(&value) {
+                    base_map.remove(&key);
+                    continue;
+                }
                 match base_map.get_mut(&key) {
                     Some(existing) => merge(existing, value),
                     None if value.is_null() => {}
@@ -59,6 +67,12 @@ pub fn merge(base: &mut Value, overlay: Value) {
         }
         (base, overlay) => *base = strip_replace_tags(overlay),
     }
+}
+
+/// `!replace null` (or `!replace ~`): the key is removed, so the field takes its default (empty
+/// for lists and maps, unset for optional values).
+fn is_replace_null(value: &Value) -> bool {
+    matches!(value, Value::Tagged(tagged) if tagged.tag == REPLACE_TAG && matches!(tagged.value, Value::Null))
 }
 
 /// Removes a top-level `!replace` tag; the flag says whether there was one.
@@ -162,14 +176,16 @@ pub fn unknown_tags(value: &Value, path: &str, found: &mut dyn FnMut(String, Str
 }
 
 /// Removes `!replace` tags so they don't leak into deserialization when there was nothing
-/// to replace.
+/// to replace; entries that are `!replace null` are dropped.
 pub fn strip_replace_tags(value: Value) -> Value {
     match value {
         Value::Tagged(tagged) if tagged.tag == REPLACE_TAG => strip_replace_tags(tagged.value),
         Value::Tagged(tagged) => {
             Value::Tagged(Box::new(TaggedValue { tag: tagged.tag, value: strip_replace_tags(tagged.value) }))
         }
-        Value::Mapping(map) => Value::Mapping(map.into_iter().map(|(k, v)| (k, strip_replace_tags(v))).collect()),
+        Value::Mapping(map) => Value::Mapping(
+            map.into_iter().filter(|(_, v)| !is_replace_null(v)).map(|(k, v)| (k, strip_replace_tags(v))).collect(),
+        ),
         Value::Sequence(seq) => Value::Sequence(seq.into_iter().map(strip_replace_tags).collect()),
         other => other,
     }
@@ -221,8 +237,12 @@ mod tests {
     #[test]
     fn replace_null_clears() {
         let mut base = yaml("{release: '17', opts: [-a]}");
-        merge_module(&mut base, yaml("{release: !replace null, opts: !replace ~}"));
-        assert_eq!(base, yaml("{release: null, opts: null}"));
+        merge_module(&mut base, yaml("{release: !replace null, opts: !replace ~, env: !replace ~}"));
+        assert_eq!(base, yaml("{}"), "cleared keys are removed, so fields take their defaults");
+        let mut base = yaml("{env: {A: x, B: y}}");
+        merge(&mut base, yaml("{env: {A: !replace null}}"));
+        assert_eq!(base, yaml("{env: {B: y}}"));
+        assert_eq!(strip_replace_tags(yaml("{a: !replace ~, b: 1}")), yaml("{b: 1}"));
     }
 
     #[test]

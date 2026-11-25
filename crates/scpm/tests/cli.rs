@@ -699,7 +699,7 @@ fn replace_inside_variants_entries_replaces() {
 #[test]
 fn replace_null_and_replace_variants() {
     let ws = format!(
-        "{WS}presets:\n  lib:\n    release: '17'\n    variants: {{'3': {{scalacOptions: [-Werror]}}, jvm: {{jvmOptions: [-x]}}}}\n"
+        "{WS}presets:\n  lib:\n    release: '17'\n    javacOptions: [-Xlint]\n    env: {{A: x, B: y}}\n    variants: {{'3': {{scalacOptions: [-Werror]}}, jvm: {{jvmOptions: [-x]}}}}\n"
     );
     let dir = workspace(&[
         ("scpm-workspace.yaml", &ws),
@@ -708,7 +708,11 @@ fn replace_null_and_replace_variants() {
             "extends: [lib]\nrelease: !replace null\nvariants: !replace\n  3: {scalacOptions: [-deprecation]}\n",
         ),
         ("modules/b/scpm.yaml", "extends: [lib]\nrelease: ~\n"),
+        ("modules/c/scpm.yaml", "extends: [lib]\njavacOptions: !replace null\nenv: {A: !replace ~}\n"),
     ]);
+    let c = json(dir.path(), &["config", "c"]);
+    assert_eq!(c[0]["javacOptions"], serde_json::json!([]), "a cleared list loads as empty");
+    assert_eq!(c[0]["env"], serde_json::json!({"B": "y"}));
     let v = json(dir.path(), &["config", "a", "b"]);
     assert_eq!(v[0]["release"], Value::Null, "!replace null clears");
     assert_eq!(v[0]["scalacOptions"], serde_json::json!(["-deprecation"]));
@@ -784,8 +788,15 @@ fn write_errors_fail_the_command() {
         return;
     }
     let dir = workspace(&[("scpm-workspace.yaml", WS), ("modules/a/scpm.yaml", "{}\n")]);
-    let cases: [&[&str]; 4] = [&["ls"], &["--json", "ls"], &["config", "a"], &["graph", "--format", "dot"]];
-    for args in cases {
+    // The last case is a JSON usage error: its write failure is reported, its exit code kept.
+    let cases: [(&[&str], i32); 5] = [
+        (&["ls"], 1),
+        (&["--json", "ls"], 1),
+        (&["config", "a"], 1),
+        (&["graph", "--format", "dot"], 1),
+        (&["--json", "ls", "-F", "nope"], 2),
+    ];
+    for (args, code) in cases {
         let out = StdCommand::new(assert_cmd::cargo::cargo_bin("scpm"))
             .arg("-C")
             .arg(dir.path())
@@ -793,7 +804,7 @@ fn write_errors_fail_the_command() {
             .stdout(fs::File::create("/dev/full").unwrap())
             .output()
             .unwrap();
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(out.status.code(), Some(code), "{args:?}");
         assert!(String::from_utf8_lossy(&out.stderr).contains("cannot write output"), "{args:?}");
     }
 }
@@ -816,6 +827,10 @@ fn module_discovery_reports_unreadable_directories() {
     if fs::read_dir(&locked).is_err() {
         let err = config_error(dir.path(), &["ls"]);
         assert!(err.contains("cannot search for modules"), "{err}");
+        // An excluded directory's errors don't matter.
+        let ws = "toolchain: {scala: '3.9.0'}\nmodules: ['modules/**', '!modules/b']\n";
+        fs::write(dir.path().join("scpm-workspace.yaml"), ws).unwrap();
+        assert_eq!(ls_ids(dir.path(), &[]), vec!["a@jvm-3"]);
     }
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 }

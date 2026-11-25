@@ -73,8 +73,8 @@ pub fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Config(diags)) => {
             if json {
-                let _ =
-                    print_json(&serde_json::json!({"ok": false, "error": {"kind": "config", "diagnostics": diags}}));
+                let error = serde_json::json!({"ok": false, "error": {"kind": "config", "diagnostics": diags}});
+                print_json(&error).unwrap_or_else(report_write_error);
             } else {
                 eprintln!("{diags}");
             }
@@ -82,7 +82,8 @@ pub fn main() -> ExitCode {
         }
         Err(Failure::Usage(message)) => {
             if json {
-                let _ = print_json(&serde_json::json!({"ok": false, "error": {"kind": "usage", "message": message}}));
+                let error = serde_json::json!({"ok": false, "error": {"kind": "usage", "message": message}});
+                print_json(&error).unwrap_or_else(report_write_error);
             } else {
                 eprintln!("error: {message}");
             }
@@ -91,9 +92,17 @@ pub fn main() -> ExitCode {
         // A closed pipe (`scpm ls | head`) is not an error.
         Err(Failure::Output(e)) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(Failure::Output(e)) => {
-            eprintln!("error: cannot write output: {e}");
+            report_write_error(e);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Reports a failed stdout write on stderr (a closed pipe is not reported). When the output was
+/// a JSON error, the exit code stays that error's.
+fn report_write_error(e: io::Error) {
+    if e.kind() != io::ErrorKind::BrokenPipe {
+        eprintln!("error: cannot write output: {e}");
     }
 }
 

@@ -771,6 +771,10 @@ fn discover_modules(
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) if is_skippable_walk_error(&e) => continue,
+            // Errors inside an excluded directory don't matter.
+            Err(e) if walk_error_path(&e).is_some_and(|p| rel(root, p).ancestors().any(|a| exclude.is_match(a))) => {
+                continue;
+            }
             Err(e) => {
                 let d = Diagnostic::new(format!("cannot search for modules: {e}"))
                     .at_key("modules")
@@ -807,6 +811,15 @@ fn is_skippable_walk_error(err: &ignore::Error) -> bool {
         | ignore::Error::WithLineNumber { err, .. } => is_skippable_walk_error(err),
         ignore::Error::Io(e) => e.kind() == std::io::ErrorKind::NotFound,
         _ => false,
+    }
+}
+
+/// The path a walk error is about, if it names one.
+fn walk_error_path(err: &ignore::Error) -> Option<&Path> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => walk_error_path(err),
+        _ => None,
     }
 }
 
