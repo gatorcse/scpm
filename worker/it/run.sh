@@ -394,10 +394,29 @@ expect "the full compile it was queued behind still succeeds" "$(await "$FIRST")
 if responded_before "$QUEUED" "$FIRST"; then pass "the queued compile is answered without waiting for the running one"
 else fail "the queued compile is answered without waiting for the running one"; fi
 
+BEFORE_BIG="$(class_files "$BIG")"
+perl -pi -e 's/List\[Int\]/Seq[Int]/' "$BIG"/src/*.scala
+send compile "$(compile_params big@jvm-3 "$SCALA3" "$BIG")"
+CHANGED=$ID
+until jq -e --argjson id "$CHANGED" 'select(.params.requestId == $id and .params.t == "compile.progress")' \
+  "$WORK/worker.out" >/dev/null 2>&1; do sleep 0.05; done
+send cancel "{\"requestId\": $CHANGED}"
+expect "cancelling a 400-file API change answers cancelled" "$(await "$CHANGED")" '.result.status == "cancelled"'
+if [ "$(class_files "$BIG")" = "$BEFORE_BIG" ]; then pass "a cancelled compile leaves classesDir as before"
+else fail "a cancelled compile leaves classesDir as before" "$(class_files "$BIG" | wc -l) files"; fi
+
+DEEP="$WORK/deep"
+mkdir -p "$DEEP/src"
+{ printf 'object Deep:\n  val x = '; head -c 300000 /dev/zero | tr '\0' '('; printf 1; head -c 300000 /dev/zero | tr '\0' ')'; echo; } \
+  >"$DEEP/src/Deep.scala"
+compile deep@jvm-3 "$SCALA3" "$DEEP"
+expect "a compiler stack overflow is answered crashed" "$R" \
+  '.result.status == "crashed" and (.result.message | test("StackOverflowError"))'
+compile core@jvm-3 "$SCALA3" "$S3"
+expect "and the worker keeps serving" "$R" '.result.status == "ok"'
+
 # --- Test runner --------------------------------------------------------------------------
 
-# run_tests NAME CLASSPATH PARAMS_JSON -> runs the test runner; sets RUN_RESULT (response line),
-# RUN_EVENTS (event params array) and RUN_EXIT
 # start_runner NAME CLASSPATH PARAMS_JSON -> starts the test runner with the request written and
 # stdin kept open on fd 4, as the CLI does; sets RUNNER_PID
 start_runner() {
@@ -408,15 +427,21 @@ start_runner() {
   exec 4>"$WORK/$1.in"
   jq -nc --argjson params "$3" '{id: 1, method: "run", params: $params}' >&4
 }
+# run_tests NAME CLASSPATH PARAMS_JSON -> runs to completion, closing stdin once the response
+# arrives (as the CLI does); sets RUN_RESULT, RUN_EVENTS, RUN_LOGS (log messages) and RUN_EXIT
 run_tests() {
   start_runner "$@"
+  until jq -e 'select(has("id"))' "$WORK/$1.out" >/dev/null 2>&1 || ! kill -0 "$RUNNER_PID" 2>/dev/null; do
+    sleep 0.05
+  done
+  exec 4>&-
   set +e
   wait "$RUNNER_PID"
   RUN_EXIT=$?
   set -e
-  exec 4>&-
   RUN_RESULT="$(jq -c 'select(has("id"))' "$WORK/$1.out")"
   RUN_EVENTS="$(jq -sc '[.[] | select(.method == "event") | .params]' "$WORK/$1.out")"
+  RUN_LOGS="$(jq -c '[.[] | select(.t == "log") | .message]' <<<"$RUN_EVENTS")"
 }
 
 section "test runner: munit $MUNIT on Scala $SCALA3_LTS"
@@ -441,6 +466,8 @@ expect "test stdout becomes a log event" "$RUN_EVENTS" \
   'any(.[]; .t == "log" and .level == "info" and .message == "hello from a test")'
 expect "runner stdout is protocol JSON only" "$(jq -sc 'length' "$WORK/munit.out" 2>&1)" '. > 0'
 expect "runner exits 0 after answering" "$RUN_EXIT" '. == 0'
+expect "closing stdin after the response is not reported as the parent going away" "$RUN_LOGS" \
+  'all(.[]; test("parent went away") | not)'
 
 run_tests munit-names "$MUNIT_CP" "$(run_params '{filters: ["*.ArithmeticSuite"], testNames: ["addition works"]}')"
 expect "testNames runs only the named test" "$RUN_RESULT" '.result.status == "ok" and .result.passed == 1 and .result.failed == 0'
@@ -449,17 +476,22 @@ run_tests munit-stdin "$MUNIT_CP" "$(run_params '{filters: ["*.StdinSuite"]}')"
 expect "a test reading stdin gets end of input" "$RUN_RESULT" '.result.status == "ok" and .result.passed == 1'
 
 run_tests munit-none "$MUNIT_CP" "$(run_params '{filters: ["*.NoSuchSuite"]}')"
-expect "filters matching nothing: ok with a warning" "$(jq -sc . <<<"$RUN_RESULT $RUN_EVENTS")" \
-  '.[0].result.status == "ok" and .[0].result.passed == 0 and any(.[1][]; .t == "log" and .level == "warn")'
+expect "filters matching nothing: ok with a warning naming the filter" "$(jq -sc . <<<"$RUN_RESULT $RUN_EVENTS")" \
+  '.[0].result.status == "ok" and .[0].result.passed == 0 and
+    any(.[1][]; .t == "log" and .level == "warn" and (.message | contains("*.NoSuchSuite")))'
 
 run_tests munit-exit "$MUNIT_CP" "$(run_params '{filters: ["*.ExitSuite"]}')"
-expect "System.exit in a test: crashed result" "$RUN_RESULT" '.id == 1 and .result.status == "crashed"'
+expect "System.exit in a test: crashed result naming the status" "$RUN_RESULT" \
+  '.id == 1 and .result.status == "crashed" and .result.message == "a test called System.exit(3)"'
 expect "System.exit in a test: suite is closed and named in the log" "$RUN_EVENTS" \
   'any(.[]; .t == "test.suite.end" and .suite == "arith.ExitSuite") and
-    any(.[]; .t == "log" and .level == "error" and (.message | test("arith.ExitSuite")))'
+    any(.[]; .t == "log" and .level == "error" and (.message | test("arith.ExitSuite"))) and
+    all(.[]; .t != "log" or (.message | test("parent went away") | not))'
 
 start_runner munit-orphan "$MUNIT_CP" "$(run_params '{filters: ["*.SleepSuite"]}')"
-until jq -e 'select(.params.t == "test.suite.start")' "$WORK/munit-orphan.out" >/dev/null 2>&1; do sleep 0.05; done
+until jq -e 'select(.params.message? // "" | startswith("child pid"))' "$WORK/munit-orphan.out" >/dev/null 2>&1; do
+  sleep 0.05
+done
 exec 4>&-
 deadline=$((SECONDS + 10))
 while kill -0 "$RUNNER_PID" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.1; done
@@ -469,8 +501,14 @@ if kill -0 "$RUNNER_PID" 2>/dev/null; then
 else
   set +e; wait "$RUNNER_PID"; ORPHAN_EXIT=$?; set -e
   expect "the runner exits 4 when its parent closes stdin mid-run" "$ORPHAN_EXIT" '. == 4'
-  expect "and says why" "$(jq -sc '[.[] | .params.message? // empty]' "$WORK/munit-orphan.out")" \
-    'any(.[]; test("parent went away"))'
+  expect "and answers crashed, saying why" "$(jq -c 'select(has("id"))' "$WORK/munit-orphan.out")" \
+    '.result.status == "crashed" and .result.message == "parent went away (stdin closed)"'
+  CHILD="$(jq -r 'select(.params.t == "log") | .params.message | capture("child pid (?<pid>[0-9]+)").pid' \
+    "$WORK/munit-orphan.out")"
+  deadline=$((SECONDS + 5))
+  while kill -0 "$CHILD" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.1; done
+  if [ -n "$CHILD" ] && ! kill -0 "$CHILD" 2>/dev/null; then pass "and kills the processes its tests started"
+  else fail "and kills the processes its tests started" "child pid: $CHILD"; kill "$CHILD" 2>/dev/null || true; fi
 fi
 
 run_tests munit-missing "$MUNIT_CP" "$(run_params '{frameworks: ["no.such.Framework"]}')"
