@@ -124,7 +124,7 @@ flowchart TB
 
     clients --> front
     deps -- "spawn, JSON over stdio" --> resolver
-    core -- "JSON-RPC over a unix socket" --> scpmd
+    core -- "JSON lines: stdio (Phase 1), unix socket (daemon)" --> scpmd
     core -- "spawn" --> testjvm
     scpmd -- "events stream back" --> out
     testjvm -- "events stream back" --> out
@@ -146,7 +146,7 @@ Only the Rust box runs on every command. Everything in "Out-of-process helpers" 
 - schedule tasks; restore and push the remote cache; run shell tasks
 - render every report; serve BSP and MCP front-ends
 
-**JVM worker (`scpmd`) is deliberately dumb.** The request is "compile this module with this classpath, these sources and these options, analysis file here, mapping roots here". The worker streams diagnostics and progress events back, then returns the analysis and products. It has no notion of a workspace graph. Rust can therefore:
+**JVM worker (`scpmd`) is deliberately dumb.** The request is "compile this module with this classpath, these sources and these options, analysis file here, mapping roots here". The worker streams diagnostics and progress events back, then returns the analysis and products. It has no notion of a workspace graph. The wire format is [docs/worker-protocol.md](worker-protocol.md) (JSON lines); the CLI normalises worker events into the §9.1 event schema (workspace-relative paths, `edit` shape, categories). Rust can therefore:
 
 - swap the worker implementation (embedded Zinc today; a Leyden or CRaC snapshot tomorrow);
 - run several workers;
@@ -306,7 +306,7 @@ boms:
   - com.acme:platform-bom:2026.11.0
 
 javacOptions: [-parameters]
-generatedSources: [src_managed]  # dirs under ${outDir} that tasks write; compiled with the sources
+generatedSources: [src_managed]  # Phase 3: dirs under ${outDir} that tasks write; compiled with the sources
 
 variants:                        # per-variant overrides, keyed by variant selector, only when needed
   '2.13':                        # matches every variant on Scala 2.13 (also: 'js', 'jvm-3', …)
@@ -338,7 +338,7 @@ Notes:
 
 - **Dependency syntax** keeps the Scala convention (`::` cross-version, `:::` full version, `:` plain Java). Keys are coordinates and values are version specs, so Renovate and agents can edit a single line. Bare names (`util:`) refer to workspace modules.
 - **Scopes**: `dependencies`, `providedDependencies` (compile-only), `runtimeDependencies`, `testDependencies`. Four is deliberately small; no Ivy configurations.
-- **Catalog references** look up the field's natural key: for a dependency, its coordinate (`catalog` → default catalog, `catalog:spark` → the `spark` catalog). The default catalog is written as a bare `catalog` (also accepted: `catalog:default`, or a quoted `'catalog:'`) because a trailing `:` is not valid in a YAML value; pnpm can use `catalog:` only because package.json is JSON; for `scala`, the key `scala`. A catalog entry may itself be a range (`^3.6.0`); it is resolved once per (platform, Scala binary version) for the whole workspace (§5.4). A variant that needs a different version uses a `variants` override:
+- **Catalog references** look up the field's natural key: for a dependency, its coordinate (`catalog` → default catalog, `catalog:spark` → the `spark` catalog). The default catalog is written as a bare `catalog` (also accepted: `catalog:default`, or a quoted `'catalog:'`) because a trailing `:` is not valid in a YAML value (pnpm can use `catalog:` only because package.json is JSON). For `scala`, the natural key is `scala`. A catalog entry may itself be a range (`^3.6.0`); it is resolved once per (platform, Scala binary version) for the whole workspace (§5.4). A variant that needs a different version uses a `variants` override:
   ```yaml
   variants:
     '2.13':
@@ -346,7 +346,7 @@ Notes:
         org.typelevel::cats-core: catalog:scala213   # looks up org.typelevel::cats-core in catalogs.scala213
   ```
 - **Source layout** is sbt/Maven's by default: `src/main/scala`, `src/main/java`, `src/main/resources`, `src/test/scala`, `src/test/java`, `src/test/resources`. Version- and platform-specific directories (`src/main/scala-2`, `scala-3`, `scala-2.13`, `scala-jvm`, `scala-js`, `scala-native`, and their `src/test/…` twins) are added automatically for the variants they match. `sources`, `resources`, `testSources` and `testResources` (lists of directories relative to the module) replace the defaults.
-- **`${outDir}`** is `.scpm/out/<variant-id>/`. `generatedSources` lists directories relative to it; tasks write them and they join the compile sources.
+- **`${outDir}`** is `.scpm/out/<variant-id>/`. `generatedSources` lists directories relative to it; tasks write them and they join the compile sources. Because tasks arrive in Phase 3, so does `generatedSources`; until then both are "not supported yet". In the sketches above, `tasks`, `pipelines`, `pipelineBase`, `generatedSources`, `policy` and `versioning` are later-phase keys.
 - **`scala: none`** marks a Java-only module: no suffix, no scala-library, variant id `<name>@jvm`.
 - **`compilerPlugins`** maps a coordinate to a spec, like dependencies. `:::` coordinates are resolved full-cross (`_<full Scala version>`). Every plugin jar is passed as `-Xplugin:<jar>`, Scala 3 plugins included.
 - **Java and run settings:** `javacOptions`; `release`, the Java release target (default: the project JDK's major, §6.3); `mainClass`; `jvmOptions` and `env` for forked `run` and `test` JVMs.
@@ -398,7 +398,7 @@ Directory-based implicit inheritance (child configs silently picking up parent-d
 
 **Variant ids** are `<module>@<platform>-<scala binary>` (`core@jvm-3`, `core@js-2.13`), or `<module>@jvm` for a Java-only module.
 
-**Selectors** (keys of `variants`, and the part after `@` in filters) are dash-separated parts. Each part matches a platform (`jvm`, `js`, `native`), a Scala binary version (`3`, `2.13`) or a full Scala version (`3.9.0`); any other part is an error. A variant matches if every part matches. In filters, `-F core` matches every variant of `core`, and globs work (`-F 'core@jvm-*'`).
+**Selectors** (keys of `variants`, and the part after `@` in filters) have the form `<platform>`, `<scala>` or `<platform>-<scala>`, where `<platform>` is `jvm`, `js` or `native`, and `<scala>` is a Scala binary version (`3`, `2.13`) or a full version (`3.9.0`, `3.8.0-RC1`, which may itself contain `-`). A variant matches if every given part matches; a selector that matches no variant is an error. In filters, `-F core` matches every variant of `core`, and globs work (`-F 'core@jvm-*'`).
 
 ### 4.5 Cross-building
 
@@ -533,12 +533,15 @@ boot:                            # everything needed before a JVM starts; lists 
     scalafmt@3.10.1: [org.scalameta:scalafmt-cli_2.13:3.10.1, …]
     scalafix@0.14.4: [ch.epfl.scala:scalafix-cli_2.13.18:0.14.4, …]
 
+catalogs:                        # selections for catalog *ranges*, one per (platform, Scala binary version)
+  default/org.typelevel::cats-effect@jvm-3: { range: ^3.6.0, version: 3.6.3 }
+
 variants:                        # keyed by variant id, even for single-variant modules
   core@jvm-3:
     specifiers:                  # each direct dependency as written, and the version scpm selected
-      org.typelevel::cats-core: { spec: 'catalog:', version: 2.13.0 }
+      org.typelevel::cats-core: { spec: catalog, version: 2.13.0 }
       io.circe::circe-core:     { spec: ^0.14.10, version: 0.14.14 }
-      org.scalameta::munit:     { spec: 'catalog:', version: 1.2.1 }
+      org.scalameta::munit:     { spec: catalog, version: 1.2.1 }
       util:                     { spec: 'workspace:*' }
     inputsHash: sha256:…
     compileClasspath:            # ordered
@@ -572,9 +575,9 @@ Each variant locks four ordered classpaths:
 
 - **Workspace modules** (`workspace:*`) appear as references (`{ module: util@jvm-3 }`), not artifacts: every upstream variant in the transitive closure, in dependency order, before the external artifacts, which follow coursier's order. Upstream modules contribute their `dependencies` to every list and their `runtimeDependencies` to the runtime lists, never their provided or test dependencies.
 - **Resolution is joint over the variant's transitive workspace closure.** A variant's external dependencies are resolved in one coursier call together with those of every upstream variant, so if A depends on B, A's classpaths hold one version of each library for both A's and B's code.
-- **Catalog ranges are resolved once per (platform, Scala binary version) for the whole workspace**, so every variant that uses that catalog entry on that platform and Scala binary version gets the same version.
+- **Catalog ranges are resolved once per (platform, Scala binary version) for the whole workspace**, so every variant that uses that catalog entry on that platform and Scala binary version gets the same version. The selection lives in the lock's top-level `catalogs` section, keyed `<catalog>/<key>@<platform>-<scala binary>`. Re-locking a stale variant reuses an existing selection whose range is unchanged; only `scpm update` re-selects, and it then re-locks every variant that uses the entry.
 - **`specifiers`** records each direct dependency's spec as written and the version scpm selected for it (§5.5), before coursier's reconciliation, like pnpm's importers. `workspace:*` entries have no version.
-- **`inputsHash`** is a sha256 over the variant's *effective* config after presets and `variants` (§4.4): dependencies (catalog references replaced by their entries), BOMs, overrides, toolchain and repositories, plus the same for every upstream variant in its workspace closure, since those are resolved jointly.
+- **`inputsHash`** is a sha256 over every effective input that affects the variant's resolution, after presets and `variants` (§4.4): platform and full Scala version, dependencies of every scope (catalog references replaced by their entries), `compilerPlugins`, BOMs, overrides, repositories, the resolution context and `policy.minimumReleaseAge`, plus the same for every upstream variant in its workspace closure, since those are resolved jointly.
 - A variant with `compilerPlugins` also has an ordered `compilerPlugins` list.
 
 **Artifacts** are keyed `group:artifact:version[:classifier][@type]`, with `@type` omitted for `jar`. Each file has one entry, shared by every variant that uses it; `deps` lists its direct dependencies for `scpm why`. **Sources jars are not in the lock.** They are IDE-only, fetched on demand and verified against the repository's checksum.
@@ -583,7 +586,9 @@ Each variant locks four ordered classpaths:
 
 #### Resolution context and repositories
 
-- **Resolution uses a fixed, declared context**, never the machine's own: by default `{os: linux, arch: x86_64, jdk: <project JDK major>}`, configurable as `lock.resolutionContext` in the workspace. It is passed to coursier (`--jdk-version`, and the OS and architecture properties that drive POM profile activation), so a lock made on macOS equals one made on Linux. The lock records it, and a change re-locks every variant.
+- **Resolution uses a fixed, declared context**, never the machine's own: by default `{os: linux, arch: x86_64, jdk: <project JDK major>}`, configurable as `lock.resolutionContext` in the workspace. It is passed to coursier, so a lock made on macOS equals one made on Linux. The lock records it, and a change re-locks every variant.
+  - **Phase 1 limit:** the native `cs` CLI exposes only `--jdk-version`, so Phase 1 applies the JDK part of the context; OS and architecture profile activation follows the machine running `cs` until the resolver sidecar (Phase 3) passes them through the coursier API. The Phase 0 resolve spike checks how often this matters in practice.
+  - **Local-runtime trade-off:** with the default `linux-x86_64` context, a macOS developer's `run` and `test` get the artifacts a Linux profile selects (for example OS-classifier natives). Libraries whose natives differ by OS should be declared explicitly, one classifier per OS, in `runtimeDependencies`.
 - **Mirrors** are applied at fetch time and never recorded.
 - **`repo`** records the repository **id** from config, derived by matching the artifact's URL against the configured repository URLs (and their mirrors) by prefix, longest match first. A URL that matches no configured repository is an error.
 
@@ -594,7 +599,7 @@ A variant is **stale** when its recomputed `inputsHash` differs from the lock's.
 - `scpm install` — re-lock stale variants, then fetch whatever is missing.
 - `scpm install --frozen` — the default when `CI=true`; a stale variant is an error.
 - `scpm compile|test|run` — locally, a stale lock is installed first (aube-style install-before-run) and scpm prints what changed. With `CI=true` or `--frozen`, a stale lock is an error.
-- `scpm ci` — `scpm install --frozen`, then `scpm pipeline`.
+- `scpm ci` — `scpm install --frozen`, then `compile` and `test` over the whole workspace; from Phase 3, `scpm install --frozen` then `scpm pipeline`.
 - `scpm update [selector]` — re-resolve within the declared ranges.
 - `scpm outdated` — list newer versions.
 - `scpm why <coord>` — explain why a coordinate is on the classpath.
@@ -768,7 +773,7 @@ There is no maintained native-image `scalac` (the only one we found was a 2018 S
 
 | | Worker JDK | Project JDK |
 |---|---|---|
-| Chosen by | scpm (25+), pinned per scpm release | `toolchain.jdk` in the workspace |
+| Chosen by | scpm: the JDK pinned per scpm release (25+), or the project JDK if that is newer; obtained with `cs java-home` in Phase 1 | `toolchain.jdk` in the workspace |
 | Runs | `scpmd`: Zinc, scalafmt, scalafix, linkers | tests and `run` (forked JVMs) |
 | Also | The AOT cache applies here | Java release target: scalac `-release` / `-java-output-version`, javac `--release`; a module's `release:` overrides the default (its major version) |
 
@@ -865,7 +870,7 @@ We copy pnpm 12's semantics almost verbatim, so the docs can say "same as pnpm".
 - `!` excludes
 - Variant-aware: `core@jvm-3`, `core@jvm-*`; a bare `core` selects every variant.
 
-**`scpm pipeline`** (the CI entry point; `scpm ci` = `scpm install --frozen`, then `scpm pipeline`):
+**`scpm pipeline`** (the CI entry point from Phase 3; `scpm ci` = `scpm install --frozen`, then `scpm pipeline`):
 1. Install: auto-install locally, an error on a stale lock in CI (§5.4).
 2. Affected modules plus dependents, since `pipelineBase`. A module also counts as changed when one of its catalog entries changes.
 3. Restore from cache.

@@ -10,9 +10,9 @@ Kill the riskiest assumptions with throwaway code before committing to the archi
 **Spikes:**
 
 - [ ] **Config.** Rust loader for `scpm-workspace.yaml` + `scpm.yaml` with JSON Schema validation, presets, catalogs and variants, following the resolution order in design §4.4. Target: under 20 ms for 500 modules.
-- [ ] **Resolve.** Drive native `cs fetch -j` from Rust and turn the report into a draft `scpm-lock.yaml`, computing sha256 values.
+- [ ] **Resolve.** Check which parts of the resolution context (JDK, OS, arch) the native `cs` CLI can apply. Drive native `cs fetch -j` from Rust and turn the report into a draft `scpm-lock.yaml`, computing sha256 values.
 - [ ] **Lock restore.** Rust fetches locked artifacts into a coursier-layout cache, run concurrently with `cs` against the same cache. This proves the lock and `.part` files interoperate, and seeds the Phase 1 compatibility suite.
-- [ ] **Worker.** A minimal Scala JVM worker embedding Zinc 2.1, compiling one module over a unix socket and streaming diagnostics as JSON.
+- [ ] **Worker.** A minimal Scala JVM worker embedding Zinc 2.1, compiling one module over JSON lines on stdio (docs/worker-protocol.md) and streaming diagnostics.
 - [ ] **Startup economics on a real GitHub Actions runner:**
   - cold vs warm compile
   - with and without a JDK 25 AOT cache, measured through Zinc (scalac in a `ScalaInstance` class loader), not scalac on the application class path
@@ -30,9 +30,9 @@ Kill the riskiest assumptions with throwaway code before committing to the archi
 **Config and dependencies**
 - The full v1 schema (design §4) is accepted. Keys for features not built yet are an error, "`<key>` is not supported yet (planned for Phase N)", whenever they would change behaviour; never silently ignored.
 - Workspace + module config: catalogs (default and named), BOMs, overrides, the `workspace:*` protocol, presets with the normative resolution order (§4.4), and four dependency scopes.
-- Module settings: sbt/Maven source layout plus `sources`/`resources`/`testSources`/`testResources`, `scala: none` (Java-only), `compilerPlugins`, `javacOptions`, `release`, `mainClass`, `jvmOptions`, `env`, `generatedSources`.
+- Module settings: sbt/Maven source layout plus `sources`/`resources`/`testSources`/`testResources`, `scala: none` (Java-only), `compilerPlugins`, `javacOptions`, `release`, `mainClass`, `jvmOptions`, `env`. (`generatedSources` comes with tasks in Phase 3.)
 - `scpm install` / `--frozen` and `scpm-lock.yaml` (§5.4): variant ids even for single-variant modules, four classpaths per variant, joint resolution over the workspace closure, per-variant `specifiers` and `inputsHash`, a fixed resolution context, the boot section, sha256 values.
-- Stale lock: locally `compile`/`test`/`run` install first and print what changed; with `CI=true` or `--frozen` it is an error. `scpm ci` = `scpm install --frozen` + `scpm pipeline`.
+- Stale lock: locally `compile`/`test`/`run` install first and print what changed; with `CI=true` or `--frozen` it is an error. `scpm ci` = `scpm install --frozen`, then `compile` and `test` over the whole workspace (it switches to `scpm pipeline` in Phase 3).
 - Resolution through the `cs` CLI. Project JDK via `cs java-home --jvm <id>` (native, cached).
 - Rust lock-restore fetcher: direct jar downloads into the coursier cache layout, no POMs, with repository `credentials` and coursier's `COURSIER_CREDENTIALS` / `credentials.properties`. Ships behind a compatibility suite that runs `cs` and Rust concurrently on one cache.
 
