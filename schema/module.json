@@ -1,0 +1,361 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scpm module",
+  "description": "`scpm.yaml`: one module. Also the shape of presets and of `variants` overrides.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "boms": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "compilerPlugins": {
+      "description": "Compiler plugins (`org:::name` for full-cross Scala 2 plugins); added as `-Xplugin`.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/DepSpec"
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/DepSpec"
+      }
+    },
+    "env": {
+      "description": "Environment variables for forked `run` and `test` JVMs.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "extends": {
+      "description": "Presets to merge in, in order.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "generatedSources": {
+      "description": "Directories under `${outDir}` (`.scpm/out/<variant>/`) written by tasks and compiled\nwith the main sources.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "javacOptions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "jvmOptions": {
+      "description": "JVM options for forked `run` and `test` JVMs.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "mainClass": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "description": "Module name; defaults to the directory name.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "organization": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "platforms": {
+      "description": "Defaults to `[jvm]`.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Platform"
+      }
+    },
+    "providedDependencies": {
+      "description": "Compile-only (Maven `provided`).",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/DepSpec"
+      }
+    },
+    "publish": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "release": {
+      "description": "Java release target, e.g. `'17'`. Defaults to the project JDK's major version.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Ver"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "resources": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "runtimeDependencies": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/DepSpec"
+      }
+    },
+    "scala": {
+      "description": "Scala version(s). A list cross-builds. `none` marks a Java-only module.\nDefaults to `toolchain.scala`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OneOrMany"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "scalacOptions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "sources": {
+      "description": "Source directories relative to the module. Default `src/main/scala`, `src/main/java`\nplus version- and platform-specific `src/main/scala-<x>` directories that exist.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "tasks": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/TaskDef"
+      }
+    },
+    "testDependencies": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/DepSpec"
+      }
+    },
+    "testResources": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "testSources": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "variants": {
+      "description": "Overrides for variants matching a selector such as `2.13`, `js` or `js-2.13`.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#"
+      }
+    },
+    "version": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Ver"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "versionScheme": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/VersionScheme"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "DepDetails": {
+      "type": "object",
+      "properties": {
+        "classifier": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exclude": {
+          "description": "`org:name` patterns; `*` allowed in either part.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "transitive": {
+          "description": "Default `true`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "type": {
+          "description": "Artifact type, default `jar`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "$ref": "#/$defs/Ver"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version"
+      ]
+    },
+    "DepSpec": {
+      "description": "A dependency's value: a version spec string, or a detailed object.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Ver"
+        },
+        {
+          "$ref": "#/$defs/DepDetails"
+        }
+      ]
+    },
+    "OneOrMany": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Ver"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ver"
+          }
+        }
+      ]
+    },
+    "Platform": {
+      "description": "The target platform of a module variant.",
+      "type": "string",
+      "enum": [
+        "jvm",
+        "js",
+        "native"
+      ]
+    },
+    "TaskDef": {
+      "description": "A task definition, pnpm style.",
+      "type": "object",
+      "properties": {
+        "concurrencyGroup": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dependsOn": {
+          "description": "`^task` = that task in each upstream module; `task` = same module.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "description": "Environment variables that are part of the cache key.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "inputs": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "outputs": {
+          "description": "Declared outputs make the task cacheable; `[]` means \"no files\".",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "run": {
+          "description": "Shell command, or `builtin:<name> [args]`. Omitted for built-in tasks like `compile`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Ver": {
+      "description": "A version string from YAML. Unquoted numbers are rejected: YAML reads `2.10` as the\nfloat `2.1`, which silently changes the version.",
+      "type": "string"
+    },
+    "VersionScheme": {
+      "type": "string",
+      "enum": [
+        "early-semver",
+        "semver-spec",
+        "pvp",
+        "strict",
+        "always"
+      ]
+    }
+  }
+}

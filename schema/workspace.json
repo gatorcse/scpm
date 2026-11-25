@@ -1,0 +1,730 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scpm workspace",
+  "description": "`scpm-workspace.yaml`: workspace-wide settings.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "boms": {
+      "description": "BOMs (`org:name:version`) applied to every module.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "catalog": {
+      "description": "The default catalog, referenced as `catalog:`.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Ver"
+      },
+      "default": {}
+    },
+    "catalogs": {
+      "description": "Named catalogs, referenced as `catalog:<name>`.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/$defs/Ver"
+        }
+      },
+      "default": {}
+    },
+    "lock": {
+      "$ref": "#/$defs/LockSettings",
+      "default": {}
+    },
+    "modules": {
+      "description": "Globs of module directories (each containing `scpm.yaml`). `!` excludes.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "organization": {
+      "description": "Default organization (groupId) for modules.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "overrides": {
+      "description": "Forced versions applied workspace-wide.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Ver"
+      },
+      "default": {}
+    },
+    "pipelineBase": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "pipelines": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "default": {}
+    },
+    "policy": {
+      "$ref": "#/$defs/Policy",
+      "default": {}
+    },
+    "presets": {
+      "description": "Named fragments that modules merge in with `extends:`.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ModuleFile"
+      },
+      "default": {}
+    },
+    "repositories": {
+      "description": "Maven repositories, in resolution order. Defaults to `[central]`.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Repository"
+      }
+    },
+    "scpm": {
+      "description": "Pinned scpm version.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Ver"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "tasks": {
+      "description": "Task defaults inherited by every module.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/TaskDef"
+      },
+      "default": {}
+    },
+    "toolchain": {
+      "$ref": "#/$defs/Toolchain",
+      "default": {}
+    },
+    "versioning": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Versioning"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "Credentials": {
+      "description": "`env:VAR` (bearer token) or `{user: env:U, password: env:P}` (basic auth).",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "password": {
+              "type": "string"
+            },
+            "user": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "user",
+            "password"
+          ]
+        }
+      ]
+    },
+    "DepDetails": {
+      "type": "object",
+      "properties": {
+        "classifier": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exclude": {
+          "description": "`org:name` patterns; `*` allowed in either part.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "transitive": {
+          "description": "Default `true`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "type": {
+          "description": "Artifact type, default `jar`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "$ref": "#/$defs/Ver"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version"
+      ]
+    },
+    "DepSpec": {
+      "description": "A dependency's value: a version spec string, or a detailed object.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Ver"
+        },
+        {
+          "$ref": "#/$defs/DepDetails"
+        }
+      ]
+    },
+    "LockSettings": {
+      "type": "object",
+      "properties": {
+        "resolutionContext": {
+          "description": "The fixed OS/arch/JDK used for POM profile activation when locking, so a lock made on\nmacOS equals one made on Linux. Default `{os: linux, arch: x86_64, jdk: <project jdk>}`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResolutionContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModuleFile": {
+      "title": "scpm module",
+      "description": "`scpm.yaml`: one module. Also the shape of presets and of `variants` overrides.",
+      "type": "object",
+      "properties": {
+        "$schema": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "boms": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "compilerPlugins": {
+          "description": "Compiler plugins (`org:::name` for full-cross Scala 2 plugins); added as `-Xplugin`.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/DepSpec"
+          }
+        },
+        "dependencies": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/DepSpec"
+          }
+        },
+        "env": {
+          "description": "Environment variables for forked `run` and `test` JVMs.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "extends": {
+          "description": "Presets to merge in, in order.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "generatedSources": {
+          "description": "Directories under `${outDir}` (`.scpm/out/<variant>/`) written by tasks and compiled\nwith the main sources.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "javacOptions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "jvmOptions": {
+          "description": "JVM options for forked `run` and `test` JVMs.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mainClass": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Module name; defaults to the directory name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "organization": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "platforms": {
+          "description": "Defaults to `[jvm]`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Platform"
+          }
+        },
+        "providedDependencies": {
+          "description": "Compile-only (Maven `provided`).",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/DepSpec"
+          }
+        },
+        "publish": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "release": {
+          "description": "Java release target, e.g. `'17'`. Defaults to the project JDK's major version.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ver"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resources": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "runtimeDependencies": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/DepSpec"
+          }
+        },
+        "scala": {
+          "description": "Scala version(s). A list cross-builds. `none` marks a Java-only module.\nDefaults to `toolchain.scala`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OneOrMany"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scalacOptions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sources": {
+          "description": "Source directories relative to the module. Default `src/main/scala`, `src/main/java`\nplus version- and platform-specific `src/main/scala-<x>` directories that exist.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "tasks": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/TaskDef"
+          }
+        },
+        "testDependencies": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/DepSpec"
+          }
+        },
+        "testResources": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "testSources": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "variants": {
+          "description": "Overrides for variants matching a selector such as `2.13`, `js` or `js-2.13`.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ModuleFile"
+          }
+        },
+        "version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ver"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "versionScheme": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VersionScheme"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "OneOrMany": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Ver"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ver"
+          }
+        }
+      ]
+    },
+    "Platform": {
+      "description": "The target platform of a module variant.",
+      "type": "string",
+      "enum": [
+        "jvm",
+        "js",
+        "native"
+      ]
+    },
+    "Policy": {
+      "type": "object",
+      "properties": {
+        "minimumReleaseAge": {
+          "description": "Refuse to lock versions younger than this, e.g. `1d`, `12h`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "minimumReleaseAgeExclude": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReleaseAgeExclude"
+          }
+        },
+        "securityBypass": {
+          "description": "`advisory-fixed` (default) or `off`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "versionConflicts": {
+          "description": "`error` (default) or `warn`: evictions that violate the evicted library's versionScheme.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ReleaseAgeExclude": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "coord": {
+              "type": "string"
+            },
+            "expires": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "coord"
+          ]
+        }
+      ]
+    },
+    "Repository": {
+      "description": "A repository: a well-known name (`central`) or a full definition.",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/RepositoryDef"
+        }
+      ]
+    },
+    "RepositoryDef": {
+      "type": "object",
+      "properties": {
+        "credentials": {
+          "description": "Omit to use coursier's credentials (`COURSIER_CREDENTIALS`, `credentials.properties`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Credentials"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "url"
+      ]
+    },
+    "ResolutionContext": {
+      "type": "object",
+      "properties": {
+        "arch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "jdk": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ver"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "os": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "TaskDef": {
+      "description": "A task definition, pnpm style.",
+      "type": "object",
+      "properties": {
+        "concurrencyGroup": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dependsOn": {
+          "description": "`^task` = that task in each upstream module; `task` = same module.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "description": "Environment variables that are part of the cache key.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "inputs": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "outputs": {
+          "description": "Declared outputs make the task cacheable; `[]` means \"no files\".",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "run": {
+          "description": "Shell command, or `builtin:<name> [args]`. Omitted for built-in tasks like `compile`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Toolchain": {
+      "type": "object",
+      "properties": {
+        "jdk": {
+          "description": "JDK, e.g. `temurin:25`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scala": {
+          "description": "Default Scala version (or `catalog:`/`catalog:<name>`, looked up under the key `scala`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ver"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Ver": {
+      "description": "A version string from YAML. Unquoted numbers are rejected: YAML reads `2.10` as the\nfloat `2.1`, which silently changes the version.",
+      "type": "string"
+    },
+    "VersionScheme": {
+      "type": "string",
+      "enum": [
+        "early-semver",
+        "semver-spec",
+        "pvp",
+        "strict",
+        "always"
+      ]
+    },
+    "Versioning": {
+      "type": "object",
+      "properties": {
+        "changes": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fixed": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "ignore": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "lanes": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "maxBump": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

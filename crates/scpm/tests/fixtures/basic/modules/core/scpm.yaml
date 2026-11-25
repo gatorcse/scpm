@@ -1,0 +1,13 @@
+extends: [strict, cross]
+platforms: [jvm, js]
+dependencies:
+  util: workspace:*
+  io.circe::circe-core: ^0.14.10
+  com.google.guava:guava:
+    version: 33.4.0-jre
+    exclude: [com.google.code.findbugs:jsr305]
+variants:
+  '2.13':
+    scalacOptions: [-Xsource:3]
+    dependencies:
+      org.typelevel::cats-core: catalog:scala213
