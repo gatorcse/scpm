@@ -1,9 +1,9 @@
 //! Loading a workspace: discover modules, validate files, expand presets, resolve catalogs
 //! and compute each module's variants (design §4).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use indexmap::IndexMap;
@@ -12,20 +12,23 @@ use serde::de::DeserializeOwned;
 use serde_yaml_ng::Value;
 
 use crate::config::{
-    DepSpec, MODULE_FILE, ModuleFile, Repository, TaskDef, VersionScheme, WORKSPACE_FILE, WorkspaceFile,
+    DepSpec, MODULE_FILE, ModuleFile, OneOrMany, Repository, TaskDef, VersionScheme, WORKSPACE_FILE, WorkspaceFile,
 };
-use crate::coord::{Coord, CrossKind, VersionedCoord, scala_binary_version};
-use crate::diag::{Diagnostic, Diagnostics, closest};
-use crate::merge::merge_module;
+use crate::coord::{Coord, CrossKind, VersionedCoord};
+use crate::diag::{Diagnostic, Diagnostics, closest, ser_opt_path, ser_path, ser_paths, slash_path};
+use crate::merge::{has_replace_tags, merge_module, strip_replace_tags, unknown_tags};
 use crate::platform::Platform;
+use crate::selector::{VariantSelector, full_version_parts};
 use crate::version::{Ver, VersionSpec};
 
 /// A loaded, fully resolved workspace.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
+    #[serde(serialize_with = "ser_path")]
     pub root: PathBuf,
     /// `None` for a lone `scpm.yaml` without a workspace file.
+    #[serde(serialize_with = "ser_opt_path")]
     pub workspace_file: Option<PathBuf>,
     #[serde(skip)]
     pub config: WorkspaceFile,
@@ -37,7 +40,7 @@ pub struct Workspace {
 #[serde(rename_all = "camelCase")]
 pub struct Module {
     pub name: String,
-    /// Directory relative to the workspace root (`.` for the root module).
+    /// Directory relative to the workspace root (`.` for the root module), `/`-separated.
     pub dir: String,
     pub variants: Vec<Variant>,
 }
@@ -73,17 +76,23 @@ pub struct Variant {
     #[serde(skip_serializing_if = "IndexMap::is_empty")]
     pub env: IndexMap<String, String>,
     /// Paths relative to the workspace root.
+    #[serde(serialize_with = "ser_paths")]
     pub sources: Vec<PathBuf>,
+    #[serde(serialize_with = "ser_paths")]
     pub resources: Vec<PathBuf>,
+    #[serde(serialize_with = "ser_paths")]
     pub test_sources: Vec<PathBuf>,
+    #[serde(serialize_with = "ser_paths")]
     pub test_resources: Vec<PathBuf>,
     /// `.scpm/out/<variant-id>/`, relative to the workspace root.
+    #[serde(serialize_with = "ser_path")]
     pub out_dir: PathBuf,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", serialize_with = "ser_paths")]
     pub generated_sources: Vec<PathBuf>,
     pub publish: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_scheme: Option<VersionScheme>,
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
     pub tasks: IndexMap<String, TaskDef>,
 }
 
@@ -92,6 +101,23 @@ pub struct Variant {
 pub struct ScalaVersion {
     pub full: String,
     pub binary: String,
+}
+
+impl ScalaVersion {
+    /// Parses a full Scala version, `major.minor.patch[-qualifier]`, for Scala 2.12, 2.13 or 3.
+    pub fn parse(full: &str) -> Result<ScalaVersion, String> {
+        let Some((major, minor, _, _)) = full_version_parts(full) else {
+            return Err(format!(
+                "`{full}` is not a full Scala version; expected `major.minor.patch[-qualifier]`, e.g. `3.9.0`"
+            ));
+        };
+        let binary = match (major, minor) {
+            ("3", _) => "3".to_string(),
+            ("2", "12" | "13") => format!("2.{minor}"),
+            _ => return Err(format!("Scala {major}.{minor} is not supported; use Scala 2.12, 2.13 or 3")),
+        };
+        Ok(ScalaVersion { full: full.to_string(), binary })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
@@ -104,9 +130,8 @@ pub enum Scope {
 }
 
 impl Scope {
-    pub const ALL: [Scope; 4] = [Scope::Compile, Scope::Provided, Scope::Runtime, Scope::Test];
-
-    fn key(self) -> &'static str {
+    /// The manifest key listing dependencies of this scope.
+    pub fn key(self) -> &'static str {
         match self {
             Scope::Compile => "dependencies",
             Scope::Provided => "providedDependencies",
@@ -198,16 +223,34 @@ fn load_at(root: &Path, workspace_file: Option<PathBuf>) -> Result<Workspace, Di
         Some(path) => parse_file::<WorkspaceFile>(root, path)?,
         None => (WorkspaceFile::default(), Value::Mapping(Default::default())),
     };
-    let presets: IndexMap<String, Value> = match raw.get("presets") {
-        Some(Value::Mapping(m)) => m.iter().filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.clone()))).collect(),
-        _ => IndexMap::new(),
+    let mut ctx = Ctx {
+        root,
+        config: &config,
+        presets: IndexMap::new(),
+        ws_file: workspace_file.as_ref().map(|p| rel(root, p)),
+        boms: Vec::new(),
     };
-    let ws_rel = workspace_file.as_ref().map(|p| rel(root, p));
-    let ctx = Ctx { root, config: &config, presets: &presets, ws_file: ws_rel.clone() };
+    if let Some(Value::Mapping(m)) = raw.get("presets") {
+        for (key, value) in m {
+            let Some(name) = key.as_str() else { continue };
+            let mut value = value.clone();
+            for d in normalize_variant_keys(&mut value, &format!("presets.{name}.")) {
+                diags.push(ctx.in_ws(d));
+            }
+            ctx.presets.insert(name.to_string(), value);
+        }
+    }
+    // Workspace BOMs apply to every module: parse them once.
+    for (i, bom) in config.boms.iter().enumerate() {
+        match VersionedCoord::parse(bom) {
+            Ok(b) => ctx.boms.push(b),
+            Err(e) => diags.push(ctx.in_ws(Diagnostic::new(e.to_string()).at_key(format!("boms[{i}]")))),
+        }
+    }
     validate_workspace(&ctx, &mut diags);
 
     let mut modules = Vec::new();
-    for dir in discover_modules(root, &config, ws_rel.as_deref(), &mut diags) {
+    for dir in discover_modules(root, &config, ctx.ws_file.as_deref(), &mut diags) {
         match load_module(&ctx, &dir) {
             Ok(m) => modules.push(m),
             Err(d) => diags.0.extend(d.0),
@@ -227,19 +270,23 @@ fn load_at(root: &Path, workspace_file: Option<PathBuf>) -> Result<Workspace, Di
     }
     let ws = Workspace { root: root.to_path_buf(), workspace_file, config, modules };
     validate_workspace_deps(&ws, &mut diags);
+    diags.dedup();
     diags.into_result(ws)
 }
 
 struct Ctx<'a> {
     root: &'a Path,
     config: &'a WorkspaceFile,
-    presets: &'a IndexMap<String, Value>,
+    /// Raw preset values for merging, with variant keys normalized.
+    presets: IndexMap<String, Value>,
     ws_file: Option<PathBuf>,
+    /// Parsed workspace `boms`.
+    boms: Vec<VersionedCoord>,
 }
 
 impl Ctx<'_> {
-    fn ws_diag(&self, message: impl Into<String>) -> Diagnostic {
-        let d = Diagnostic::new(message);
+    /// Points `d` at the workspace file.
+    fn in_ws(&self, d: Diagnostic) -> Diagnostic {
         match &self.ws_file {
             Some(f) => d.in_file(f.clone()),
             None => d,
@@ -252,10 +299,26 @@ fn parse_file<T: DeserializeOwned>(root: &Path, path: &Path) -> Result<(T, Value
     let display = rel(root, path);
     let text = fs::read_to_string(path)
         .map_err(|e| Diagnostic::new(format!("cannot read file: {e}")).in_file(display.clone()))?;
-    let de = serde_yaml_ng::Deserializer::from_str(&text);
-    let typed = serde_path_to_error::deserialize::<_, T>(de).map_err(|e| Diagnostic::from_yaml(&display, e))?;
-    let raw: Value = serde_yaml_ng::from_str(&text).map_err(|e| Diagnostic::new(e.to_string()).in_file(display))?;
+    let raw: Value = serde_yaml_ng::from_str(&text).map_err(|e| Diagnostic::from_yaml_syntax(&display, e))?;
     let raw = if raw.is_null() { Value::Mapping(Default::default()) } else { raw };
+    let mut diags = Diagnostics::default();
+    unknown_tags(&raw, "", &mut |key, tag| {
+        let d = Diagnostic::new(format!("unknown YAML tag `{tag}`"))
+            .in_file(display.clone())
+            .with_help("the only supported tag is `!replace`");
+        diags.push(if key.is_empty() { d } else { d.at_key(key) });
+    });
+    if !diags.is_empty() {
+        return Err(diags);
+    }
+    let de = serde_yaml_ng::Deserializer::from_str(&text);
+    let typed = match serde_path_to_error::deserialize::<_, T>(de) {
+        Ok(typed) => typed,
+        // `!replace` on a scalar (`release: !replace '17'`) reads as an enum in the typed parse;
+        // validate the untagged value instead (without source positions).
+        Err(_) if has_replace_tags(&raw) => from_value(&strip_replace_tags(raw.clone()), &display)?,
+        Err(e) => return Err(Diagnostic::from_yaml(&display, e).into()),
+    };
     Ok((typed, raw))
 }
 
@@ -263,62 +326,264 @@ fn rel(root: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(root).map(Path::to_path_buf).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn validate_workspace(ctx: &Ctx, diags: &mut Diagnostics) {
-    for bom in &ctx.config.boms {
-        if let Err(e) = VersionedCoord::parse(bom) {
-            diags.push(ctx.ws_diag(e.to_string()).at_key("boms"));
-        }
+/// YAML reads unquoted `variants` keys such as `3` or `2.13` as numbers. Integers are turned
+/// into strings; floats are rejected because `2.10` would silently become `2.1`.
+fn normalize_variant_keys(module: &mut Value, prefix: &str) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    let Some(Value::Mapping(variants)) = module.get_mut("variants") else { return diags };
+    for (key, value) in std::mem::take(variants) {
+        let key = match key {
+            Value::Number(n) if n.is_f64() => {
+                diags.push(
+                    Diagnostic::new(format!("unquoted variant selector: YAML reads it as the number `{n}`"))
+                        .at_key(format!("{prefix}variants.{n}"))
+                        .with_help("quote variant selectors, e.g. '2.13'"),
+                );
+                continue;
+            }
+            Value::Number(n) => Value::String(n.to_string()),
+            other => other,
+        };
+        variants.insert(key, value);
     }
-    for (key, version) in &ctx.config.overrides {
+    diags
+}
+
+fn not_supported(key: impl Into<String>, what: &str, phase: u8) -> Diagnostic {
+    Diagnostic::new(format!("{what} is not supported yet (planned for Phase {phase})"))
+        .at_key(key)
+        .with_help("remove it for now; see docs/roadmap.md")
+}
+
+fn unknown_preset(name: &str, known: &[&str]) -> Diagnostic {
+    let help = match closest(name, known.iter().copied()) {
+        Some(b) => format!("did you mean `{b}`?"),
+        _ if known.is_empty() => "no presets are defined in the workspace file".to_string(),
+        _ => format!("defined presets: {}", known.join(", ")),
+    };
+    Diagnostic::new(format!("unknown preset `{name}`")).with_help(help)
+}
+
+fn validate_workspace(ctx: &Ctx, diags: &mut Diagnostics) {
+    let config = ctx.config;
+    for (key, version) in &config.overrides {
         if let Err(e) = Coord::parse(key) {
-            diags.push(ctx.ws_diag(e.to_string()).at_key(format!("overrides.{key}")));
+            diags.push(ctx.in_ws(Diagnostic::new(e.to_string()).at_key(format!("overrides.{key}"))));
         }
         if !matches!(VersionSpec::parse(version.as_str()), VersionSpec::Exact { .. }) {
-            diags.push(ctx.ws_diag("overrides must be exact versions").at_key(format!("overrides.{key}")));
+            diags.push(
+                ctx.in_ws(Diagnostic::new("overrides must be exact versions").at_key(format!("overrides.{key}"))),
+            );
         }
     }
-    for (name, preset) in &ctx.config.presets {
-        if preset.name.is_some() {
-            diags.push(ctx.ws_diag("presets cannot set `name`").at_key(format!("presets.{name}")));
-        }
-    }
-    if ctx.config.catalogs.contains_key("default") {
+    if config.catalogs.contains_key("default") {
         diags.push(
-            ctx.ws_diag("`default` is reserved for the default catalog")
-                .at_key("catalogs.default")
-                .with_help("put these entries under `catalog:`"),
+            ctx.in_ws(
+                Diagnostic::new("`default` is reserved for the default catalog")
+                    .at_key("catalogs.default")
+                    .with_help("put these entries under `catalog:`"),
+            ),
         );
     }
-    for (name, catalog) in std::iter::once((&String::new(), &ctx.config.catalog)).chain(&ctx.config.catalogs) {
+    for (name, catalog) in std::iter::once((&String::new(), &config.catalog)).chain(&config.catalogs) {
         for (key, version) in catalog {
             let at = if name.is_empty() { format!("catalog.{key}") } else { format!("catalogs.{name}.{key}") };
             if key != "scala"
                 && let Err(e) = Coord::parse(key)
             {
-                diags.push(ctx.ws_diag(e.to_string()).at_key(at.clone()));
+                diags.push(ctx.in_ws(Diagnostic::new(e.to_string()).at_key(at.clone())));
             }
             if matches!(
                 VersionSpec::parse(version.as_str()),
                 VersionSpec::Catalog { .. } | VersionSpec::Workspace { .. }
             ) {
-                diags.push(ctx.ws_diag("catalog entries must be versions or ranges").at_key(at));
+                diags.push(ctx.in_ws(Diagnostic::new("catalog entries must be versions or ranges").at_key(at)));
             }
         }
     }
+    if let Some(scala) = &config.toolchain.scala
+        && let Err(d) = resolve_scala_versions(ctx, std::slice::from_ref(scala))
+    {
+        diags.push(ctx.in_ws(d.at_key("toolchain.scala")));
+    }
+    let policy = &config.policy;
     let unsupported = [
-        (!ctx.config.pipelines.is_empty(), "pipelines", 3),
-        (ctx.config.pipeline_base.is_some(), "pipelineBase", 3),
-        (ctx.config.versioning.is_some(), "versioning", 4),
-        (ctx.config.policy.minimum_release_age.is_some(), "policy.minimumReleaseAge", 3),
+        (!config.tasks.is_empty(), "tasks", 3),
+        (!config.pipelines.is_empty(), "pipelines", 3),
+        (config.pipeline_base.is_some(), "pipelineBase", 3),
+        (config.versioning.is_some(), "versioning", 4),
+        (policy.minimum_release_age.is_some(), "policy.minimumReleaseAge", 3),
+        (!policy.minimum_release_age_exclude.is_empty(), "policy.minimumReleaseAgeExclude", 3),
+        (policy.security_bypass.is_some(), "policy.securityBypass", 3),
+        (policy.version_conflicts.is_some(), "policy.versionConflicts", 3),
     ];
     for (used, key, phase) in unsupported {
         if used {
-            diags.push(
-                ctx.ws_diag(format!("`{key}` is not supported yet (planned for Phase {phase})"))
-                    .with_help("remove it for now; see docs/roadmap.md"),
-            );
+            diags.push(ctx.in_ws(not_supported(key, &format!("`{key}`"), phase)));
         }
     }
+
+    // Every preset is validated once here, whether or not a module uses it.
+    let names: Vec<&str> = config.presets.keys().map(String::as_str).collect();
+    for (name, preset) in &config.presets {
+        let prefix = format!("presets.{name}.");
+        for d in module_checks(preset, &prefix, Kind::Preset) {
+            diags.push(ctx.in_ws(d));
+        }
+        let others: Vec<&str> = names.iter().copied().filter(|n| n != name).collect();
+        for parent in &preset.extends {
+            if !config.presets.contains_key(parent) {
+                diags.push(ctx.in_ws(unknown_preset(parent, &others).at_key(format!("{prefix}extends"))));
+            }
+        }
+        if let Some(scala) = &preset.scala
+            && let Err(d) = resolve_scala_versions(ctx, &scala.clone().into_vec())
+        {
+            diags.push(ctx.in_ws(d.at_key(format!("{prefix}scala"))));
+        }
+    }
+    for cycle in preset_cycles(&config.presets) {
+        diags.push(ctx.in_ws(
+            Diagnostic::new(format!("preset cycle: {}", cycle.join(" → "))).at_key(format!("presets.{}", cycle[0])),
+        ));
+    }
+}
+
+/// Cycles in presets' `extends`, each reported once (a coloured depth-first search).
+fn preset_cycles(presets: &IndexMap<String, ModuleFile>) -> Vec<Vec<String>> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Colour {
+        InProgress,
+        Done,
+    }
+    fn visit<'a>(
+        name: &'a str,
+        presets: &'a IndexMap<String, ModuleFile>,
+        colour: &mut HashMap<&'a str, Colour>,
+        stack: &mut Vec<&'a str>,
+        cycles: &mut Vec<Vec<String>>,
+    ) {
+        colour.insert(name, Colour::InProgress);
+        stack.push(name);
+        for parent in &presets[name].extends {
+            let Some((parent, _)) = presets.get_key_value(parent) else { continue };
+            match colour.get(parent.as_str()) {
+                None => visit(parent, presets, colour, stack, cycles),
+                Some(Colour::InProgress) => {
+                    let start = stack.iter().position(|s| *s == parent).expect("in-progress presets are on the stack");
+                    let mut cycle: Vec<String> = stack[start..].iter().map(|s| s.to_string()).collect();
+                    cycle.push(parent.clone());
+                    cycles.push(cycle);
+                }
+                Some(Colour::Done) => {}
+            }
+        }
+        stack.pop();
+        colour.insert(name, Colour::Done);
+    }
+    let mut colour = HashMap::new();
+    let mut cycles = Vec::new();
+    for name in presets.keys() {
+        if !colour.contains_key(name.as_str()) {
+            visit(name, presets, &mut colour, &mut Vec::new(), &mut cycles);
+        }
+    }
+    cycles
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Module,
+    Preset,
+    Variant,
+}
+
+/// Checks on a module file, a preset, or a `variants` entry, as written. Keys are prefixed with
+/// `prefix` (e.g. `presets.library.`); the caller sets the file.
+fn module_checks(m: &ModuleFile, prefix: &str, kind: Kind) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    let at = |key: &str| format!("{prefix}{key}");
+    if kind == Kind::Preset && m.name.is_some() {
+        out.push(Diagnostic::new("presets cannot set `name`").at_key(at("name")));
+    }
+    if kind == Kind::Variant {
+        let forbidden = [
+            ("name", m.name.is_some()),
+            ("extends", !m.extends.is_empty()),
+            ("platforms", !m.platforms.is_empty()),
+            ("scala", m.scala.is_some()),
+            ("variants", !m.variants.is_empty()),
+        ];
+        for (key, set) in forbidden {
+            if set {
+                out.push(
+                    Diagnostic::new(format!("`{key}` cannot be set in a variant override"))
+                        .at_key(prefix.trim_end_matches('.')),
+                );
+            }
+        }
+    }
+    if let Some(p) = m.platforms.iter().find(|p| **p != Platform::Jvm) {
+        out.push(not_supported(at("platforms"), &format!("the `{p}` platform"), 2));
+    }
+    if !m.tasks.is_empty() {
+        out.push(not_supported(at("tasks"), "`tasks`", 3));
+    }
+    if !m.generated_sources.is_empty() {
+        out.push(not_supported(at("generatedSources"), "`generatedSources`", 3));
+    }
+    for (i, bom) in m.boms.iter().enumerate() {
+        if let Err(e) = VersionedCoord::parse(bom) {
+            out.push(Diagnostic::new(e.to_string()).at_key(at(&format!("boms[{i}]"))));
+        }
+    }
+    let dirs = [
+        ("sources", &m.sources),
+        ("resources", &m.resources),
+        ("testSources", &m.test_sources),
+        ("testResources", &m.test_resources),
+    ];
+    for (key, list) in dirs {
+        for (i, dir) in list.iter().flatten().enumerate() {
+            if !stays_inside(dir) {
+                out.push(
+                    Diagnostic::new(format!("`{dir}` is not inside the module"))
+                        .at_key(at(&format!("{key}[{i}]")))
+                        .with_help("source and resource directories are relative to the module and stay inside it"),
+                );
+            }
+        }
+    }
+    if kind != Kind::Variant {
+        for (selector, entry) in &m.variants {
+            if let Err(e) = VariantSelector::parse(selector) {
+                out.push(
+                    Diagnostic::new(format!("invalid variant selector `{selector}`: {e}"))
+                        .at_key(at(&format!("variants.{selector}"))),
+                );
+            }
+            out.extend(module_checks(entry, &format!("{prefix}variants.{selector}."), Kind::Variant));
+        }
+    }
+    out
+}
+
+/// A relative path that does not climb out of its base directory with `..`.
+fn stays_inside(dir: &str) -> bool {
+    let path = Path::new(dir);
+    if path.has_root() || dir.starts_with(['/', '\\']) {
+        return false;
+    }
+    let mut depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir if depth > 0 => depth -= 1,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Module directories, relative to the root, in a stable order.
@@ -362,9 +627,17 @@ fn discover_modules(
     }
     let (include, exclude): (GlobSet, GlobSet) =
         (include.build().unwrap_or_default(), exclude.build().unwrap_or_default());
+    // Membership is decided by the `modules` globs alone: ignore files don't hide modules, and
+    // symlinked module directories count (symlink loops are reported by the walker and skipped).
     let walker = ignore::WalkBuilder::new(root)
         .hidden(true)
-        .filter_entry(|e| !matches!(e.file_name().to_str(), Some("target" | "node_modules" | ".scpm")))
+        .git_ignore(false)
+        .git_exclude(false)
+        .git_global(false)
+        .ignore(false)
+        .parents(false)
+        .follow_links(true)
+        .filter_entry(|e| !matches!(e.file_name().to_str(), Some(".git" | "target" | "node_modules" | ".scpm")))
         .build();
     for entry in walker.flatten() {
         if entry.file_name() != MODULE_FILE {
@@ -382,76 +655,187 @@ fn discover_modules(
     dirs.into_iter().collect()
 }
 
+/// Where a module's effective `scala` came from, so errors point at the right file.
+#[derive(Debug, Clone, PartialEq)]
+enum ScalaOrigin {
+    Toolchain,
+    Preset(String),
+    Module,
+}
+
+/// A `variants` entry; entries repeated under the same selector are merged into the first.
+struct VariantEntry {
+    key: String,
+    selector: VariantSelector,
+    overlays: Vec<Value>,
+    /// Whether the module's own file has this selector (only then is "matches no variant" an
+    /// error: presets may carry entries for variants a module doesn't have).
+    in_module: bool,
+    matched: bool,
+}
+
+/// A module's config during expansion (design §4.4, "Effective variant config").
+struct Expansion {
+    effective: Value,
+    applied: HashSet<String>,
+    variants: Vec<VariantEntry>,
+    scala_origin: Option<ScalaOrigin>,
+}
+
+impl Expansion {
+    /// Applies `name` after its own `extends`, depth-first; each preset at most once. Unknown
+    /// presets and cycles are reported by [`validate_workspace`].
+    fn apply_preset(&mut self, ctx: &Ctx, name: &str, stack: &mut Vec<String>) {
+        if self.applied.contains(name) || stack.iter().any(|s| s == name) {
+            return;
+        }
+        let (Some(raw), Some(typed)) = (ctx.presets.get(name), ctx.config.presets.get(name)) else { return };
+        stack.push(name.to_string());
+        for parent in &typed.extends {
+            self.apply_preset(ctx, parent, stack);
+        }
+        stack.pop();
+        self.applied.insert(name.to_string());
+        let (own, variants) = split_module(raw.clone());
+        if own.get("scala").is_some_and(|v| !v.is_null()) {
+            self.scala_origin = Some(ScalaOrigin::Preset(name.to_string()));
+        }
+        merge_module(&mut self.effective, own);
+        self.add_variants(variants, false);
+    }
+
+    fn add_variants(&mut self, variants: Option<Value>, in_module: bool) {
+        let Some(Value::Mapping(map)) = variants else { return };
+        for (key, overlay) in map {
+            // Invalid selectors are reported where they are written.
+            let Some(key) = key.as_str() else { continue };
+            let Ok(selector) = VariantSelector::parse(key) else { continue };
+            match self.variants.iter_mut().find(|e| e.key == key) {
+                Some(entry) => {
+                    entry.overlays.push(overlay);
+                    entry.in_module |= in_module;
+                }
+                None => self.variants.push(VariantEntry {
+                    key: key.to_string(),
+                    selector,
+                    overlays: vec![overlay],
+                    in_module,
+                    matched: false,
+                }),
+            }
+        }
+    }
+}
+
+/// Splits a module-shaped value into its own settings and its `variants` (dropping `extends`,
+/// which is applied separately).
+fn split_module(mut value: Value) -> (Value, Option<Value>) {
+    let Some(map) = value.as_mapping_mut() else { return (value, None) };
+    map.remove("extends");
+    let variants = map.remove("variants");
+    (value, variants)
+}
+
 fn load_module(ctx: &Ctx, rel_dir: &Path) -> Result<Module, Diagnostics> {
     let file = rel_dir.join(MODULE_FILE);
-    let (_typed, raw): (ModuleFile, Value) = parse_file(ctx.root, &ctx.root.join(&file))?;
+    let (typed, mut raw): (ModuleFile, Value) = parse_file(ctx.root, &ctx.root.join(&file))?;
     let mut diags = Diagnostics::default();
+    for d in normalize_variant_keys(&mut raw, "").into_iter().chain(module_checks(&typed, "", Kind::Module)) {
+        diags.push(d.in_file(&file));
+    }
 
     // Resolution order (design §4.4): toolchain defaults → presets → module → variants.
-    let mut effective = Value::Mapping(Default::default());
+    let mut exp = Expansion {
+        effective: Value::Mapping(Default::default()),
+        applied: HashSet::new(),
+        variants: Vec::new(),
+        scala_origin: None,
+    };
     if let Some(scala) = &ctx.config.toolchain.scala {
-        effective.as_mapping_mut().expect("mapping").insert("scala".into(), Value::String(scala.0.clone()));
+        exp.effective.as_mapping_mut().expect("mapping").insert("scala".into(), Value::String(scala.0.clone()));
+        exp.scala_origin = Some(ScalaOrigin::Toolchain);
     }
-    let extends = string_list(raw.get("extends"));
-    for preset in &extends {
-        apply_preset(ctx, preset, &mut effective, &mut Vec::new(), &file, &mut diags);
+    let known: Vec<&str> = ctx.presets.keys().map(String::as_str).collect();
+    for preset in &typed.extends {
+        if ctx.presets.contains_key(preset) {
+            exp.apply_preset(ctx, preset, &mut Vec::new());
+        } else {
+            diags.push(unknown_preset(preset, &known).in_file(&file).at_key("extends"));
+        }
     }
-    let mut own = raw.clone();
-    if let Some(m) = own.as_mapping_mut() {
-        m.remove("extends");
+    let (own, own_variants) = split_module(raw);
+    if own.get("scala").is_some_and(|v| !v.is_null()) {
+        exp.scala_origin = Some(ScalaOrigin::Module);
     }
-    merge_module(&mut effective, own);
+    merge_module(&mut exp.effective, own);
+    exp.add_variants(own_variants, true);
     if !diags.is_empty() {
+        diags.dedup();
         return Err(diags);
     }
 
-    let base: ModuleFile = from_value(&effective, &file)?;
-    let dir_name = rel_dir.file_name().and_then(|n| n.to_str()).map(str::to_string);
-    let name =
-        base.name.clone().or(dir_name).or_else(|| ctx.root.file_name().and_then(|n| n.to_str()).map(str::to_string));
-    let Some(name) = name.filter(|n| valid_module_name(n)) else {
-        return Err(Diagnostic::new("invalid or missing module name")
-            .in_file(file)
-            .with_help("names use lowercase letters, digits, `-`, `_` and `.`; set `name:`")
-            .into());
+    let base: ModuleFile = from_value(&exp.effective, &file)?;
+    let (name, from_dir) = match &base.name {
+        Some(n) => (n.clone(), false),
+        None => {
+            let dir = if rel_dir.as_os_str().is_empty() { ctx.root } else { rel_dir };
+            (dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), true)
+        }
     };
+    if !valid_module_name(&name) {
+        let rules = "module names use lowercase letters, digits, `-`, `_` and `.`, starting with a letter or digit";
+        let d = if from_dir {
+            Diagnostic::new(format!("invalid module name `{name}` (taken from the directory name)"))
+                .with_help(format!("{rules}; set `name:` to a valid name"))
+        } else {
+            Diagnostic::new(format!("invalid module name `{name}`")).at_key("name").with_help(rules)
+        };
+        return Err(d.in_file(&file).into());
+    }
 
     let platforms: Vec<Platform> = if base.platforms.is_empty() {
         vec![Platform::Jvm]
     } else {
         base.platforms.iter().copied().collect::<BTreeSet<_>>().into_iter().collect()
     };
-    let scalas = resolve_scala_versions(ctx, &base, &file, &platforms)?;
-
-    let variant_overrides: Vec<(String, Value)> = match effective.get("variants") {
-        Some(Value::Mapping(m)) => m.iter().filter_map(|(k, v)| Some((selector_string(k)?, v.clone()))).collect(),
-        _ => Vec::new(),
+    let Some(specs) = base.scala.clone().map(OneOrMany::into_vec) else {
+        return Err(Diagnostic::new("no Scala version")
+            .in_file(&file)
+            .with_help(
+                "set `scala:` here, `toolchain.scala` in scpm-workspace.yaml, or `scala: none` for a Java-only module",
+            )
+            .into());
     };
-    for (selector, value) in &variant_overrides {
-        for forbidden in ["name", "extends", "platforms", "scala", "variants"] {
-            if value.get(forbidden).is_some() {
-                diags.push(
-                    Diagnostic::new(format!("`{forbidden}` cannot be set in a variant override"))
-                        .in_file(file.clone())
-                        .at_key(format!("variants.{selector}")),
-                );
+    let scalas = match resolve_scala_versions(ctx, &specs) {
+        Ok(s) => s,
+        // Errors in the workspace file are reported there, once.
+        Err(d) => {
+            return Err(match exp.scala_origin {
+                Some(ScalaOrigin::Toolchain) => ctx.in_ws(d.at_key("toolchain.scala")),
+                Some(ScalaOrigin::Preset(p)) => ctx.in_ws(d.at_key(format!("presets.{p}.scala"))),
+                Some(ScalaOrigin::Module) | None => d.in_file(&file).at_key("scala"),
             }
+            .into());
         }
+    };
+    if scalas == [None] && platforms != [Platform::Jvm] {
+        return Err(Diagnostic::new("Java-only modules (`scala: none`) can only target the jvm platform")
+            .in_file(&file)
+            .at_key("platforms")
+            .into());
     }
 
     let mut variants = Vec::new();
-    let mut matched = vec![false; variant_overrides.len()];
     for &platform in &platforms {
         for scala in &scalas {
             let id = variant_id(&name, platform, scala.as_ref());
-            let mut value = effective.clone();
-            if let Some(m) = value.as_mapping_mut() {
-                m.remove("variants");
-            }
-            for (i, (selector, overlay)) in variant_overrides.iter().enumerate() {
-                if selector_matches(selector, platform, scala.as_ref()) {
-                    matched[i] = true;
-                    merge_module(&mut value, overlay.clone());
+            let mut value = exp.effective.clone();
+            for entry in &mut exp.variants {
+                if entry.selector.matches(platform, scala.as_ref()) {
+                    entry.matched = true;
+                    for overlay in &entry.overlays {
+                        merge_module(&mut value, overlay.clone());
+                    }
                 }
             }
             match from_value::<ModuleFile>(&value, &file)
@@ -462,73 +846,22 @@ fn load_module(ctx: &Ctx, rel_dir: &Path) -> Result<Module, Diagnostics> {
             }
         }
     }
-    for (i, (selector, _)) in variant_overrides.iter().enumerate() {
-        if !matched[i] {
-            let ids: Vec<_> = variants.iter().map(|v| v.id.as_str()).collect();
-            diags.push(
-                Diagnostic::new(format!("variant selector `{selector}` matches no variant"))
-                    .in_file(file.clone())
-                    .at_key(format!("variants.{selector}"))
-                    .with_help(format!("this module's variants: {}", ids.join(", "))),
-            );
-        }
+    let all_ids: Vec<String> = platforms
+        .iter()
+        .flat_map(|&p| scalas.iter().map(move |s| (p, s)))
+        .map(|(p, s)| variant_id(&name, p, s.as_ref()))
+        .collect();
+    for entry in exp.variants.iter().filter(|e| e.in_module && !e.matched) {
+        diags.push(
+            Diagnostic::new(format!("variant selector `{}` matches no variant", entry.key))
+                .in_file(&file)
+                .at_key(format!("variants.{}", entry.key))
+                .with_help(format!("this module's variants: {}", all_ids.join(", "))),
+        );
     }
-    let dir =
-        if rel_dir.as_os_str().is_empty() { ".".to_string() } else { rel_dir.to_string_lossy().replace('\\', "/") };
+    let dir = if rel_dir.as_os_str().is_empty() { ".".to_string() } else { slash_path(rel_dir) };
+    diags.dedup();
     diags.into_result(Module { name, dir, variants })
-}
-
-fn apply_preset(
-    ctx: &Ctx,
-    name: &str,
-    into: &mut Value,
-    stack: &mut Vec<String>,
-    file: &Path,
-    diags: &mut Diagnostics,
-) {
-    if stack.iter().any(|s| s == name) {
-        stack.push(name.to_string());
-        diags.push(ctx.ws_diag(format!("preset cycle: {}", stack.join(" → "))).at_key(format!("presets.{name}")));
-        stack.pop();
-        return;
-    }
-    let Some(preset) = ctx.presets.get(name) else {
-        let known: Vec<_> = ctx.presets.keys().map(String::as_str).collect();
-        let help = match closest(name, known.iter().copied()) {
-            Some(b) => format!("did you mean `{b}`?"),
-            _ if known.is_empty() => "no presets are defined in the workspace file".to_string(),
-            _ => format!("defined presets: {}", known.join(", ")),
-        };
-        diags.push(Diagnostic::new(format!("unknown preset `{name}`")).in_file(file).at_key("extends").with_help(help));
-        return;
-    };
-    stack.push(name.to_string());
-    for parent in string_list(preset.get("extends")) {
-        apply_preset(ctx, &parent, into, stack, file, diags);
-    }
-    stack.pop();
-    let mut own = preset.clone();
-    if let Some(m) = own.as_mapping_mut() {
-        m.remove("extends");
-    }
-    merge_module(into, own);
-}
-
-fn string_list(value: Option<&Value>) -> Vec<String> {
-    match value {
-        Some(Value::Sequence(items)) => items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
-        Some(Value::String(s)) => vec![s.clone()],
-        _ => Vec::new(),
-    }
-}
-
-/// YAML keys like `3` or `2.13` may be numbers; selectors are strings.
-fn selector_string(key: &Value) -> Option<String> {
-    match key {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    }
 }
 
 fn from_value<T: DeserializeOwned>(value: &Value, file: &Path) -> Result<T, Diagnostics> {
@@ -548,58 +881,26 @@ pub fn variant_id(module: &str, platform: Platform, scala: Option<&ScalaVersion>
     }
 }
 
-/// A selector is dash-separated parts, each matching the platform, the Scala binary version
-/// or the full Scala version (design §4.4).
-pub fn selector_matches(selector: &str, platform: Platform, scala: Option<&ScalaVersion>) -> bool {
-    selector
-        .split('-')
-        .all(|part| part == platform.as_str() || scala.is_some_and(|s| part == s.binary || part == s.full))
-}
-
-fn resolve_scala_versions(
-    ctx: &Ctx,
-    base: &ModuleFile,
-    file: &Path,
-    platforms: &[Platform],
-) -> Result<Vec<Option<ScalaVersion>>, Diagnostics> {
-    let Some(specs) = base.scala.clone().map(|s| s.into_vec()) else {
-        return Err(Diagnostic::new("no Scala version")
-            .in_file(file)
-            .with_help(
-                "set `scala:` here, `toolchain.scala` in scpm-workspace.yaml, or `scala: none` for a Java-only module",
-            )
-            .into());
-    };
+/// Resolves a `scala` value (one or more versions, catalog references, or `none`).
+fn resolve_scala_versions(ctx: &Ctx, specs: &[Ver]) -> Result<Vec<Option<ScalaVersion>>, Diagnostic> {
+    if specs.is_empty() {
+        return Err(Diagnostic::new("`scala` lists no versions")
+            .with_help("list at least one Scala version, or use `scala: none` for a Java-only module"));
+    }
     if specs.iter().any(|s| s.as_str() == "none") {
         if specs.len() > 1 {
-            return Err(Diagnostic::new("`none` cannot be combined with other Scala versions")
-                .in_file(file)
-                .at_key("scala")
-                .into());
-        }
-        if platforms != [Platform::Jvm] {
-            return Err(Diagnostic::new("Java-only modules (`scala: none`) can only target the jvm platform")
-                .in_file(file)
-                .at_key("platforms")
-                .into());
+            return Err(Diagnostic::new("`none` cannot be combined with other Scala versions"));
         }
         return Ok(vec![None]);
     }
     let mut out: Vec<Option<ScalaVersion>> = Vec::new();
     for spec in specs {
-        let version = resolve_catalog(ctx, "scala", &spec).map_err(|d| d.in_file(file).at_key("scala"))?;
-        let VersionSpec::Exact { version } = version else {
-            return Err(Diagnostic::new(format!("Scala version `{spec}` must be an exact version, not a range"))
-                .in_file(file)
-                .at_key("scala")
-                .into());
+        let VersionSpec::Exact { version } = resolve_catalog(ctx, "scala", spec)? else {
+            return Err(Diagnostic::new(format!("Scala version `{spec}` must be an exact version, not a range")));
         };
-        let sv = ScalaVersion { binary: scala_binary_version(&version), full: version };
+        let sv = ScalaVersion::parse(&version).map_err(Diagnostic::new)?;
         if out.iter().flatten().any(|s| s.binary == sv.binary) {
-            return Err(Diagnostic::new(format!("two Scala versions with binary version {}", sv.binary))
-                .in_file(file)
-                .at_key("scala")
-                .into());
+            return Err(Diagnostic::new(format!("two Scala versions with binary version {}", sv.binary)));
         }
         out.push(Some(sv));
     }
@@ -666,6 +967,9 @@ fn build_variant(
             let written = VersionSpec::parse(spec.version().as_str());
             if !key.contains(':') {
                 match written {
+                    _ if key == name => diags.push(
+                        Diagnostic::new(format!("module `{name}` cannot depend on itself")).in_file(file).at_key(at),
+                    ),
                     VersionSpec::Workspace { range } if range == "*" => {
                         workspace_dependencies.push(WorkspaceDependency { scope, module: key.clone() })
                     }
@@ -703,12 +1007,11 @@ fn build_variant(
             Err(d) => diags.push(d.in_file(file).at_key(at)),
         }
     }
-    let mut boms = Vec::new();
-    for raw in ctx.config.boms.iter().chain(&cfg.boms) {
-        match VersionedCoord::parse(raw) {
-            Ok(b) if !boms.contains(&b) => boms.push(b),
-            Ok(_) => {}
-            Err(e) => diags.push(Diagnostic::new(e.to_string()).in_file(file).at_key("boms")),
+    // Invalid module and preset BOMs are reported by `module_checks`.
+    let mut boms = ctx.boms.clone();
+    for b in cfg.boms.iter().filter_map(|raw| VersionedCoord::parse(raw).ok()) {
+        if !boms.contains(&b) {
+            boms.push(b);
         }
     }
     let module_root = rel_dir.to_path_buf();
@@ -811,20 +1114,18 @@ fn external_dependency(
 }
 
 fn validate_workspace_deps(ws: &Workspace, diags: &mut Diagnostics) {
+    let names: Vec<_> = ws.modules.iter().map(|m| m.name.as_str()).collect();
     for module in &ws.modules {
         for variant in &module.variants {
             for dep in &variant.workspace_dependencies {
                 if ws.module(&dep.module).is_none() {
-                    let names: Vec<_> = ws.modules.iter().map(|m| m.name.as_str()).collect();
                     let mut d = Diagnostic::new(format!("unknown workspace module `{}`", dep.module))
                         .in_file(module_file(module))
                         .at_key(format!("{}.{}", dep.scope.key(), dep.module));
                     if let Some(b) = closest(&dep.module, names.iter().copied()) {
                         d = d.with_help(format!("did you mean `{b}`?"));
                     }
-                    if !diags.0.contains(&d) {
-                        diags.push(d);
-                    }
+                    diags.push(d);
                 }
             }
         }
@@ -833,4 +1134,30 @@ fn validate_workspace_deps(ws: &Workspace, diags: &mut Diagnostics) {
 
 pub fn module_file(module: &Module) -> PathBuf {
     if module.dir == "." { PathBuf::from(MODULE_FILE) } else { Path::new(&module.dir).join(MODULE_FILE) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scala_versions() {
+        assert_eq!(ScalaVersion::parse("3.9.0").unwrap().binary, "3");
+        assert_eq!(ScalaVersion::parse("3.8.0-RC1").unwrap().binary, "3");
+        assert_eq!(ScalaVersion::parse("2.13.18").unwrap().binary, "2.13");
+        assert_eq!(ScalaVersion::parse("2.12.20").unwrap().binary, "2.12");
+        for bad in ["3", "3.9", "2.11.12", "4.0.0", "3.9.0-", "banana"] {
+            assert!(ScalaVersion::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn source_dirs_stay_inside_the_module() {
+        for ok in ["src/main/scala", "./gen", "a/../b"] {
+            assert!(stays_inside(ok), "{ok}");
+        }
+        for bad in ["/abs", "../shared", "a/../../b", "\\\\server\\share"] {
+            assert!(!stays_inside(bad), "{bad}");
+        }
+    }
 }

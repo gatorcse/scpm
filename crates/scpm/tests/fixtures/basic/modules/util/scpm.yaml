@@ -1,4 +1,3 @@
 extends: [library, cross]
-platforms: [jvm, js]
 dependencies:
   org.typelevel::cats-core: catalog

@@ -107,9 +107,10 @@ impl From<filter::FilterError> for Failure {
 }
 
 fn run(cli: Cli) -> Result<(), Failure> {
+    let cwd = std::env::current_dir().map_err(|e| Failure::Usage(e.to_string()))?;
     let start = match &cli.dir {
-        Some(d) => d.clone(),
-        None => std::env::current_dir().map_err(|e| Failure::Usage(e.to_string()))?,
+        Some(d) => cwd.join(d),
+        None => cwd,
     };
     match cli.command {
         Command::Schema { file } => {
@@ -122,7 +123,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Command::Ls => {
             let (ws, graph) = load(&start)?;
-            let selected = filter::select(&ws, &graph, &cli.filter)?;
+            let selected = filter::select(&ws, &graph, &cli.filter, &invocation_dir(&start)?)?;
             let rows: Vec<LsRow> = ws
                 .modules
                 .iter()
@@ -145,7 +146,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let (ws, graph) = load(&start)?;
             let mut selectors = cli.filter.clone();
             selectors.extend(targets);
-            let selected = filter::select(&ws, &graph, &selectors)?;
+            let selected = filter::select(&ws, &graph, &selectors, &invocation_dir(&start)?)?;
             let variants: Vec<_> = ws.variants().filter(|v| selected.contains(&v.id)).collect();
             if cli.json {
                 print_json(&variants);
@@ -156,7 +157,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Command::Graph { format } => {
             let (ws, graph) = load(&start)?;
-            let selected = filter::select(&ws, &graph, &cli.filter)?;
+            let selected = filter::select(&ws, &graph, &cli.filter, &invocation_dir(&start)?)?;
             let order: Vec<&String> = graph.order.iter().filter(|id| selected.contains(*id)).collect();
             let edges: Vec<_> =
                 graph.edges.iter().filter(|e| selected.contains(&e.from) && selected.contains(&e.to)).collect();
@@ -207,6 +208,11 @@ struct LsRow {
     id: String,
     module: String,
     dir: String,
+}
+
+/// The canonical directory scpm runs in; path selectors are relative to it.
+fn invocation_dir(start: &std::path::Path) -> Result<PathBuf, Failure> {
+    start.canonicalize().map_err(|e| Failure::Usage(format!("cannot access {}: {e}", start.display())))
 }
 
 fn load(start: &std::path::Path) -> Result<(Workspace, Graph), Failure> {

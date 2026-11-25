@@ -46,6 +46,7 @@ impl Graph {
                                     variant.id, dep.module
                                 ))
                                 .in_file(module_file(module))
+                                .at_key(format!("{}.{}", dep.scope.key(), dep.module))
                                 .with_help(format!("available: {}", available.join(", "))),
                             );
                         }
@@ -58,13 +59,17 @@ impl Graph {
         let order = match topo_order(&ids, &edges) {
             Ok(order) => order,
             Err(cycle) => {
-                diags.push(
-                    Diagnostic::new(format!("dependency cycle: {}", cycle.join(" → ")))
-                        .with_help("test-scope dependencies may form cycles; compile and runtime ones may not"),
-                );
+                let mut d = Diagnostic::new(format!("dependency cycle: {}", cycle.join(" → ")))
+                    .with_help("test-scope dependencies may form cycles; compile and runtime ones may not");
+                // Point at the file of the first module in the cycle.
+                if let Some(module) = ws.modules.iter().find(|m| m.variants.iter().any(|v| v.id == cycle[0])) {
+                    d = d.in_file(module_file(module));
+                }
+                diags.push(d);
                 Vec::new()
             }
         };
+        diags.dedup();
         diags.into_result(Graph { order, edges })
     }
 

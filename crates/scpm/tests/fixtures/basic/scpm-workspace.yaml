@@ -28,6 +28,3 @@ presets:
     scalacOptions: [-Werror]
   cross:
     scala: [catalog, catalog:scala213]
-tasks:
-  compile: { dependsOn: ['^compile'] }
-  test: { dependsOn: [compile], outputs: [] }

@@ -1,5 +1,4 @@
 extends: [strict, cross]
-platforms: [jvm, js]
 dependencies:
   util: workspace:*
   io.circe::circe-core: ^0.14.10

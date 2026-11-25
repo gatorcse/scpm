@@ -13,5 +13,6 @@ pub mod filter;
 pub mod graph;
 pub mod merge;
 pub mod platform;
+pub mod selector;
 pub mod version;
 pub mod workspace;
