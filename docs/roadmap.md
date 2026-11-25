@@ -96,7 +96,7 @@ Kill the riskiest assumptions with throwaway code before committing to the archi
 - Lanes using Maven-ordering-safe pre-release suffixes, fixed groups and epics.
 - `scpm publish -r`:
   - rewrites `workspace:`, `catalog:` and ranges to concrete versions
-  - signs with PGP or Sigstore
+  - signs with PGP (required by Central), optionally adding Sigstore
   - targets Central Portal, GitHub Packages and Artifactory, with an atomic multi-module publish
 - `info.versionScheme` written to POMs automatically.
 - First-party update bot: `scpm upgrade` and the `scpm-upgrade` Action. It groups updates by catalog entry, applies Scalafix migrations, labels semver risk with MiMa, and bypasses the release-age gate for security fixes.

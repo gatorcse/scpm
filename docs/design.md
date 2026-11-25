@@ -396,7 +396,7 @@ Directory-based implicit inheritance (child configs silently picking up parent-d
 - A `variants` entry may contain any module key except `name`, `extends`, `platforms`, `scala` and `variants`.
 - `toolchain.jdk` is workspace-only in v1. A module sets its Java target with `release`.
 
-**Variant ids** are `<module>@<platform>-<scala binary>` (`core@jvm-3`, `core@js-2.13`), or `<module>@jvm` for a Java-only module.
+**Variant ids** are `<module>@<platform>-<scala binary>` (`core@jvm-3`, `core@js-2.13`), or `<module>@jvm` for a Java-only module. A module's `scala` list may therefore hold at most one version per binary version; `[3.8.4, 3.9.0]` is an error.
 
 **Selectors** (keys of `variants`, and the part after `@` in filters) have the form `<platform>`, `<scala>` or `<platform>-<scala>`, where `<platform>` is `jvm`, `js` or `native`, and `<scala>` is a Scala binary version (`3`, `2.13`) or a full version (`3.9.0`, `3.8.0-RC1`, which may itself contain `-`). A variant matches if every given part matches; a selector that matches no variant is an error. In filters, `-F core` matches every variant of `core`, and globs work (`-F 'core@jvm-*'`).
 
@@ -573,7 +573,7 @@ Each variant locks four ordered classpaths:
 | `testCompileClasspath` | `compileClasspath` + `testDependencies` |
 | `testRuntimeClasspath` | `runtimeClasspath` + `providedDependencies` + `testDependencies` |
 
-- **Workspace modules** (`workspace:*`) appear as references (`{ module: util@jvm-3 }`), not artifacts: every upstream variant in the transitive closure, in dependency order, before the external artifacts, which follow coursier's order. Upstream modules contribute their `dependencies` to every list and their `runtimeDependencies` to the runtime lists, never their provided or test dependencies.
+- **Workspace modules** (`workspace:*`) appear as references (`{ module: util@jvm-3 }`), not artifacts: every upstream variant in the transitive closure, in dependency order, before the external artifacts, which follow coursier's order. A direct `workspace:*` reference lands on the lists its declaring scope feeds (table above), so one under `testDependencies` is on the test lists only. From there the closure follows each upstream module's `dependencies` on every list and its `runtimeDependencies` on the runtime lists, never its provided or test dependencies.
 - **Resolution is joint over the variant's transitive workspace closure.** A variant's external dependencies are resolved in one coursier call together with those of every upstream variant, so if A depends on B, A's classpaths hold one version of each library for both A's and B's code.
 - **Catalog ranges are resolved once per (platform, Scala binary version) for the whole workspace**, so every variant that uses that catalog entry on that platform and Scala binary version gets the same version. The selection lives in the lock's top-level `catalogs` section, keyed `<catalog>/<key>@<platform>-<scala binary>`. Re-locking a stale variant reuses an existing selection whose range is unchanged; only `scpm update` re-selects, and it then re-locks every variant that uses the entry.
 - **`specifiers`** records each direct dependency's spec as written and the version scpm selected for it (§5.5), before coursier's reconciliation, like pnpm's importers. `workspace:*` entries have no version.
@@ -1047,7 +1047,7 @@ Copied from pnpm 11.11+ with JVM-specific checks added:
 - **Fixed groups** and **epics**, as pnpm defines them.
 - **`scpm publish -r`**:
   - rewrites `workspace:`, `catalog:` and ranges to concrete versions;
-  - signs with PGP or Sigstore;
+  - signs with PGP (Central requires it), optionally adding Sigstore;
   - publishes to the Central Portal Publisher API (bundle upload, then poll status), GitHub Packages or Artifactory.
   - It may embed `scala/scala-publish`.
 

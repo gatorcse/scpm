@@ -82,8 +82,10 @@ error; details in `message`).
 
 ### `cancel`
 
-`params`: `{"requestId": 1}` → `result`: `{}`. The cancelled request then completes
-with `status: cancelled`.
+`params`: `{"requestId": 1}` → `result`: `{}`. Cancellation is best-effort: a request
+still running then completes with `status: cancelled`, unless it finished first, in which
+case its normal response stands. Cancelling an unknown or already-completed request is a
+no-op and still returns `{}`; no request ever gets a second response.
 
 ### `shutdown`
 
