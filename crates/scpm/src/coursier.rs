@@ -99,14 +99,19 @@ impl Repo {
     /// The configured credentials, read from the environment. A missing or empty variable is
     /// an error, which callers raise only when the repository is actually contacted.
     pub fn auth(&self) -> Result<Option<Auth>, CoursierError> {
+        self.auth_with(&|var| env::var(var).ok())
+    }
+
+    /// [`Self::auth`] with the variables read through `lookup`.
+    fn auth_with(&self, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Option<Auth>, CoursierError> {
         let read = |var: &str, what: &str| -> Result<String, CoursierError> {
-            match env::var(var) {
-                Ok(v) if !v.is_empty() => Ok(v),
-                Ok(_) => Err(CoursierError::Config(format!(
+            match lookup(var) {
+                Some(v) if !v.is_empty() => Ok(v),
+                Some(_) => Err(CoursierError::Config(format!(
                     "repository `{}`: environment variable `{var}` ({what}) is empty",
                     self.id
                 ))),
-                Err(_) => Err(CoursierError::Config(format!(
+                None => Err(CoursierError::Config(format!(
                     "repository `{}`: environment variable `{var}` ({what}) is not set",
                     self.id
                 ))),
@@ -291,17 +296,25 @@ pub fn url_from_cache_path(cache: &Path, file: &Path) -> Option<String> {
     Some(format!("{protocol}://{rest}"))
 }
 
-/// Inverse of [`escape`]: each `%XX` is one UTF-16 code unit (coursier escapes units, not
-/// UTF-8 bytes, so `é` is `%E9`).
+/// Inverse of [`escape`]: each `%HL` is one UTF-16 code unit `16 * H + L` (coursier escapes
+/// units, not UTF-8 bytes, so `é` is `%E9`). `H` is a digit or `'A' + n - 10`, which runs past
+/// `F` for units above U+00FF (`Ā` is `%G0`).
 fn unescape(s: &str) -> String {
+    let digit = |c: char| -> Option<u32> {
+        match c {
+            '0'..='9' => Some(c as u32 - '0' as u32),
+            c if c >= 'A' => Some(c as u32 - 'A' as u32 + 10),
+            _ => None,
+        }
+    };
     let mut units: Vec<u16> = Vec::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
+    let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '%' {
             let mut ahead = chars.clone();
-            let hex: String = ahead.by_ref().take(2).collect();
-            if hex.len() == 2
-                && let Ok(unit) = u16::from_str_radix(&hex, 16)
+            if let (Some(high), Some(low)) = (ahead.next().and_then(digit), ahead.next().and_then(digit))
+                && low < 16
+                && let Ok(unit) = u16::try_from(high * 16 + low)
             {
                 units.push(unit);
                 chars = ahead;
@@ -595,7 +608,8 @@ fn add_common_args(cmd: &mut Command, repos: &[Repo], cache: &Path) -> Result<Co
         cmd.arg("--repository").arg(&repo.url);
     }
     let mut missing_credentials = Vec::new();
-    let properties = credential_properties(repos, &CoursierCredentials::load(), &mut missing_credentials);
+    let properties =
+        credential_properties(repos, &|var| env::var(var).ok(), &CoursierCredentials::load(), &mut missing_credentials);
     // NamedTempFile is created with mode 0600 on Unix.
     let mut file = tempfile::Builder::new()
         .prefix("scpm-credentials-")
@@ -617,7 +631,13 @@ fn credentials_env_value(path: &Path) -> String {
 
 /// The credentials file for `cs`: each repository's configured credentials, scoped to its
 /// origin, then coursier's own entries restricted to scpm's plain-HTTP policy.
-fn credential_properties(repos: &[Repo], coursier: &CoursierCredentials, missing: &mut Vec<String>) -> String {
+/// `lookup` reads the environment variables configured credentials name.
+fn credential_properties(
+    repos: &[Repo],
+    lookup: &dyn Fn(&str) -> Option<String>,
+    coursier: &CoursierCredentials,
+    missing: &mut Vec<String>,
+) -> String {
     let mut properties = String::new();
     let mut entry = |prefix: String, host: &str, user: &str, password: &str, extra: &[(&str, String)]| {
         properties.push_str(&format!(
@@ -632,7 +652,7 @@ fn credential_properties(repos: &[Repo], coursier: &CoursierCredentials, missing
     };
     for (i, repo) in repos.iter().enumerate() {
         let Some(origin) = repo.origin() else { continue };
-        match repo.auth() {
+        match repo.auth_with(lookup) {
             // `scheme://host[:port]` scopes the credentials to the repository's scheme, host and
             // port (coursier 2.1.27 ignores `https-only` for a host with a scheme).
             Ok(Some(auth)) => {
@@ -800,6 +820,11 @@ mod tests {
         let path = cache_path(cache, url, None).unwrap();
         assert_eq!(path, Path::new("/c/https/h.example/d%E9p%F4t/g/a/1/a-1.jar"));
         assert_eq!(url_from_cache_path(cache, &path).unwrap(), url);
+        // Above U+00FF the high "digit" runs past `F`; astral characters are two units.
+        let url = "https://h.example/Ā/日本/\u{1F600}/a-1.jar";
+        let path = cache_path(cache, url, None).unwrap();
+        assert!(path.starts_with("/c/https/h.example/%G0/"), "{}", path.display());
+        assert_eq!(url_from_cache_path(cache, &path).unwrap(), url);
     }
 
     #[test]
@@ -819,19 +844,16 @@ mod tests {
 
     #[test]
     fn configured_credentials_are_scoped_to_the_repository_origin() {
-        let var = "SCPM_TEST_ORIGIN_SCOPE_TOKEN";
-        // SAFETY: the variable name is unique to this test.
-        unsafe { env::set_var(var, "tok3n") };
         let repos = vec![Repo {
             id: "r".into(),
             url: "https://repo.example:8443/maven/".into(),
-            credentials: Some(RepoCredentials::Bearer { token_var: var.into() }),
+            credentials: Some(RepoCredentials::Bearer { token_var: "REPO_TOKEN".into() }),
             allow_insecure_credentials: false,
         }];
-        let mut cmd = Command::new("cs");
-        let common = add_common_args(&mut cmd, &repos, Path::new("/c")).unwrap();
-        let text = fs::read_to_string(common._credential_file.as_ref().unwrap().path()).unwrap();
-        assert!(!cmd.get_args().any(|a| a.to_string_lossy().contains("tok3n")));
+        let lookup = |var: &str| (var == "REPO_TOKEN").then(|| "tok3n".to_string());
+        let mut missing = Vec::new();
+        let text = credential_properties(&repos, &lookup, &CoursierCredentials::default(), &mut missing);
+        assert!(missing.is_empty(), "{missing:?}");
         let parsed = crate::credentials::CoursierCredentials { entries: crate::credentials::parse_properties(&text) };
         assert_eq!(parsed.find("https://repo.example:8443/maven/x.jar").unwrap().password, "tok3n");
         assert!(parsed.find("https://repo.example/maven/x.jar").is_none(), "another port");
@@ -881,7 +903,7 @@ mod tests {
             ),
         };
         let parse = |repos: &[Repo]| {
-            let text = credential_properties(repos, &coursier, &mut Vec::new());
+            let text = credential_properties(repos, &|_| None, &coursier, &mut Vec::new());
             crate::credentials::CoursierCredentials { entries: crate::credentials::parse_properties(&text) }
         };
         let closed = parse(&[repo("http://nexus.local:8081/m/", false)]);

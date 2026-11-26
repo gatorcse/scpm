@@ -502,7 +502,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("c.properties");
         std::fs::write(&file, "x.host=c.example\nx.username=carol\nx.password=pw3\n").unwrap();
-        for value in [file.display().to_string(), format!("file:{}", file.display())] {
+        // A bare path is read as a file only if it starts with `/` (not `C:\…` on Windows).
+        let bare = file.display().to_string();
+        let values = [Some(format!("file:{bare}")), bare.starts_with('/').then_some(bare)];
+        for value in values.into_iter().flatten() {
             let from_file = CoursierCredentials::from_env_value(&value);
             assert_eq!(from_file.find("https://c.example/x").unwrap().user, "carol", "{value}");
         }

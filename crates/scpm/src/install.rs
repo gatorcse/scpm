@@ -1,7 +1,7 @@
 //! `scpm install`: lock stale variants with coursier, then restore every locked artifact into
 //! the coursier cache (design §5.2, §5.4, §5.5).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -275,6 +275,8 @@ fn inputs_hash(ws: &Workspace, graph: &Graph, v: &Variant, repos: &[Repo], ctx: 
         "repositories": repo_inputs(repos),
         "context": ctx,
         "minimumReleaseAge": ws.config.policy.minimum_release_age,
+        // Rejected as unsupported for now (so always empty), but part of the contract.
+        "minimumReleaseAgeExclude": ws.config.policy.minimum_release_age_exclude,
     }))
 }
 
@@ -612,9 +614,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
         requests.values().chain(plugin_requests.values()).chain(boot_requests.values()).collect();
     let results = resolve_concurrently(&all, &labels, &repos, &cache, scratch.path())?;
 
-    for req in &all {
-        record_artifacts(&mut lock, &results[*req], &repos)?;
-    }
+    record_artifacts(&mut lock, all.iter().flat_map(|req| &results[*req]), &repos)?;
     for (name, req) in &boot_requests {
         lock.boot.insert(name.clone(), results[req].iter().map(|a| a.key.clone()).collect());
     }
@@ -774,9 +774,19 @@ fn resolve_concurrently<'a>(
 
 /// Adds artifacts from this run's resolutions to the lock. The repository id is always
 /// re-derived from where coursier downloaded the file (repositories may have changed since the
-/// entry was written); sha256 and size of existing entries are kept (artifacts are immutable).
-fn record_artifacts(lock: &mut Lockfile, resolved: &[ResolvedArtifact], repos: &[Repo]) -> Result<(), InstallError> {
+/// entry was written). An existing entry keeps its sha256 and size (artifacts are immutable)
+/// only if the resolved file has them: the lock doesn't record repository URLs, so a
+/// repository whose URL changed under the same id must be checked like one with a new id.
+fn record_artifacts<'a>(
+    lock: &mut Lockfile,
+    resolved: impl IntoIterator<Item = &'a ResolvedArtifact>,
+    repos: &[Repo],
+) -> Result<(), InstallError> {
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
     for a in resolved {
+        if !seen.insert((&a.key, &a.url)) {
+            continue;
+        }
         let repo = repo_for_url(repos, &a.url).ok_or_else(|| {
             InstallError::Resolve(format!(
                 "{} was downloaded from {}, which matches no configured repository",
@@ -793,30 +803,30 @@ fn record_artifacts(lock: &mut Lockfile, resolved: &[ResolvedArtifact], repos: &
             )));
         }
         let file_err = |e: std::io::Error| InstallError::Resolve(format!("{}: {e}", a.file.display()));
+        let size = std::fs::metadata(&a.file).map_err(file_err)?.len();
+        let sha256 = fetch::sha256_file(&a.file).map_err(file_err)?;
         match lock.artifacts.get_mut(&a.key) {
-            Some(existing) if existing.repo == repo.id => {}
-            // Moving to another repository keeps the locked integrity only if that repository
-            // serves the same bytes; otherwise a restore could never pass the lock's checks.
+            // The locked integrity stays only if the repository serves the same bytes;
+            // otherwise a restore could never pass the lock's checks.
             Some(existing) => {
-                let size = std::fs::metadata(&a.file).map_err(file_err)?.len();
-                let sha256 = fetch::sha256_file(&a.file).map_err(file_err)?;
                 if (size, &sha256) != (existing.size, &existing.sha256) {
                     return Err(InstallError::Resolve(format!(
-                        "{key}: repository `{new}` serves different bytes than the copy locked from `{old}` \
+                        "{key}: {url} (repository `{new}`) serves different bytes than the copy locked from `{old}` \
                          (sha256 {sha256}, locked {locked}); a published artifact must not change\n  \
-                         help: if the new bytes are expected, remove `{key}` from the `artifacts` of {lock_file} and run `scpm install`",
+                         help: if the new bytes are expected, remove `{key}` from the `artifacts` of {lock_file} and run `scpm install`; \
+                         if the cached file {file} is damaged, delete it and run `scpm install` again",
                         key = a.key,
+                        url = a.url,
                         new = repo.id,
                         old = existing.repo,
                         locked = existing.sha256,
                         lock_file = crate::lockfile::LOCK_FILE,
+                        file = a.file.display(),
                     )));
                 }
                 existing.repo = repo.id.clone();
             }
             None => {
-                let size = std::fs::metadata(&a.file).map_err(file_err)?.len();
-                let sha256 = fetch::sha256_file(&a.file).map_err(file_err)?;
                 lock.artifacts.insert(a.key.clone(), ArtifactLock { repo: repo.id.clone(), sha256, size });
             }
         }
@@ -1076,6 +1086,15 @@ mod tests {
         let err = record_artifacts(&mut lock, &[resolved("a")], &repos).unwrap_err().to_string();
         assert!(err.contains("serves different bytes"), "{err}");
         assert_eq!(lock.artifacts["g:x:1"].repo, "b", "the lock entry is unchanged");
+
+        // `b` now points at another URL serving other bytes: the same id is no excuse.
+        let moved = vec![Repo { url: "https://a.example/".into(), ..repos[1].clone() }];
+        let resolved_from_a = ResolvedArtifact { url: "https://a.example/g/x/1/x-1.jar".into(), ..resolved("a") };
+        let err = record_artifacts(&mut lock, [&resolved_from_a], &moved).unwrap_err().to_string();
+        assert!(err.contains("serves different bytes") && err.contains("repository `b`"), "{err}");
+        std::fs::write(&file, b"bytes").unwrap();
+        record_artifacts(&mut lock, &[resolved_from_a], &moved).unwrap();
+        assert_eq!(lock.artifacts["g:x:1"], ArtifactLock { repo: "b".into(), ..locked });
     }
 
     #[test]

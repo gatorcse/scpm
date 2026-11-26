@@ -191,17 +191,24 @@ pub fn fetch_all(items: Vec<FetchItem>, opts: FetchOptions) -> Result<FetchRepor
         }
     }
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-    let results = runtime.block_on(download_all(downloads));
+    let results = runtime.block_on(download_all(downloads, opts.verify));
     for (r, repair) in results {
         match r {
-            Ok(Some(bytes)) => {
-                report.downloaded += 1;
-                report.bytes += bytes;
-                if repair {
-                    report.repaired += 1;
+            Ok(Fetched { downloaded, rehashed }) => {
+                if rehashed && opts.verify {
+                    report.verified += 1;
+                }
+                match downloaded {
+                    Some(bytes) => {
+                        report.downloaded += 1;
+                        report.bytes += bytes;
+                        if repair || rehashed {
+                            report.repaired += 1;
+                        }
+                    }
+                    None => report.present += 1,
                 }
             }
-            Ok(None) => report.present += 1,
             Err(e) => errors.push(e),
         }
     }
@@ -221,7 +228,7 @@ fn hash_files(paths: Vec<&Path>) -> Vec<io::Result<String>> {
     })
 }
 
-async fn download_all(items: Vec<(FetchItem, bool)>) -> Vec<(Result<Option<u64>, FetchError>, bool)> {
+async fn download_all(items: Vec<(FetchItem, bool)>, verify: bool) -> Vec<(Result<Fetched, FetchError>, bool)> {
     let client = reqwest::Client::builder()
         .user_agent(user_agent())
         .connect_timeout(Duration::from_secs(15))
@@ -236,7 +243,7 @@ async fn download_all(items: Vec<(FetchItem, bool)>) -> Vec<(Result<Option<u64>,
             let permits = permits.clone();
             tokio::spawn(async move {
                 let _permit = permits.acquire().await.expect("semaphore open");
-                (fetch_one(&client, &item, repair).await, repair)
+                (fetch_one(&client, &item, repair, verify).await, repair)
             })
         })
         .collect();
@@ -247,9 +254,24 @@ async fn download_all(items: Vec<(FetchItem, bool)>) -> Vec<(Result<Option<u64>,
     out
 }
 
-/// Returns `Some(bytes)` if this call downloaded the file, `None` if another process did.
-/// `replace` downloads even if a file of the right size is present (it failed `--verify`).
-async fn fetch_one(client: &reqwest::Client, item: &FetchItem, replace: bool) -> Result<Option<u64>, FetchError> {
+/// What [`fetch_one`] did with a file.
+struct Fetched {
+    /// `Some(bytes)` if this call downloaded the file, `None` if another process did.
+    downloaded: Option<u64>,
+    /// A file that appeared while waiting for the lock was hashed against the lock (and
+    /// downloaded again if it didn't match).
+    rehashed: bool,
+}
+
+/// Makes `item` present. `replace` downloads even if a file of the right size is present (it
+/// failed a hash check). With `verify` (or [`FetchItem::verify_cached`]), a file another process
+/// wrote while this one waited for the lock is hashed before it is trusted.
+async fn fetch_one(
+    client: &reqwest::Client,
+    item: &FetchItem,
+    replace: bool,
+    verify: bool,
+) -> Result<Fetched, FetchError> {
     let io_err =
         |path: &Path, source: io::Error| FetchError::Io { key: item.key.clone(), path: path.to_path_buf(), source };
     let dir = item.dest.parent().expect("cache files have a parent");
@@ -260,9 +282,19 @@ async fn fetch_one(client: &reqwest::Client, item: &FetchItem, replace: bool) ->
         let lock_path = lock_path.clone();
         tokio::task::spawn_blocking(move || acquire(&lock_path, &key)).await.expect("lock task")?
     };
+    let mut rehashed = false;
     if !replace && fs::metadata(&item.dest).is_ok_and(|m| m.len() == item.size) {
-        release(lock, &lock_path);
-        return Ok(None);
+        if !(verify || item.verify_cached) {
+            release(lock, &lock_path);
+            return Ok(Fetched { downloaded: None, rehashed });
+        }
+        rehashed = true;
+        let dest = item.dest.clone();
+        let hash = tokio::task::spawn_blocking(move || sha256_file(&dest)).await.expect("hash task");
+        if hash.is_ok_and(|h| h == item.sha256) {
+            release(lock, &lock_path);
+            return Ok(Fetched { downloaded: None, rehashed });
+        }
     }
     let auth = item.auth.as_ref().ok().cloned().flatten();
     let part = part_path(&item.dest);
@@ -280,7 +312,7 @@ async fn fetch_one(client: &reqwest::Client, item: &FetchItem, replace: bool) ->
             Ok(bytes) => {
                 let renamed = fs::rename(&part, &item.dest).map_err(|e| io_err(&item.dest, e));
                 release(lock, &lock_path);
-                return renamed.map(|()| Some(bytes));
+                return renamed.map(|()| Fetched { downloaded: Some(bytes), rehashed });
             }
             Err(e) if retryable(&e) => last_error = Some(e),
             Err(e) => {
@@ -325,23 +357,62 @@ fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
 }
 
 /// The realm of a `WWW-Authenticate: Basic realm="…"` challenge.
-fn basic_realm(resp: &reqwest::Response) -> Option<&str> {
+fn basic_realm(resp: &reqwest::Response) -> Option<String> {
     resp.headers().get_all(reqwest::header::WWW_AUTHENTICATE).iter().find_map(|v| parse_basic_realm(v.to_str().ok()?))
 }
 
-fn parse_basic_realm(header: &str) -> Option<&str> {
-    let (scheme, params) = header.trim().split_once(' ')?;
-    if !scheme.eq_ignore_ascii_case("basic") {
-        return None;
-    }
-    let mut rest = params;
+/// The realm of the first Basic challenge in a `WWW-Authenticate` value, which may list several
+/// challenges (`Bearer realm="api", Basic realm="packages"`, RFC 9110 §11.6.1).
+fn parse_basic_realm(header: &str) -> Option<String> {
+    let token_end = |s: &str| s.find(|c: char| c == '=' || c == ',' || c.is_ascii_whitespace()).unwrap_or(s.len());
+    let mut in_basic = false;
+    let mut rest = header;
     loop {
-        rest = rest.trim_start_matches([' ', ',']);
-        let (name, after) = rest.split_once('=')?;
-        let after = after.strip_prefix('"')?;
-        let (value, tail) = after.split_once('"')?;
-        if name.trim().eq_ignore_ascii_case("realm") {
-            return Some(value);
+        rest = rest.trim_start_matches([' ', '\t', ',']);
+        if rest.is_empty() {
+            return None;
+        }
+        let end = token_end(rest);
+        if end == 0 {
+            // A stray `=`.
+            rest = &rest[1..];
+            continue;
+        }
+        let token = &rest[..end];
+        let after = rest[end..].trim_start_matches([' ', '\t']);
+        let Some(value) = after.strip_prefix('=') else {
+            // A token not followed by `=` starts a challenge (a token68 like `abc==` is skipped
+            // as a parameter of the scheme before it).
+            in_basic = token.eq_ignore_ascii_case("basic");
+            rest = after;
+            continue;
+        };
+        let value = value.trim_start_matches([' ', '\t']);
+        let (parsed, tail) = match value.strip_prefix('"') {
+            Some(quoted) => {
+                // A quoted-string, with `\` escaping the next character.
+                let mut out = String::new();
+                let mut chars = quoted.char_indices();
+                let mut close = None;
+                while let Some((i, c)) = chars.next() {
+                    match c {
+                        '\\' => out.extend(chars.next().map(|(_, c)| c)),
+                        '"' => {
+                            close = Some(i);
+                            break;
+                        }
+                        c => out.push(c),
+                    }
+                }
+                (out, &quoted[close? + 1..])
+            }
+            None => {
+                let end = value.find(|c: char| c == ',' || c.is_ascii_whitespace()).unwrap_or(value.len());
+                (value[..end].to_string(), &value[end..])
+            }
+        };
+        if in_basic && token.eq_ignore_ascii_case("realm") {
+            return Some(parsed);
         }
         rest = tail;
     }
@@ -607,11 +678,18 @@ mod tests {
 
     #[test]
     fn basic_realms() {
-        assert_eq!(parse_basic_realm("Basic realm=\"Sonatype Nexus\""), Some("Sonatype Nexus"));
-        assert_eq!(parse_basic_realm("BASIC charset=\"UTF-8\", realm=\"R\""), Some("R"));
-        assert_eq!(parse_basic_realm("Basic realm=\"R\", charset=\"UTF-8\""), Some("R"));
-        assert_eq!(parse_basic_realm("Bearer realm=\"R\""), None);
-        assert_eq!(parse_basic_realm("Basic charset=\"UTF-8\""), None);
+        let realm = |h: &str| parse_basic_realm(h);
+        assert_eq!(realm("Basic realm=\"Sonatype Nexus\"").as_deref(), Some("Sonatype Nexus"));
+        assert_eq!(realm("BASIC charset=\"UTF-8\", realm=\"R\"").as_deref(), Some("R"));
+        assert_eq!(realm("Basic realm=\"R\", charset=\"UTF-8\"").as_deref(), Some("R"));
+        assert_eq!(realm("Basic realm=R").as_deref(), Some("R"));
+        assert_eq!(realm("Bearer realm=\"R\""), None);
+        assert_eq!(realm("Basic charset=\"UTF-8\""), None);
+        // Several challenges in one field; commas and escapes inside quoted values.
+        assert_eq!(realm("Bearer realm=\"api\", Basic realm=\"packages\"").as_deref(), Some("packages"));
+        assert_eq!(realm("Bearer error=\"a, Basic realm=x\", Basic realm=\"p\"").as_deref(), Some("p"));
+        assert_eq!(realm("Negotiate abc==, Basic realm = \"a \\\"b\\\"\"").as_deref(), Some("a \"b\""));
+        assert_eq!(realm("Basic, Bearer realm=\"R\""), None);
     }
 
     #[test]

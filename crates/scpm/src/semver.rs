@@ -177,6 +177,10 @@ impl MavenVersion {
             }
         }
         if version.len() > start {
+            // A terminal `.X` qualifier is nested like `-X` (Maven 3.9: `1.0.sp` == `1.0-sp`).
+            if !is_digit && !stack.last().expect("the root list").is_empty() {
+                stack.push(Vec::new());
+            }
             stack.last_mut().expect("the root list").push(Item::parse(is_digit, &version[start..]));
         }
         let mut items = stack.pop().expect("the root list");
@@ -502,6 +506,8 @@ mod tests {
             "1.0-sp-1",
             "1.0rc1",
             "1.0.jre7",
+            "1.0.sp",
+            "1.0.foo",
             "1.2.3+4-abc",
         ];
         let vs: Vec<MavenVersion> = corpus.iter().map(|s| v(s)).collect();
@@ -531,6 +537,10 @@ mod tests {
         assert!(Range::parse(">=1.0-rc1").unwrap().matches(&v("1.0-cr1")));
         assert_eq!(v("1.0-a1"), v("1.0-alpha1"));
         assert!(v("1.0-foo") < v("1.0-goo"), "unknown qualifiers sort lexically");
+        // A terminal dotted qualifier is the hyphenated one.
+        assert_eq!(v("1.0.sp"), v("1.0-sp"));
+        assert_eq!(v("1.0.0.foo"), v("1.0-foo"));
+        assert_eq!(Range::parse("=1.0.sp").unwrap().select(["1.0", "1.0-sp", "1.1"]), Some("1.0-sp"));
     }
 
     #[test]
