@@ -1,0 +1,6 @@
+mainClass: app.Main
+dependencies:
+  util: workspace:*
+  javalib: workspace:*
+testDependencies:
+  org.scalameta::munit: catalog

@@ -7,12 +7,14 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
+use crate::compile;
 use crate::config::{ModuleFile, WorkspaceFile};
 use crate::diag::Diagnostics;
 use crate::filter;
 use crate::graph::Graph;
 use crate::install::{self, ClasspathKind, InstallOptions, InstallSummary};
 use crate::lockfile::Lockfile;
+use crate::report::{Event, Mode, Reporter};
 use crate::workspace::{self, Workspace};
 
 #[derive(Debug, Parser)]
@@ -54,6 +56,16 @@ pub enum Command {
         /// Re-hash cached artifacts against the lock and re-download any that don't match.
         #[arg(long)]
         verify: bool,
+    },
+    /// Compile modules (and what they depend on). Unchanged variants are skipped without a JVM.
+    Compile {
+        /// Module names or variant ids; shorthand for `-F`.
+        targets: Vec<String>,
+        /// Also compile test sources.
+        #[arg(long)]
+        tests: bool,
+        #[arg(long)]
+        frozen: bool,
     },
     /// Explain why an artifact is on the classpath (`org::name`, `org:name_3` or `name`).
     Why { artifact: String },
@@ -111,6 +123,7 @@ pub fn main() -> ExitCode {
             }
             ExitCode::from(2)
         }
+        Err(Failure::Silent) => ExitCode::FAILURE,
         // A closed pipe (`scpm ls | head`) is not an error.
         Err(Failure::Output(e)) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(Failure::Output(e)) => {
@@ -141,6 +154,8 @@ enum Failure {
     Usage(String),
     /// The command ran and failed (resolution, download, stale lock): exit code 1.
     Command(String),
+    /// Failed, and the reporter already said why: exit code 1, nothing more to print.
+    Silent,
     /// Writing to stdout failed.
     Output(io::Error),
 }
@@ -229,6 +244,35 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 print_install_summary(&summary)?;
             }
             Ok(())
+        }
+        Command::Compile { targets, tests, frozen } => {
+            let (ws, graph) = load(&start)?;
+            let mut selectors = cli.filter.clone();
+            selectors.extend(targets);
+            let selected = filter::select(&ws, &graph, &selectors, &invocation_dir(&start)?)?;
+            let lock = ensure_installed(&ws, &graph, frozen)?;
+            let _guard = compile::workspace_lock(&ws.root).map_err(|e| Failure::Command(e.to_string()))?;
+            let started = std::time::Instant::now();
+            let reporter = std::sync::Arc::new(Reporter::new(Mode::detect(cli.json), &ws.root, &run_id()));
+            reporter.emit(Event::RunStart { run: run_id(), command: "compile".into() });
+            let result = compile::Toolchain::new(&ws, &lock).and_then(|tc| {
+                let handle = compile::WorkerHandle::new(&tc, reporter.clone());
+                let result = compile::compile(&tc, &graph, &selected, tests, &handle);
+                handle.shutdown();
+                result
+            });
+            let elapsed = started.elapsed().as_millis() as u64;
+            match result {
+                Ok(ok) => {
+                    reporter.finish("compile", ok, elapsed, None);
+                    if ok { Ok(()) } else { Err(Failure::Silent) }
+                }
+                // The reporter includes the error, so JSON output stays one document.
+                Err(e) => {
+                    reporter.finish("compile", false, elapsed, Some(&e.to_string()));
+                    Err(Failure::Silent)
+                }
+            }
         }
         Command::Why { artifact } => {
             let (ws, graph) = load(&start)?;
@@ -370,6 +414,16 @@ fn ensure_installed(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<Lockf
     Lockfile::read(&ws.root)
         .map_err(|e| Failure::Command(e.to_string()))?
         .ok_or_else(|| Failure::Command("no scpm-lock.yaml; run `scpm install`".into()))
+}
+
+/// A sortable, unique id for a run: `<unix millis>-<pid>`.
+fn run_id() -> String {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        format!("{millis}-{}", std::process::id())
+    })
+    .clone()
 }
 
 /// CI mode (implied `--frozen`) is `CI=true` (any case: AppVeyor sets `True`).

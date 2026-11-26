@@ -1,0 +1,381 @@
+//! Client for the JVM compile worker (`scpmd`) over JSON lines on stdio
+//! (docs/worker-protocol.md). Phase 1 runs it in the foreground for one command.
+
+use std::collections::{HashMap, VecDeque};
+use std::env;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use serde_json::{Value, json};
+
+pub const PROTOCOL_VERSION: u64 = 1;
+
+/// The oldest JDK the worker runs on (its bytecode targets 17).
+pub const MIN_JAVA: u32 = 17;
+
+/// The worker's third-party dependencies, pinned in the lock's boot section.
+pub const COMPILE_WORKER_DEPS: &str = include_str!("../../../worker/deps/compile-worker.txt");
+pub const TEST_RUNNER_DEPS: &str = include_str!("../../../worker/deps/test-runner.txt");
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum WorkerError {
+    #[error("{0}")]
+    Setup(String),
+    #[error("cannot start {java}: {message}")]
+    Spawn { java: String, message: String },
+    #[error("the compile worker exited unexpectedly{0}")]
+    Exited(String),
+    #[error("compile worker error ({code}): {message}")]
+    Remote { code: String, message: String },
+}
+
+/// Locates a helper jar: an explicit environment variable, or the sbt 2 build output of the
+/// `worker/` project in a source checkout containing the running binary.
+pub fn helper_jar(env_var: &str, project: &str) -> Result<PathBuf, WorkerError> {
+    if let Some(path) = env::var_os(env_var).filter(|p| !p.is_empty()) {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            return Err(WorkerError::Setup(format!("{env_var} points to {}, which does not exist", path.display())));
+        }
+        return Ok(path);
+    }
+    let exe = env::current_exe().map_err(|e| WorkerError::Setup(e.to_string()))?;
+    for dir in exe.ancestors() {
+        let out = dir.join("worker/target/out/jvm");
+        if let Some(jar) = find_jar(&out, project) {
+            return Ok(jar);
+        }
+    }
+    Err(WorkerError::Setup(format!(
+        "cannot find the {project} jar; build it with `sbt package` in worker/ or set {env_var}"
+    )))
+}
+
+fn find_jar(out: &Path, project: &str) -> Option<PathBuf> {
+    let mut found = Vec::new();
+    for scala_dir in std::fs::read_dir(out).ok()?.flatten() {
+        let dir = scala_dir.path().join(project);
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(project) && name.ends_with(".jar") && !name.ends_with("-tests.jar") {
+                found.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    found.pop()
+}
+
+/// The JDK used for helper JVMs and forked runs.
+#[derive(Debug, Clone)]
+pub struct Java {
+    pub path: PathBuf,
+    /// Where `path` came from, for error messages (e.g. `JAVA_HOME`).
+    pub source: String,
+    /// Full version, e.g. `25.0.2`.
+    pub version: String,
+    pub major: u32,
+}
+
+/// Finds `java`: `SCPM_JAVA_HOME`, `JAVA_HOME`, then `PATH`; checks its version once per process.
+pub fn java() -> Result<Java, WorkerError> {
+    static JAVA: OnceLock<Result<Java, WorkerError>> = OnceLock::new();
+    JAVA.get_or_init(detect_java).clone()
+}
+
+fn detect_java() -> Result<Java, WorkerError> {
+    let exe = if cfg!(windows) { "java.exe" } else { "java" };
+    let (path, source) = ["SCPM_JAVA_HOME", "JAVA_HOME"]
+        .iter()
+        .find_map(|var| {
+            let home = env::var_os(var).filter(|h| !h.is_empty())?;
+            Some((Path::new(&home).join("bin").join(exe), format!("${var}")))
+        })
+        .unwrap_or_else(|| (PathBuf::from(exe), "PATH".to_string()));
+    let out = Command::new(&path).arg("-version").output().map_err(|e| WorkerError::Spawn {
+        java: format!("{} (from {source})", path.display()),
+        message: format!("{e}; install a JDK {MIN_JAVA}+ or set SCPM_JAVA_HOME / JAVA_HOME"),
+    })?;
+    // `openjdk version "25.0.2" 2026-01-20` or `java version "1.8.0_402"`.
+    // The ` version "…"` line (other output, e.g. from JAVA_TOOL_OPTIONS, may contain quotes).
+    let text = String::from_utf8_lossy(&out.stderr);
+    let version = parse_java_version(&text).unwrap_or_default();
+    let major = match version.split(['.', '-', '+']).collect::<Vec<_>>().as_slice() {
+        ["1", minor, ..] => minor.parse().unwrap_or(0),
+        [major, ..] => major.parse().unwrap_or(0),
+        _ => 0,
+    };
+    if major < MIN_JAVA {
+        return Err(WorkerError::Setup(format!(
+            "{} (from {source}) is Java {}; scpm needs JDK {MIN_JAVA} or newer (set SCPM_JAVA_HOME)",
+            path.display(),
+            if version.is_empty() { "of unknown version".to_string() } else { version }
+        )));
+    }
+    Ok(Java { path, source, version, major })
+}
+
+/// `25.0.2` from `openjdk version "25.0.2" 2026-01-20` (and `java -version` noise around it).
+fn parse_java_version(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find_map(|l| l.split_once(" version \""))
+        .and_then(|(_, rest)| rest.split('"').next())
+        .map(str::to_string)
+}
+
+/// An identity of the JDK for build fingerprints, found without starting a JVM when possible:
+/// the JDK home's `release` file (via `SCPM_JAVA_HOME`, `JAVA_HOME`, or the resolved `java`
+/// on `PATH`). Falls back to running `java -version`.
+pub fn java_identity() -> Result<String, WorkerError> {
+    let exe = if cfg!(windows) { "java.exe" } else { "java" };
+    let homes = ["SCPM_JAVA_HOME", "JAVA_HOME"]
+        .iter()
+        .filter_map(|v| env::var_os(v).filter(|h| !h.is_empty()).map(PathBuf::from))
+        .chain(
+            env::var_os("PATH")
+                .into_iter()
+                .flat_map(|p| env::split_paths(&p).collect::<Vec<_>>())
+                .map(|d| d.join(exe))
+                .find(|p| p.is_file())
+                .and_then(|p| p.canonicalize().ok())
+                .and_then(|p| p.parent()?.parent().map(Path::to_path_buf)),
+        );
+    for home in homes {
+        if let Ok(release) = std::fs::read_to_string(home.join("release"))
+            && let Some(line) = release.lines().find(|l| l.starts_with("JAVA_VERSION="))
+        {
+            return Ok(format!("{} {line}", home.display()));
+        }
+    }
+    let java = java()?;
+    Ok(format!("{} {}", java.path.display(), java.version))
+}
+
+/// JVM flags for helper processes: keep HotSpot's own output off stdout (the protocol
+/// channel), exit on OOM, and silence JDK 24+ warnings that would otherwise fill stderr.
+fn helper_jvm_flags(java: &Java) -> Vec<&'static str> {
+    let mut flags = vec![
+        "-XX:+ExitOnOutOfMemoryError",
+        "-XX:+DisplayVMOutputToStderr",
+        "-Xlog:disable",
+        "-Xlog:all=warning:stderr",
+        "--enable-native-access=ALL-UNNAMED",
+    ];
+    if java.major >= 23 {
+        flags.push("--sun-misc-unsafe-memory-access=allow");
+    }
+    flags
+}
+
+type Reply = Result<Value, WorkerError>;
+
+/// Requests waiting for a reply; `None` once the worker's stdout has closed.
+type Pending = Arc<Mutex<Option<HashMap<u64, Sender<Reply>>>>>;
+
+/// A running worker. Requests may be sent from several threads at once.
+pub struct Worker {
+    child: Mutex<Child>,
+    stdin: Mutex<Option<ChildStdin>>,
+    pending: Pending,
+    next_id: AtomicU64,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl Worker {
+    /// Starts `java -cp <classpath> <main>` and sends `initialize`. Events go to `on_event`.
+    pub fn spawn(
+        classpath: &[PathBuf],
+        main: &str,
+        log_file: Option<&Path>,
+        on_event: impl Fn(Value) + Send + 'static,
+    ) -> Result<Worker, WorkerError> {
+        let java = java()?;
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let cp = classpath.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(sep);
+        let mut child = Command::new(&java.path)
+            .args(helper_jvm_flags(&java))
+            .arg("-cp")
+            .arg(cp)
+            .arg(main)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| WorkerError::Spawn {
+                java: format!("{} (from {})", java.path.display(), java.source),
+                message: e.to_string(),
+            })?;
+        let stdout = child.stdout.take().expect("piped");
+        let stderr = child.stderr.take().expect("piped");
+        let stdin = child.stdin.take().expect("piped");
+        let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
+        let push_tail = |tail: &Mutex<VecDeque<String>>, line: String| {
+            let mut t = tail.lock().expect("tail");
+            if t.len() == 40 {
+                t.pop_front();
+            }
+            t.push_back(line);
+        };
+
+        {
+            let tail = stderr_tail.clone();
+            let mut log = log_file.and_then(|p| {
+                std::fs::create_dir_all(p.parent()?).ok()?;
+                std::fs::OpenOptions::new().create(true).append(true).open(p).ok()
+            });
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stderr);
+                let mut buf = Vec::new();
+                while reader.read_until(b'\n', &mut buf).is_ok_and(|n| n > 0) {
+                    let line = String::from_utf8_lossy(&buf).trim_end().to_string();
+                    if let Some(log) = log.as_mut() {
+                        let _ = writeln!(log, "{line}");
+                    }
+                    push_tail(&tail, line);
+                    buf.clear();
+                }
+            });
+        }
+        {
+            let pending = pending.clone();
+            let tail = stderr_tail.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                let mut buf = Vec::new();
+                while reader.read_until(b'\n', &mut buf).is_ok_and(|n| n > 0) {
+                    match serde_json::from_slice::<Value>(&buf) {
+                        Ok(msg) if msg.get("method").and_then(Value::as_str) == Some("event") => {
+                            on_event(msg["params"].clone())
+                        }
+                        Ok(msg) => {
+                            if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+                                let reply = match msg.get("error") {
+                                    Some(err) => Err(WorkerError::Remote {
+                                        code: err["code"].as_str().unwrap_or("unknown").to_string(),
+                                        message: err["message"].as_str().unwrap_or_default().to_string(),
+                                    }),
+                                    None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+                                };
+                                let sender = pending.lock().expect("pending").as_mut().and_then(|p| p.remove(&id));
+                                if let Some(tx) = sender {
+                                    let _ = tx.send(reply);
+                                }
+                            }
+                        }
+                        // Not JSON (shouldn't happen with the launch flags): keep it as context.
+                        Err(_) => push_tail(&tail, format!("(stdout) {}", String::from_utf8_lossy(&buf).trim_end())),
+                    }
+                    buf.clear();
+                }
+                // EOF: fail everything still waiting, and refuse new requests.
+                let context = tail_context(&tail);
+                let waiting = pending.lock().expect("pending").take().unwrap_or_default();
+                for (_, tx) in waiting {
+                    let _ = tx.send(Err(WorkerError::Exited(context.clone())));
+                }
+            });
+        }
+        let worker = Worker {
+            child: Mutex::new(child),
+            stdin: Mutex::new(Some(stdin)),
+            pending,
+            next_id: AtomicU64::new(1),
+            stderr_tail,
+        };
+        let init = worker.request("initialize", json!({"protocolVersion": PROTOCOL_VERSION}))?;
+        if init["protocolVersion"].as_u64() != Some(PROTOCOL_VERSION) {
+            return Err(WorkerError::Setup(format!(
+                "worker speaks protocol {}, expected {PROTOCOL_VERSION}",
+                init["protocolVersion"]
+            )));
+        }
+        Ok(worker)
+    }
+
+    /// Sends a request and blocks until its response.
+    pub fn request(&self, method: &str, params: Value) -> Result<Value, WorkerError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = channel();
+        match self.pending.lock().expect("pending").as_mut() {
+            Some(p) => p.insert(id, tx),
+            None => return Err(self.exited()),
+        };
+        let line = json!({"id": id, "method": method, "params": params}).to_string();
+        {
+            let mut stdin = self.stdin.lock().expect("stdin");
+            let sent = stdin.as_mut().map(|s| writeln!(s, "{line}").and_then(|()| s.flush()));
+            if !matches!(sent, Some(Ok(()))) {
+                if let Some(p) = self.pending.lock().expect("pending").as_mut() {
+                    p.remove(&id);
+                }
+                return Err(self.exited());
+            }
+        }
+        match rx.recv() {
+            Ok(Err(WorkerError::Exited(_))) | Err(_) => Err(self.exited()),
+            Ok(reply) => reply,
+        }
+    }
+
+    /// An `Exited` error with the exit status (if known) and the end of stderr.
+    fn exited(&self) -> WorkerError {
+        let status = self.child.lock().ok().and_then(|mut c| {
+            // Give the process a moment to finish exiting so its status is available.
+            for _ in 0..20 {
+                if let Ok(Some(s)) = c.try_wait() {
+                    return Some(s);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            None
+        });
+        let status = status.map(|s| format!(" ({s})")).unwrap_or_default();
+        WorkerError::Exited(format!("{status}{}", tail_context(&self.stderr_tail)))
+    }
+
+    /// Asks the worker to exit and waits for it.
+    pub fn shutdown(self) {
+        let _ = self.request("shutdown", json!({}));
+        self.stdin.lock().expect("stdin").take();
+        let _ = self.child.lock().expect("child").wait();
+    }
+}
+
+fn tail_context(tail: &Mutex<VecDeque<String>>) -> String {
+    let t = tail.lock().expect("tail");
+    if t.is_empty() { String::new() } else { format!(":\n{}", t.iter().cloned().collect::<Vec<_>>().join("\n")) }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // Closing stdin is a clean shutdown for the worker; make sure it doesn't outlive us.
+        self.stdin.lock().map(|mut s| s.take()).ok();
+        if let Ok(mut child) = self.child.lock()
+            && matches!(child.try_wait(), Ok(None))
+        {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if matches!(child.try_wait(), Ok(None)) {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::parse_java_version;
+
+    #[test]
+    fn java_versions_ignore_unrelated_quotes() {
+        let out = "Picked up JAVA_TOOL_OPTIONS: -Dfoo=\"bar baz\"\nopenjdk version \"25.0.2\" 2026-01-20 LTS\n";
+        assert_eq!(parse_java_version(out).as_deref(), Some("25.0.2"));
+        assert_eq!(parse_java_version("java version \"1.8.0_402\"").as_deref(), Some("1.8.0_402"));
+    }
+}

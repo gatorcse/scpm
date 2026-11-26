@@ -160,8 +160,30 @@ fn resolution_context(ws: &Workspace) -> ResolutionContextLock {
     }
 }
 
+/// Scala version used to drive Zinc for Java-only modules when the workspace has no Scala.
+pub const JAVA_ONLY_SCALA: &str = "2.13.18";
+
+/// The Scala version that drives Zinc for a variant (Java-only variants borrow one).
+pub fn compiler_scala(ws: &Workspace, v: &Variant) -> String {
+    v.scala.as_ref().map(|s| s.full.clone()).unwrap_or_else(|| {
+        ws.variants()
+            .find_map(|o| o.scala.as_ref().map(|s| s.full.clone()))
+            .unwrap_or_else(|| JAVA_ONLY_SCALA.to_string())
+    })
+}
+
+/// Boot entry name of the compiler bridge for a Scala version. The Scala 2 bridge comes from
+/// Zinc, so its name carries the Zinc version and a Zinc upgrade re-resolves it.
+pub fn bridge_boot(scala: &str) -> String {
+    if crate::coord::scala_binary_version(scala) == "3" {
+        format!("compiler-bridge@{scala}")
+    } else {
+        format!("compiler-bridge@{scala}+zinc-{ZINC_VERSION}")
+    }
+}
+
 /// `temurin:25.0.1` → `25`, `21` → `21`.
-fn jdk_major(id: &str) -> Option<String> {
+pub fn jdk_major(id: &str) -> Option<String> {
     let version = id.rsplit(':').next()?;
     let major: String = version.chars().take_while(char::is_ascii_digit).collect();
     (!major.is_empty()).then_some(major)
@@ -432,10 +454,10 @@ pub(crate) fn classpath_request(
     Ok(req)
 }
 
-/// A boot closure (design §5.4): its lock name, root dependency, and whether it is transitive.
+/// A boot closure (design §5.4): its lock name, root dependencies, and whether they are fetched transitively.
 struct BootRoot {
     name: String,
-    root: String,
+    roots: Vec<String>,
     transitive: bool,
 }
 
@@ -443,22 +465,45 @@ struct BootRoot {
 /// so its name carries the Zinc version and a Zinc upgrade re-resolves it.
 fn boot_roots(full: &str) -> Vec<BootRoot> {
     let binary = crate::coord::scala_binary_version(full);
-    let root = |name: String, root: String, transitive: bool| BootRoot { name, root, transitive };
+    let root = |name: String, root: String, transitive: bool| BootRoot { name, roots: vec![root], transitive };
     if binary == "3" {
         vec![
             root(format!("scala-compiler@{full}"), format!("org.scala-lang:scala3-compiler_3:{full}"), true),
-            root(format!("compiler-bridge@{full}"), format!("org.scala-lang:scala3-sbt-bridge:{full}"), false),
+            root(bridge_boot(full), format!("org.scala-lang:scala3-sbt-bridge:{full}"), false),
         ]
     } else {
         vec![
             root(format!("scala-compiler@{full}"), format!("org.scala-lang:scala-compiler:{full}"), true),
-            root(
-                format!("compiler-bridge@{full}+zinc-{ZINC_VERSION}"),
-                format!("org.scala-sbt:compiler-bridge_{binary}:{ZINC_VERSION}"),
-                false,
-            ),
+            root(bridge_boot(full), format!("org.scala-sbt:compiler-bridge_{binary}:{ZINC_VERSION}"), false),
         ]
     }
+}
+
+/// Boot entry name for a JVM helper: keyed by a hash of its dependency list, so changing the
+/// list (a new scpm version) re-locks it.
+pub fn helper_boot_name(helper: &str, deps: &str) -> String {
+    let digest = Sha256::digest(deps.as_bytes());
+    format!("{helper}@{}", &fetch::hex(&digest)[..12])
+}
+
+/// The compile worker's boot entry name.
+pub fn worker_boot() -> String {
+    helper_boot_name("worker", crate::worker::COMPILE_WORKER_DEPS)
+}
+
+/// The test runner's boot entry name.
+pub fn test_runner_boot() -> String {
+    helper_boot_name("test-runner", crate::worker::TEST_RUNNER_DEPS)
+}
+
+fn helper_roots() -> Vec<BootRoot> {
+    let lines = |text: &str| -> Vec<String> {
+        text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_string).collect()
+    };
+    vec![
+        BootRoot { name: worker_boot(), roots: lines(crate::worker::COMPILE_WORKER_DEPS), transitive: true },
+        BootRoot { name: test_runner_boot(), roots: lines(crate::worker::TEST_RUNNER_DEPS), transitive: true },
+    ]
 }
 
 /// Reads the previous lock. A corrupt or merge-conflicted lock is re-built from scratch
@@ -498,9 +543,10 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
         .filter(|(id, hash)| previous.variants.get(*id).is_none_or(|l| &l.inputs_hash != *hash))
         .map(|(id, _)| id.clone())
         .collect();
-    let scala_versions: BTreeSet<String> =
-        ws.variants().filter_map(|v| v.scala.as_ref().map(|s| s.full.clone())).collect();
-    let boot: Vec<BootRoot> = scala_versions.iter().flat_map(|v| boot_roots(v)).collect();
+    // Compilers for every Scala version in use (Java-only variants drive Zinc with one too),
+    // plus the JVM helpers.
+    let scala_versions: BTreeSet<String> = ws.variants().map(|v| compiler_scala(ws, v)).collect();
+    let boot: Vec<BootRoot> = scala_versions.iter().flat_map(|v| boot_roots(v)).chain(helper_roots()).collect();
     let boot_inputs = (!boot.is_empty()).then(|| boot_inputs_hash(&repos, &ctx));
     let boot_inputs_changed = previous.boot_inputs != boot_inputs;
     let missing_boot: Vec<&BootRoot> =
@@ -509,7 +555,11 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
 
     if opts.frozen && (!stale.is_empty() || !missing_boot.is_empty() || !removed.is_empty()) {
         let mut what = stale.clone();
-        what.extend(missing_boot.iter().map(|b| b.name.clone()));
+        what.extend(missing_boot.iter().map(|b| match b.name.split_once('@') {
+            Some(("worker", _)) => "the compile worker's dependencies (they change with scpm versions)".to_string(),
+            Some(("test-runner", _)) => "the test runner's dependencies (they change with scpm versions)".to_string(),
+            _ => b.name.clone(),
+        }));
         what.extend(removed.iter().map(|id| format!("{id} (removed)")));
         return Err(InstallError::Stale(what));
     }
@@ -601,9 +651,9 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
         .map(|b| {
             let mut req = ResolveRequest { jdk_version: Some(ctx.jdk.clone()), ..Default::default() };
             if b.transitive {
-                req.dependencies.push(b.root.clone())
+                req.dependencies.extend(b.roots.iter().cloned())
             } else {
-                req.intransitive.push(b.root.clone())
+                req.intransitive.extend(b.roots.iter().cloned())
             }
             labels.push((req.clone(), format!("boot entry {}", b.name)));
             (b.name.clone(), req)
@@ -966,11 +1016,11 @@ mod tests {
     #[test]
     fn boot_roots_per_scala_version() {
         let s3 = boot_roots("3.9.0");
-        assert_eq!(s3[0].root, "org.scala-lang:scala3-compiler_3:3.9.0");
-        assert_eq!(s3[1].root, "org.scala-lang:scala3-sbt-bridge:3.9.0");
+        assert_eq!(s3[0].roots[0], "org.scala-lang:scala3-compiler_3:3.9.0");
+        assert_eq!(s3[1].roots[0], "org.scala-lang:scala3-sbt-bridge:3.9.0");
         assert_eq!(s3[1].name, "compiler-bridge@3.9.0");
         let s2 = boot_roots("2.13.18");
-        assert_eq!(s2[1].root, format!("org.scala-sbt:compiler-bridge_2.13:{ZINC_VERSION}"));
+        assert_eq!(s2[1].roots[0], format!("org.scala-sbt:compiler-bridge_2.13:{ZINC_VERSION}"));
         assert_eq!(s2[1].name, format!("compiler-bridge@2.13.18+zinc-{ZINC_VERSION}"), "a Zinc upgrade re-resolves it");
     }
 

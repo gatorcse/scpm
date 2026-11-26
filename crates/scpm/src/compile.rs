@@ -1,0 +1,511 @@
+//! `scpm compile`: schedule `#compile` and `#test-compile` tasks in dependency order, skip
+//! unchanged ones without a JVM, and compile the rest on the worker (design §3.2, §6).
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, UNIX_EPOCH};
+
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+use crate::coursier;
+use crate::fetch;
+use crate::graph::Graph;
+use crate::install::{self, ClasspathKind, InstallError};
+use crate::lockfile::{ClasspathEntry, Lockfile};
+use crate::report::{Diagnostic, Event, Position, Range, Reporter, Severity, TaskStatus};
+use crate::worker::{self, Worker, WorkerError};
+use crate::workspace::Workspace;
+
+#[derive(Debug, thiserror::Error)]
+pub enum CompileError {
+    #[error(transparent)]
+    Install(#[from] InstallError),
+    #[error(transparent)]
+    Worker(#[from] WorkerError),
+    #[error("{0}")]
+    Setup(String),
+}
+
+/// Paths for a variant's main outputs.
+pub fn classes_dir(root: &Path, id: &str) -> PathBuf {
+    root.join(".scpm/out").join(id).join("classes")
+}
+
+/// Holds `.scpm/out/.lock` for the duration of a build so two scpm commands in one workspace
+/// don't compile into the same directories at once.
+pub fn workspace_lock(root: &Path) -> Result<File, CompileError> {
+    let dir = root.join(".scpm/out");
+    fs::create_dir_all(&dir).map_err(|e| CompileError::Setup(format!("{}: {e}", dir.display())))?;
+    let path = dir.join(".lock");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| CompileError::Setup(format!("{}: {e}", path.display())))?;
+    let mut warned = false;
+    loop {
+        match fetch::try_lock(&file) {
+            Ok(true) => return Ok(file),
+            Ok(false) => {
+                if !warned {
+                    eprintln!("waiting for another scpm command in this workspace to finish…");
+                    warned = true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(CompileError::Setup(format!("{}: {e}", path.display()))),
+        }
+    }
+}
+
+pub struct Toolchain<'a> {
+    pub ws: &'a Workspace,
+    pub lock: &'a Lockfile,
+    files: HashMap<String, PathBuf>,
+}
+
+impl<'a> Toolchain<'a> {
+    pub fn new(ws: &'a Workspace, lock: &'a Lockfile) -> Result<Toolchain<'a>, CompileError> {
+        let repos = coursier::repositories(&ws.repositories()).map_err(InstallError::from)?;
+        let cache = coursier::cache_dir();
+        let files = install::fetch_items(lock, &repos, &crate::credentials::CoursierCredentials::load(), &cache)?
+            .into_iter()
+            .map(|i| (i.key, i.dest))
+            .collect();
+        Ok(Toolchain { ws, lock, files })
+    }
+
+    pub fn file(&self, key: &str) -> PathBuf {
+        self.files[key].clone()
+    }
+
+    pub fn boot(&self, name: &str) -> Result<Vec<PathBuf>, CompileError> {
+        let keys = self.lock.boot.get(name).ok_or_else(|| {
+            CompileError::Setup(format!("the lockfile has no `{name}` boot entry; run `scpm install`"))
+        })?;
+        Ok(keys.iter().map(|k| self.file(k)).collect())
+    }
+
+    /// Classpath files of a variant, with upstream modules as their classes directories.
+    pub fn classpath(&self, id: &str, kind: ClasspathKind) -> Result<Vec<(Option<String>, PathBuf)>, CompileError> {
+        let vlock = self.lock.variants.get(id).ok_or_else(|| InstallError::Stale(vec![id.to_string()]))?;
+        Ok(kind
+            .entries(vlock)
+            .iter()
+            .map(|e| match e {
+                ClasspathEntry::Module { module } => (None, classes_dir(&self.ws.root, module)),
+                ClasspathEntry::Artifact(key) => (Some(key.clone()), self.file(key)),
+            })
+            .collect())
+    }
+
+    /// Classpath for the compile worker process itself.
+    pub fn worker_classpath(&self) -> Result<Vec<PathBuf>, CompileError> {
+        let mut cp = vec![worker::helper_jar("SCPM_WORKER_JAR", "scpm-compile-worker")?];
+        cp.extend(self.boot(&install::worker_boot())?);
+        Ok(cp)
+    }
+}
+
+fn is_scala_library(key: &str) -> bool {
+    key.starts_with("org.scala-lang:scala-library:") || key.starts_with("org.scala-lang:scala3-library_3:")
+}
+
+/// Source files under the variant's source directories, sorted.
+pub fn source_files(root: &Path, dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for dir in dirs {
+        let walker = ignore::WalkBuilder::new(root.join(dir)).standard_filters(false).hidden(true).build();
+        for entry in walker.flatten() {
+            let p = entry.path();
+            if p.is_file() && p.extension().is_some_and(|e| e == "scala" || e == "java") {
+                files.push(p.to_path_buf());
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// A schedulable unit: a variant's main or test sources.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Node {
+    variant: String,
+    test: bool,
+}
+
+impl Node {
+    fn main(variant: &str) -> Node {
+        Node { variant: variant.to_string(), test: false }
+    }
+
+    fn task(&self) -> String {
+        format!("{}#{}", self.variant, if self.test { "test-compile" } else { "compile" })
+    }
+}
+
+/// Everything needed to compile one node, in the worker's terms.
+struct Plan {
+    node: Node,
+    params: Value,
+    sources_empty: bool,
+    fingerprint: String,
+    classes: PathBuf,
+    analysis: PathBuf,
+    fingerprint_file: PathBuf,
+}
+
+/// Identity of the tools that produce the output (JDK, worker build), so switching either
+/// recompiles. Found without starting a JVM, so a no-op build stays JVM-free (design §3.2).
+fn tool_identity() -> Result<String, CompileError> {
+    let java = worker::java_identity()?;
+    let jar = worker::helper_jar("SCPM_WORKER_JAR", "scpm-compile-worker")?;
+    let meta = fs::metadata(&jar).map_err(|e| CompileError::Setup(format!("{}: {e}", jar.display())))?;
+    let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    Ok(format!("java {java}\nworker {} {} {mtime} {}\n", jar.display(), meta.len(), install::worker_boot()))
+}
+
+/// `upstream`: fingerprints of the main nodes this node depends on.
+fn plan(tc: &Toolchain, node: &Node, upstream: &[String], tools: &str) -> Result<Plan, CompileError> {
+    let ws = tc.ws;
+    let v = ws.variant(&node.variant).expect("scheduled nodes are variants");
+    let scala = install::compiler_scala(ws, v);
+    let (src_dirs, kind, classes_name, analysis_name, fp_name) = if node.test {
+        (&v.test_sources, ClasspathKind::TestCompile, "test-classes", "test-analysis.zip", "test-fingerprint")
+    } else {
+        (&v.sources, ClasspathKind::Compile, "classes", "analysis.zip", "fingerprint")
+    };
+    let out_dir = ws.root.join(".scpm/out").join(&v.id);
+    let classes = out_dir.join(classes_name);
+    let sources = source_files(&ws.root, src_dirs);
+    let mut classpath: Vec<(Option<String>, PathBuf)> = tc.classpath(&v.id, kind)?;
+    if node.test {
+        classpath.insert(0, (None, classes_dir(&ws.root, &v.id)));
+    }
+
+    let mut scalac_options = v.scalac_options.clone();
+    let vlock = &tc.lock.variants[&v.id];
+    for key in &vlock.compiler_plugins {
+        scalac_options.push(format!("-Xplugin:{}", tc.file(key).display()));
+    }
+    let mut javac_options = v.javac_options.clone();
+    // The release target defaults to the project JDK (design §6.3).
+    let release = v.release.clone().or_else(|| ws.config.toolchain.jdk.as_deref().and_then(install::jdk_major));
+    if let Some(release) = &release {
+        javac_options.extend(["--release".to_string(), release.clone()]);
+        if let Some(s) = &v.scala {
+            if s.binary == "3" {
+                scalac_options.extend(["-java-output-version".to_string(), release.clone()]);
+            } else {
+                scalac_options.push(format!("-release:{release}"));
+            }
+        }
+    }
+
+    // The fingerprint covers everything that can change the output; equal fingerprints let us
+    // skip the worker entirely.
+    let mut h = Sha256::new();
+    // The variant's own compiler bridge (its boot name carries the Zinc version for Scala 2).
+    h.update(format!("v2\n{}\n{scala}\n{}\n{tools}", node.task(), install::bridge_boot(&scala)));
+    for f in &sources {
+        let meta = fs::metadata(f).map_err(|e| CompileError::Setup(format!("{}: {e}", f.display())))?;
+        let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+        h.update(format!("src {} {} {mtime}\n", f.display(), meta.len()));
+    }
+    for (key, path) in &classpath {
+        h.update(format!("cp {}\n", key.clone().unwrap_or_else(|| path.display().to_string())));
+    }
+    for up in upstream {
+        h.update(format!("up {up}\n"));
+    }
+    h.update(format!("scalac {scalac_options:?}\njavac {javac_options:?}\n"));
+    let fingerprint = fetch::hex(&h.finalize());
+
+    // The Scala library goes to the worker separately (after hashing, so a library change
+    // still changes the fingerprint).
+    let library: Vec<PathBuf> = if v.scala.is_some() {
+        classpath.iter().filter(|(k, _)| k.as_deref().is_some_and(is_scala_library)).map(|(_, p)| p.clone()).collect()
+    } else {
+        Vec::new()
+    };
+    classpath.retain(|(k, _)| !k.as_deref().is_some_and(is_scala_library));
+    let analysis = out_dir.join(analysis_name);
+    let cache = coursier::cache_dir();
+    // Upstream modules' analyses let Zinc see their API changes (like sbt's inter-project
+    // lookup) instead of treating their classes directories as opaque libraries.
+    let upstream_analyses: Vec<Value> = classpath
+        .iter()
+        .filter(|(key, _)| key.is_none())
+        .filter_map(|(_, dir)| {
+            let out = dir.parent()?;
+            Some(json!({"classesDir": dir, "analysisFile": out.join("analysis.zip")}))
+        })
+        .collect();
+    let params = json!({
+        "target": node.task(),
+        "scalaVersion": scala,
+        "scalaCompilerClasspath": tc.boot(&format!("scala-compiler@{scala}"))?,
+        "scalaLibraryClasspath": library,
+        "compilerBridge": tc.boot(&install::bridge_boot(&scala))?.first().cloned().unwrap_or_default(),
+        "sources": sources,
+        "classpath": classpath.iter().map(|(_, p)| p).collect::<Vec<_>>(),
+        "classesDir": classes,
+        "analysisFile": analysis,
+        "scalacOptions": scalac_options,
+        "javacOptions": javac_options,
+        "rootPaths": {"WS": ws.root, "CACHE": cache},
+        "upstreamAnalyses": upstream_analyses,
+    });
+    Ok(Plan {
+        node: node.clone(),
+        params,
+        sources_empty: sources.is_empty(),
+        fingerprint,
+        classes,
+        analysis,
+        fingerprint_file: out_dir.join(fp_name),
+    })
+}
+
+/// Converts a worker diagnostic event to the run schema (workspace-relative paths).
+fn diagnostic(root: &Path, task: &str, e: &Value) -> Diagnostic {
+    let severity = match e["severity"].as_str() {
+        Some("error") => Severity::Error,
+        Some("warning") => Severity::Warning,
+        _ => Severity::Info,
+    };
+    let file = e["file"].as_str().map(|f| {
+        let p = Path::new(f);
+        p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/")
+    });
+    let pos = |v: &Value| Position { line: v["line"].as_u64().unwrap_or(0), col: v["col"].as_u64().unwrap_or(0) };
+    let range =
+        e.get("range").filter(|r| r.is_object()).map(|r| Range { start: pos(&r["start"]), end: pos(&r["end"]) });
+    Diagnostic {
+        task: task.to_string(),
+        severity,
+        file,
+        range,
+        code: e["code"].as_str().map(str::to_string),
+        message: e["message"].as_str().unwrap_or_default().to_string(),
+        rendered: e["rendered"].as_str().map(str::to_string),
+        actions: e["actions"].as_array().cloned().unwrap_or_default(),
+    }
+}
+
+/// Lazily started worker shared by the compile tasks of one command.
+pub struct WorkerHandle<'a> {
+    tc: &'a Toolchain<'a>,
+    reporter: Arc<Reporter>,
+    /// The worker, or why it couldn't start (not retried within one command).
+    worker: Mutex<Option<Result<Arc<Worker>, String>>>,
+}
+
+impl<'a> WorkerHandle<'a> {
+    pub fn new(tc: &'a Toolchain<'a>, reporter: Arc<Reporter>) -> Self {
+        WorkerHandle { tc, reporter, worker: Mutex::new(None) }
+    }
+
+    fn get(&self) -> Result<Arc<Worker>, String> {
+        let mut slot = self.worker.lock().expect("worker slot");
+        if let Some(w) = slot.as_ref() {
+            return w.clone();
+        }
+        let started = self.start().map_err(|e| e.to_string());
+        *slot = Some(started.clone());
+        started
+    }
+
+    fn start(&self) -> Result<Arc<Worker>, CompileError> {
+        let root = self.tc.ws.root.clone();
+        let reporter = self.reporter.clone();
+        let classpath = self.tc.worker_classpath()?;
+        let log = root.join(".scpm/logs/worker.log");
+        let w = Worker::spawn(&classpath, "scpm.worker.Main", Some(&log), move |event| {
+            if event["t"] == "diagnostic" {
+                let task = event["target"].as_str().unwrap_or_default();
+                reporter.emit(Event::Diagnostic(diagnostic(&root, task, &event)));
+            }
+        })?;
+        Ok(Arc::new(w))
+    }
+
+    pub fn shutdown(self) {
+        if let Some(Ok(w)) = self.worker.into_inner().expect("worker slot")
+            && let Ok(w) = Arc::try_unwrap(w)
+        {
+            w.shutdown();
+        }
+    }
+}
+
+/// Compiles `targets` (and what they depend on) in dependency order: main sources only, or
+/// main and test sources when `with_tests`. Returns whether everything compiled.
+pub fn compile(
+    tc: &Toolchain,
+    graph: &Graph,
+    targets: &BTreeSet<String>,
+    with_tests: bool,
+    worker: &WorkerHandle,
+) -> Result<bool, CompileError> {
+    // Main nodes depend on their compile-scope upstream; test nodes depend on their own main
+    // node and on the main nodes of their test-compile upstream. Test-scope workspace edges
+    // only ever point from a test node to main nodes, so this graph has no cycles even when
+    // the module graph has test-scope cycles.
+    let deps_of = |node: &Node| -> Vec<Node> {
+        let main_nodes = |kind| -> Vec<Node> {
+            install::upstream_variants(graph, &node.variant, kind).iter().map(|u| Node::main(u)).collect()
+        };
+        if node.test {
+            let mut d = vec![Node::main(&node.variant)];
+            d.extend(main_nodes(ClasspathKind::TestCompile));
+            d
+        } else {
+            main_nodes(ClasspathKind::Compile)
+        }
+    };
+    let mut deps: BTreeMap<Node, Vec<Node>> = BTreeMap::new();
+    let mut frontier: Vec<Node> = targets.iter().map(|t| Node::main(t)).collect();
+    if with_tests {
+        frontier.extend(
+            targets
+                .iter()
+                .filter(|t| tc.ws.variant(t).is_some_and(|v| !source_files(&tc.ws.root, &v.test_sources).is_empty()))
+                .map(|t| Node { variant: t.clone(), test: true }),
+        );
+    }
+    while let Some(node) = frontier.pop() {
+        if deps.contains_key(&node) {
+            continue;
+        }
+        let d = deps_of(&node);
+        frontier.extend(d.iter().cloned());
+        deps.insert(node, d);
+    }
+    // Queue in dependency order: main nodes by the graph's order, then test nodes.
+    let position: HashMap<&str, usize> = graph.order.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+    let mut order: Vec<Node> = deps.keys().cloned().collect();
+    order.sort_by_key(|n| (n.test, position.get(n.variant.as_str()).copied().unwrap_or(usize::MAX)));
+    let tools = tool_identity()?;
+
+    // Scheduler state: finished fingerprints (None = failed or skipped).
+    let done: Mutex<BTreeMap<Node, Option<String>>> = Mutex::new(BTreeMap::new());
+    let changed = Condvar::new();
+    let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
+    let queue: Mutex<Vec<Node>> = Mutex::new(order.into_iter().rev().collect());
+    let first_error: Mutex<Option<CompileError>> = Mutex::new(None);
+
+    std::thread::scope(|s| {
+        for _ in 0..parallelism {
+            s.spawn(|| {
+                loop {
+                    // Take a queued node whose dependencies have all finished.
+                    let node = {
+                        let mut q = queue.lock().expect("queue");
+                        loop {
+                            if q.is_empty() {
+                                return;
+                            }
+                            let d = done.lock().expect("done");
+                            if let Some(pos) = q.iter().rposition(|n| deps[n].iter().all(|u| d.contains_key(u))) {
+                                break q.remove(pos);
+                            }
+                            drop(q);
+                            drop(changed.wait(d).expect("condvar"));
+                            q = queue.lock().expect("queue");
+                        }
+                    };
+                    let upstream: Option<Vec<String>> = {
+                        let d = done.lock().expect("done");
+                        deps[&node].iter().map(|u| d[u].clone()).collect()
+                    };
+                    // A panic must not leave the other threads waiting forever.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &upstream {
+                        None => {
+                            worker.reporter.emit(Event::TaskEnd {
+                                task: node.task(),
+                                status: TaskStatus::Skipped,
+                                duration_ms: 0,
+                                message: None,
+                            });
+                            Ok(None)
+                        }
+                        Some(ups) => plan(tc, &node, ups, &tools).and_then(|p| compile_plan(&p, worker)),
+                    }));
+                    let result = match outcome {
+                        Ok(Ok(fp)) => fp,
+                        Ok(Err(e)) => {
+                            first_error.lock().expect("error").get_or_insert(e);
+                            None
+                        }
+                        Err(_) => {
+                            first_error.lock().expect("error").get_or_insert(CompileError::Setup(format!(
+                                "internal error while building {}",
+                                node.task()
+                            )));
+                            None
+                        }
+                    };
+                    done.lock().expect("done").insert(node, result);
+                    changed.notify_all();
+                }
+            });
+        }
+    });
+    if let Some(e) = first_error.into_inner().expect("error") {
+        return Err(e);
+    }
+    Ok(done.into_inner().expect("done").values().all(Option::is_some))
+}
+
+/// Compiles one node; returns its fingerprint, or `None` if it didn't compile.
+fn compile_plan(plan: &Plan, worker: &WorkerHandle) -> Result<Option<String>, CompileError> {
+    let task = plan.node.task();
+    let end = |status: TaskStatus, duration_ms: u64, message: Option<String>| {
+        worker.reporter.emit(Event::TaskEnd { task: task.clone(), status, duration_ms, message });
+    };
+    if fs::read_to_string(&plan.fingerprint_file).is_ok_and(|old| old == plan.fingerprint) && plan.classes.is_dir() {
+        end(TaskStatus::UpToDate, 0, None);
+        return Ok(Some(plan.fingerprint.clone()));
+    }
+    if plan.sources_empty {
+        // Nothing to compile: make sure no output from deleted sources lingers.
+        let _ = fs::remove_dir_all(&plan.classes);
+        let _ = fs::remove_file(&plan.analysis);
+        fs::create_dir_all(&plan.classes).map_err(|e| CompileError::Setup(e.to_string()))?;
+        let _ = fs::write(&plan.fingerprint_file, &plan.fingerprint);
+        end(TaskStatus::Ok, 0, Some("no sources".into()));
+        return Ok(Some(plan.fingerprint.clone()));
+    }
+    worker.reporter.emit(Event::TaskStart { task: task.clone() });
+    let started = Instant::now();
+    let response = worker.get().map_err(WorkerError::Setup).and_then(|w| w.request("compile", plan.params.clone()));
+    let elapsed = started.elapsed().as_millis() as u64;
+    let result = match response {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = fs::remove_file(&plan.fingerprint_file);
+            end(TaskStatus::Crashed, elapsed, Some(e.to_string()));
+            return Ok(None);
+        }
+    };
+    let status = match result["status"].as_str() {
+        Some("ok") => TaskStatus::Ok,
+        Some("failed") => TaskStatus::Failed,
+        Some("cancelled") => TaskStatus::Cancelled,
+        _ => TaskStatus::Crashed,
+    };
+    if status == TaskStatus::Ok {
+        let _ = fs::write(&plan.fingerprint_file, &plan.fingerprint);
+    } else {
+        let _ = fs::remove_file(&plan.fingerprint_file);
+    }
+    end(status, elapsed, result["message"].as_str().map(str::to_string));
+    Ok((status == TaskStatus::Ok).then(|| plan.fingerprint.clone()))
+}

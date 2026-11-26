@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
         with:
-          install_args: rust coursier
+          install_args: rust coursier java sbt
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test
@@ -57,6 +57,16 @@ jobs:
           restore-keys: |
             coursier-${{ matrix.shard }}-
             coursier-
+      # The worker jars depend only on worker/, so a cache hit lets the shards skip sbt.
+      - id: worker-jars
+        uses: actions/cache@v4
+        with:
+          path: worker/target/out/jvm
+          key: worker-jars-${{ hashFiles('worker/**') }}
+      - name: Build the JVM helpers
+        if: steps.worker-jars.outputs.cache-hit != 'true'
+        working-directory: worker
+        run: sbt -batch package
       - run: cargo nextest run --no-fail-fast --partition hash:${{ matrix.shard }}/4
       - run: cargo test --doc
         if: matrix.shard == 1
