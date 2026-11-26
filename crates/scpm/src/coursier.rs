@@ -746,8 +746,12 @@ fn add_common_args(
         }
     }
     let mut missing_credentials = Vec::new();
-    let properties =
-        credential_properties(repos, &|var| env::var(var).ok(), &CoursierCredentials::load(), &mut missing_credentials);
+    let properties = credential_properties(
+        repos,
+        &|var| env::var(var).ok(),
+        &CoursierCredentials::load(),
+        &mut missing_credentials,
+    )?;
     // NamedTempFile is created with mode 0600 on Unix.
     let mut file = tempfile::Builder::new()
         .prefix("scpm-credentials-")
@@ -792,12 +796,52 @@ fn credentials_env_value(path: &Path) -> String {
 /// The credentials file for `cs`: each repository's configured credentials, scoped to its
 /// origin, then coursier's own entries restricted to scpm's plain-HTTP policy.
 /// `lookup` reads the environment variables configured credentials name.
+///
+/// `cs` matches credentials by scheme, host and port only, so two download URLs on one origin
+/// that need different credentials (or one none) can't be kept apart: that is an error naming
+/// both, never a guess about which credentials to send (design §5.9).
 fn credential_properties(
     repos: &[Repo],
     lookup: &dyn Fn(&str) -> Option<String>,
     coursier: &CoursierCredentials,
     missing: &mut Vec<String>,
-) -> String {
+) -> Result<String, CoursierError> {
+    // What `cs` would send to each repository: its readable credentials, else nothing.
+    let resolved: Vec<(&Repo, Option<Auth>, bool)> = repos
+        .iter()
+        .map(|repo| match repo.auth_with(lookup) {
+            Ok(auth) => (repo, auth, false),
+            Err(e) => {
+                missing.push(e.to_string());
+                (repo, None, true)
+            }
+        })
+        .collect();
+    for (i, (a, a_auth, a_unreadable)) in resolved.iter().enumerate() {
+        let Some(origin) = a.origin() else { continue };
+        let clash = resolved[..i]
+            .iter()
+            .find(|(b, b_auth, _)| b.origin().is_some_and(|o| o.eq_ignore_ascii_case(origin)) && b_auth != a_auth);
+        if let Some((b, b_auth, b_unreadable)) = clash {
+            let has = |auth: &Option<Auth>, unreadable: bool| match (auth, unreadable) {
+                (Some(_), _) => "credentials",
+                (None, true) => "credentials that can't be read",
+                (None, false) => "no credentials",
+            };
+            let (b_has, a_has) = (has(b_auth, *b_unreadable), has(a_auth, *a_unreadable));
+            return Err(CoursierError::Config(format!(
+                "repositories `{}` ({}, {}) and `{}` ({}, {}) are reached at the same origin {origin} with different credentials; \
+                 coursier scopes credentials by scheme, host and port only, so scpm won't guess which to send\n  \
+                 help: give both the same credentials, or reach one of them through another host or port",
+                b.id,
+                b.fetch_url(),
+                b_has,
+                a.id,
+                a.fetch_url(),
+                a_has,
+            )));
+        }
+    }
     let mut properties = String::new();
     let mut entry = |prefix: String, host: &str, user: &str, password: &str, extra: &[(&str, String)]| {
         properties.push_str(&format!(
@@ -810,17 +854,17 @@ fn credential_properties(
             properties.push_str(&format!("{prefix}.{key}={}\n", escape_property(value)));
         }
     };
-    for (i, repo) in repos.iter().enumerate() {
-        let Some(origin) = repo.origin() else { continue };
-        match repo.auth_with(lookup) {
-            // `scheme://host[:port]` scopes the credentials to the repository's scheme, host and
-            // port (coursier 2.1.27 ignores `https-only` for a host with a scheme).
-            Ok(Some(auth)) => {
-                entry(format!("scpm{i}"), origin, auth.user(), auth.password(), &[("auto", "true".into())])
-            }
-            Ok(None) => {}
-            Err(e) => missing.push(e.to_string()),
+    let mut written: Vec<&str> = Vec::new();
+    for (i, (repo, auth, _)) in resolved.iter().enumerate() {
+        let (Some(origin), Some(auth)) = (repo.origin(), auth) else { continue };
+        // `scheme://host[:port]` scopes the credentials to the repository's scheme, host and
+        // port (coursier 2.1.27 ignores `https-only` for a host with a scheme). Every
+        // repository on an origin has the same credentials (checked above): write them once.
+        if written.iter().any(|w| w.eq_ignore_ascii_case(origin)) {
+            continue;
         }
+        written.push(origin);
+        entry(format!("scpm{i}"), origin, auth.user(), auth.password(), &[("auto", "true".into())]);
     }
     let allowed = coursier.restricted(&insecure_credential_origins(repos));
     for (i, c) in allowed.entries.iter().enumerate() {
@@ -830,7 +874,7 @@ fn credential_properties(
         }
         entry(format!("coursier{i}"), &c.host_spec(), &c.user, &c.password, &extra);
     }
-    properties
+    Ok(properties)
 }
 
 /// Escapes a value for a Java properties file.
@@ -1020,12 +1064,73 @@ mod tests {
         }];
         let lookup = |var: &str| (var == "REPO_TOKEN").then(|| "tok3n".to_string());
         let mut missing = Vec::new();
-        let text = credential_properties(&repos, &lookup, &CoursierCredentials::default(), &mut missing);
+        let text = credential_properties(&repos, &lookup, &CoursierCredentials::default(), &mut missing).unwrap();
         assert!(missing.is_empty(), "{missing:?}");
         let parsed = crate::credentials::CoursierCredentials { entries: crate::credentials::parse_properties(&text) };
         assert_eq!(parsed.find("https://repo.example:8443/maven/x.jar").unwrap().password, "tok3n");
         assert!(parsed.find("https://repo.example/maven/x.jar").is_none(), "another port");
         assert!(parsed.find("https://repo.example:9443/maven/x.jar").is_none(), "another port");
+    }
+
+    #[test]
+    fn one_origin_with_different_credentials_is_an_error() {
+        let token = |var: &str| Some(RepoCredentials::Bearer { token: Secret::Env(var.into()) });
+        let repo = |id: &str, url: &str, credentials: Option<RepoCredentials>| Repo {
+            id: id.into(),
+            url: url.into(),
+            credentials,
+            ..Default::default()
+        };
+        let lookup = |var: &str| match var {
+            "TOKEN_A" => Some("secret-a".to_string()),
+            "TOKEN_B" => Some("secret-b".to_string()),
+            "SAME_AS_A" => Some("secret-a".to_string()),
+            _ => None,
+        };
+        let props =
+            |repos: &[Repo]| credential_properties(repos, &lookup, &CoursierCredentials::default(), &mut Vec::new());
+
+        // GitHub Packages: two path-scoped tokens on one origin.
+        let err = props(&[
+            repo("orgA", "https://maven.pkg.github.com/orgA/", token("TOKEN_A")),
+            repo("orgB", "https://maven.pkg.github.com/orgB/", token("TOKEN_B")),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("https://maven.pkg.github.com/orgA/") && err.contains("https://maven.pkg.github.com/orgB/"),
+            "{err}"
+        );
+        assert!(err.contains("same origin https://maven.pkg.github.com"), "{err}");
+        assert!(!err.contains("secret-"), "{err}");
+
+        // A repository's credentials must not reach another repository's mirror on its origin.
+        let mirrored = Repo {
+            mirror: Some(Mirror { url: "https://acme.example/mirror/".into(), matched: "*".into() }),
+            ..repo("central", CENTRAL_URL, None)
+        };
+        let err =
+            props(&[repo("acme", "https://acme.example/maven/", token("TOKEN_A")), mirrored]).unwrap_err().to_string();
+        assert!(err.contains("https://acme.example/mirror/") && err.contains("no credentials"), "{err}");
+
+        // Credentials that can't be read count as none being sent, but say so.
+        let err = props(&[
+            repo("a", "https://h.example/a/", token("UNSET")),
+            repo("b", "https://h.example/b/", token("TOKEN_B")),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("credentials that can't be read"), "{err}");
+
+        // Unambiguous: the same credentials on one origin (written once), or other ports.
+        let text = props(&[
+            repo("orgA", "https://maven.pkg.github.com/orgA/", token("TOKEN_A")),
+            repo("orgB", "https://maven.pkg.github.com/orgB/", token("SAME_AS_A")),
+            repo("other", "https://maven.pkg.github.com:8443/m/", token("TOKEN_B")),
+            repo("plain", "https://elsewhere.example/m/", None),
+        ])
+        .unwrap();
+        assert_eq!(text.matches(".host=").count(), 2, "{text}");
     }
 
     fn repo_with(credentials: Credentials) -> Result<Vec<Repo>, CoursierError> {
@@ -1073,7 +1178,7 @@ mod tests {
             ),
         };
         let parse = |repos: &[Repo]| {
-            let text = credential_properties(repos, &|_| None, &coursier, &mut Vec::new());
+            let text = credential_properties(repos, &|_| None, &coursier, &mut Vec::new()).unwrap();
             crate::credentials::CoursierCredentials { entries: crate::credentials::parse_properties(&text) }
         };
         let closed = parse(&[repo("http://nexus.local:8081/m/", false)]);
