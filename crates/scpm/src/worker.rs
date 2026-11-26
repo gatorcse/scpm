@@ -447,6 +447,11 @@ impl Worker {
         WorkerError::Exited(format!("{} exited unexpectedly{status}{}", self.name, tail_context(&self.stderr_tail)))
     }
 
+    /// Whether the process is still running.
+    pub fn is_alive(&self) -> bool {
+        self.child.lock().is_ok_and(|mut c| matches!(c.try_wait(), Ok(None)))
+    }
+
     /// Kills the process (and its process group, if it has its own) and fails pending
     /// requests with `reason` right away, without waiting for stdout to close (a grandchild
     /// may keep it open).

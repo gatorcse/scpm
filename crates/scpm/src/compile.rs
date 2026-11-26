@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -298,6 +299,18 @@ fn plan(tc: &Toolchain, node: &Node, upstream: &[String], tools: &str) -> Result
     })
 }
 
+/// Makes the edit paths of a quick-fix action workspace-relative.
+fn relative_edits(root: &Path, mut action: Value) -> Value {
+    if let Some(edits) = action.get_mut("edits").and_then(Value::as_array_mut) {
+        for edit in edits {
+            if let Some(file) = edit["file"].as_str().map(Path::new).and_then(|f| f.strip_prefix(root).ok()) {
+                edit["file"] = file.to_string_lossy().replace('\\', "/").into();
+            }
+        }
+    }
+    action
+}
+
 /// Converts a worker diagnostic event to the run schema (workspace-relative paths).
 fn diagnostic(root: &Path, task: &str, e: &Value) -> Diagnostic {
     let severity = match e["severity"].as_str() {
@@ -320,38 +333,51 @@ fn diagnostic(root: &Path, task: &str, e: &Value) -> Diagnostic {
         code: e["code"].as_str().map(str::to_string),
         message: e["message"].as_str().unwrap_or_default().to_string(),
         rendered: e["rendered"].as_str().map(str::to_string),
-        actions: e["actions"].as_array().cloned().unwrap_or_default(),
+        actions: e["actions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| relative_edits(root, a))
+            .collect(),
     }
 }
 
-/// Lazily started worker shared by the compile tasks of one command.
-pub struct WorkerHandle<'a> {
-    tc: &'a Toolchain<'a>,
-    reporter: Arc<Reporter>,
-    /// The worker, or why it couldn't start (not retried within one command).
-    worker: Mutex<Option<Result<Arc<Worker>, String>>>,
+/// Where worker events go for the command currently using the worker.
+#[derive(Default)]
+struct Route {
+    reporter: Option<Arc<Reporter>>,
+    root: PathBuf,
 }
 
-impl<'a> WorkerHandle<'a> {
-    pub fn new(tc: &'a Toolchain<'a>, reporter: Arc<Reporter>) -> Self {
-        WorkerHandle { tc, reporter, worker: Mutex::new(None) }
-    }
+/// A compile worker that can outlive one command (the MCP server and, later, the daemon keep
+/// it warm). Commands using one slot must not overlap.
+#[derive(Default)]
+pub struct WorkerSlot {
+    worker: Mutex<Option<(Vec<PathBuf>, Arc<Worker>)>>,
+    route: Arc<Mutex<Route>>,
+    cancelled: AtomicBool,
+}
 
-    fn get(&self) -> Result<Arc<Worker>, String> {
-        let mut slot = self.worker.lock().expect("worker slot");
-        if let Some(w) = slot.as_ref() {
-            return w.clone();
+impl WorkerSlot {
+    /// The running worker for `classpath`, starting (or restarting) it if needed.
+    fn get(&self, classpath: Vec<PathBuf>, log: &Path) -> Result<Arc<Worker>, CompileError> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(CompileError::Setup("cancelled".into()));
         }
-        let started = self.start().map_err(|e| e.to_string());
-        *slot = Some(started.clone());
-        started
-    }
-
-    fn start(&self) -> Result<Arc<Worker>, CompileError> {
-        let root = self.tc.ws.root.clone();
-        let reporter = self.reporter.clone();
-        let classpath = self.tc.worker_classpath()?;
-        let log = root.join(".scpm/logs/worker.log");
+        let mut slot = self.worker.lock().expect("worker slot");
+        if let Some((cp, w)) = slot.as_ref()
+            && *cp == classpath
+            && w.is_alive()
+        {
+            return Ok(w.clone());
+        }
+        if let Some((_, old)) = slot.take()
+            && let Ok(old) = Arc::try_unwrap(old)
+        {
+            old.shutdown();
+        }
+        let route = self.route.clone();
         let spec = worker::Spawn {
             name: "the compile worker",
             classpath: &classpath,
@@ -359,24 +385,95 @@ impl<'a> WorkerHandle<'a> {
             jvm_options: &[],
             env: Vec::new(),
             cwd: None,
-            log_file: Some(&log),
+            log_file: Some(log),
             initialize: true,
             own_process_group: false,
         };
-        let w = Worker::spawn(spec, move |event| {
-            if event["t"] == "diagnostic" {
-                let task = event["target"].as_str().unwrap_or_default();
-                reporter.emit(Event::Diagnostic(diagnostic(&root, task, &event)));
+        let w = Arc::new(Worker::spawn(spec, move |event| {
+            if event["t"] != "diagnostic" {
+                return;
             }
-        })?;
-        Ok(Arc::new(w))
+            let route = route.lock().expect("route");
+            if let Some(reporter) = route.reporter.as_ref() {
+                let task = event["target"].as_str().unwrap_or_default();
+                reporter.emit(Event::Diagnostic(diagnostic(&route.root, task, &event)));
+            }
+        })?);
+        *slot = Some((classpath, w.clone()));
+        Ok(w)
     }
 
-    pub fn shutdown(self) {
-        if let Some(Ok(w)) = self.worker.into_inner().expect("worker slot")
+    /// Cancels the current command (e.g. a cancelled MCP call): in-flight compiles fail with
+    /// `reason`, and no worker is (re)started until [`WorkerSlot::reset_cancel`].
+    pub fn cancel(&self, reason: &str) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Some((_, w)) = self.worker.lock().expect("worker slot").as_ref() {
+            w.kill(reason);
+        }
+    }
+
+    /// Allows the next command to use (and start) the worker again.
+    pub fn reset_cancel(&self) {
+        self.cancelled.store(false, Ordering::SeqCst);
+    }
+
+    /// Stops the worker, if one is running.
+    pub fn shutdown(&self) {
+        if let Some((_, w)) = self.worker.lock().expect("worker slot").take()
             && let Ok(w) = Arc::try_unwrap(w)
         {
             w.shutdown();
+        }
+    }
+}
+
+/// One command's view of a worker slot: routes the worker's events to this command's reporter.
+pub struct WorkerHandle<'a> {
+    tc: &'a Toolchain<'a>,
+    reporter: Arc<Reporter>,
+    slot: Arc<WorkerSlot>,
+    owned: bool,
+    /// Why the worker couldn't start (not retried within one command).
+    failed: Mutex<Option<String>>,
+}
+
+impl<'a> WorkerHandle<'a> {
+    /// A worker that lives only for this command.
+    pub fn new(tc: &'a Toolchain<'a>, reporter: Arc<Reporter>) -> Self {
+        Self::shared(tc, reporter, Arc::new(WorkerSlot::default()), true)
+    }
+
+    /// Uses `slot`'s worker (starting it if needed); leaves it running afterwards unless
+    /// `owned`.
+    pub fn shared(tc: &'a Toolchain<'a>, reporter: Arc<Reporter>, slot: Arc<WorkerSlot>, owned: bool) -> Self {
+        {
+            let mut route = slot.route.lock().expect("route");
+            route.reporter = Some(reporter.clone());
+            route.root = tc.ws.root.clone();
+        }
+        WorkerHandle { tc, reporter, slot, owned, failed: Mutex::new(None) }
+    }
+
+    fn get(&self) -> Result<Arc<Worker>, String> {
+        let mut failed = self.failed.lock().expect("failed");
+        if let Some(e) = failed.as_ref() {
+            return Err(e.clone());
+        }
+        let started = self
+            .tc
+            .worker_classpath()
+            .and_then(|cp| self.slot.get(cp, &self.tc.ws.root.join(".scpm/logs/worker.log")))
+            .map_err(|e| e.to_string());
+        if let Err(e) = &started {
+            *failed = Some(e.clone());
+        }
+        started
+    }
+
+    pub fn shutdown(self) {
+        self.slot.route.lock().expect("route").reporter = None;
+        if self.owned {
+            self.slot.shutdown();
         }
     }
 }
@@ -537,11 +634,13 @@ fn compile_plan(plan: &Plan, worker: &WorkerHandle) -> Result<Option<String>, Co
         end(TaskStatus::UpToDate, 0, None);
         return Ok(Some(plan.fingerprint.clone()));
     }
+    let diagnostics_file = plan.fingerprint_file.with_extension("diagnostics.json");
     if plan.sources_empty {
         // Nothing to compile: make sure no output from deleted sources lingers.
         remove_stale(&plan.fingerprint_file, false)?;
         remove_stale(&plan.analysis, false)?;
         remove_stale(&plan.classes, true)?;
+        remove_stale(&diagnostics_file, false)?;
         fs::create_dir_all(&plan.classes).map_err(|e| CompileError::Setup(e.to_string()))?;
         let _ = fs::write(&plan.fingerprint_file, &plan.fingerprint);
         end(TaskStatus::Ok, 0, Some("no sources".into()));
@@ -569,6 +668,15 @@ fn compile_plan(plan: &Plan, worker: &WorkerHandle) -> Result<Option<String>, Co
         let _ = fs::write(&plan.fingerprint_file, &plan.fingerprint);
     } else {
         let _ = fs::remove_file(&plan.fingerprint_file);
+    }
+    // The task's current diagnostics (warnings stay valid while it is up to date); the MCP
+    // `diagnostics` tool reads these.
+    // Without the ANSI rendering (agents read these), written atomically.
+    let diagnostics: Vec<Diagnostic> =
+        worker.reporter.diagnostics_for(&task).into_iter().map(|d| Diagnostic { rendered: None, ..d }).collect();
+    let tmp = diagnostics_file.with_extension(format!("tmp-{}", std::process::id()));
+    if fs::write(&tmp, serde_json::to_vec(&diagnostics).unwrap_or_default()).is_ok() {
+        let _ = fs::rename(&tmp, &diagnostics_file);
     }
     end(status, elapsed, result["message"].as_str().map(str::to_string));
     Ok((status == TaskStatus::Ok).then(|| plan.fingerprint.clone()))

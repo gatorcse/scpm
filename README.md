@@ -31,6 +31,11 @@ Milestones land as a stack of PRs; see [docs/roadmap.md](docs/roadmap.md).
   a timeout, JUnit XML in `.scpm/out/<id>/test-reports/`, failures as GitHub annotations
   and in `--json`. `scpm run <module> [--main X] -- args` runs a main class and passes its
   exit code through.
+- **M5:** `scpm mcp` serves the Model Context Protocol on stdio. Its tools are `compile`,
+  `test`, `diagnostics`, `ls`, `graph`, `config`, `install`, `why` and `classpath`, and
+  its resources are `scpm://workspace` and `scpm://run/latest`. Results are compact: a
+  green compile lists no tasks, and lists are capped with `more` counts. One compile
+  worker stays warm across calls.
 
 ## Development
 

@@ -39,8 +39,11 @@ pub struct Diagnostic {
     pub task: String,
     pub severity: Severity,
     /// Workspace-relative, `/`-separated; `None` for global diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<Range>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,6 +135,8 @@ pub enum Mode {
     Text,
     Github,
     Json,
+    /// Collect and log only; the caller uses the returned summary (the MCP server).
+    Quiet,
 }
 
 impl Mode {
@@ -147,6 +152,8 @@ impl Mode {
     }
 }
 
+/// Observer of emitted events.
+type Listener = Box<dyn Fn(&Event) + Send + Sync>;
 /// Most lines of a task's output kept while it runs (older ones are dropped from the terminal
 /// view; the event log keeps everything).
 const MAX_BUFFERED_LINES: usize = 5_000;
@@ -160,6 +167,8 @@ pub struct Reporter {
     color: bool,
     /// Prefix that makes workspace-relative paths repository-relative for annotations.
     repo_prefix: String,
+    /// Observer of every event (the MCP server sends progress notifications from it).
+    listener: Mutex<Option<Listener>>,
     /// Print task output immediately rather than per task at its end.
     stream_logs: std::sync::atomic::AtomicBool,
 }
@@ -187,6 +196,7 @@ impl Reporter {
             state: Mutex::new(State::default()),
             color: mode == Mode::Text && io::stderr().is_terminal(),
             repo_prefix: repo_prefix(root),
+            listener: Mutex::new(None),
             stream_logs: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -196,7 +206,20 @@ impl Reporter {
         matches!(self.mode, Mode::Text | Mode::Github)
     }
 
+    /// Calls `f` for every event emitted from now on.
+    pub fn set_listener(&self, f: impl Fn(&Event) + Send + Sync + 'static) {
+        *self.listener.lock().expect("listener") = Some(Box::new(f));
+    }
+
+    /// Diagnostics reported so far for `task`.
+    pub fn diagnostics_for(&self, task: &str) -> Vec<Diagnostic> {
+        self.state.lock().expect("state").diagnostics.iter().filter(|d| d.task == task).cloned().collect()
+    }
+
     pub fn emit(&self, event: Event) {
+        if let Some(f) = self.listener.lock().expect("listener").as_ref() {
+            f(&event);
+        }
         if let Some(log) = self.log.lock().expect("log").as_mut() {
             let _ = serde_json::to_writer(&mut *log, &event);
             let _ = log.write_all(b"\n");
@@ -306,7 +329,7 @@ impl Reporter {
     /// Finishes the run: writes `latest.ndjson`, then the mode-specific summary. An `error`
     /// (a command failure that isn't a task result) is part of the summary, so JSON output stays
     /// a single document.
-    pub fn finish(&self, command: &str, ok: bool, duration_ms: u64, error: Option<&str>) {
+    pub fn finish(&self, command: &str, ok: bool, duration_ms: u64, error: Option<&str>) -> serde_json::Value {
         self.emit(Event::RunEnd { ok, duration_ms });
         drop(self.log.lock().expect("log").take());
         if let Some(path) = &self.log_path {
@@ -316,6 +339,7 @@ impl Reporter {
         let errors = state.diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
         let warnings = state.diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
         let tests = TestCounts::of(&state.tests);
+        let doc = summary_doc(&state, command, ok, duration_ms, error);
         match self.mode {
             Mode::Text | Mode::Github => {
                 if let Some(e) = error {
@@ -343,7 +367,7 @@ impl Reporter {
                     state.tasks.len()
                 );
             }
-            Mode::Json => {}
+            Mode::Json | Mode::Quiet => {}
         }
         match self.mode {
             Mode::Github => {
@@ -372,53 +396,60 @@ impl Reporter {
                     .collect();
                 github::emit(&diags, &tests, &state.tasks, command, ok, error)
             }
-            Mode::Json => {
-                let tasks: Vec<_> = state
-                    .tasks
-                    .iter()
-                    .map(|(task, status, ms, message)| {
-                        let mut t = serde_json::json!({"task": task, "status": status, "durationMs": ms});
-                        if let Some(m) = message {
-                            t["message"] = m.clone().into();
-                        }
-                        t
-                    })
-                    .collect();
-                // The compiler's ANSI `rendered` text stays in the event log; JSON output is
-                // for machines and agents, so keep it compact.
-                let diagnostics: Vec<Diagnostic> =
-                    state.diagnostics.iter().cloned().map(|d| Diagnostic { rendered: None, ..d }).collect();
-                let mut doc = serde_json::json!({
-                    "ok": ok, "command": command, "durationMs": duration_ms,
-                    "tasks": tasks, "diagnostics": diagnostics,
-                    "errors": errors, "warnings": warnings,
-                });
-                if tests.total() > 0 || command == "test" {
-                    // Failures only (without stack traces); passing cases are in the event log.
-                    let failures: Vec<TestCase> = state
-                        .tests
-                        .iter()
-                        .filter(|t| t.is_failure())
-                        .cloned()
-                        .map(|mut t| {
-                            if let Some(f) = t.failure.as_mut() {
-                                f.stack_trace = None;
-                            }
-                            t
-                        })
-                        .collect();
-                    doc["tests"] = serde_json::json!({
-                        "passed": tests.passed, "failed": tests.failed, "skipped": tests.skipped, "failures": failures,
-                    });
-                }
-                if let Some(e) = error {
-                    doc["error"] = e.into();
-                }
-                println!("{}", serde_json::to_string_pretty(&doc).expect("json"));
-            }
-            Mode::Text => {}
+            Mode::Json => println!("{}", serde_json::to_string_pretty(&doc).expect("json")),
+            Mode::Text | Mode::Quiet => {}
         }
+        doc
     }
+}
+
+/// The compact JSON summary of a run (for `--json` and the MCP server).
+fn summary_doc(state: &State, command: &str, ok: bool, duration_ms: u64, error: Option<&str>) -> serde_json::Value {
+    let errors = state.diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
+    let warnings = state.diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
+    let tests = TestCounts::of(&state.tests);
+    let tasks: Vec<_> = state
+        .tasks
+        .iter()
+        .map(|(task, status, ms, message)| {
+            let mut t = serde_json::json!({"task": task, "status": status, "durationMs": ms});
+            if let Some(m) = message {
+                t["message"] = m.clone().into();
+            }
+            t
+        })
+        .collect();
+    // The compiler's ANSI `rendered` text stays in the event log; JSON output is
+    // for machines and agents, so keep it compact.
+    let diagnostics: Vec<Diagnostic> =
+        state.diagnostics.iter().cloned().map(|d| Diagnostic { rendered: None, ..d }).collect();
+    let mut doc = serde_json::json!({
+        "ok": ok, "command": command, "durationMs": duration_ms,
+        "tasks": tasks, "diagnostics": diagnostics,
+        "errors": errors, "warnings": warnings,
+    });
+    if tests.total() > 0 || command == "test" {
+        // Failures only (without stack traces); passing cases are in the event log.
+        let failures: Vec<TestCase> = state
+            .tests
+            .iter()
+            .filter(|t| t.is_failure())
+            .cloned()
+            .map(|mut t| {
+                if let Some(f) = t.failure.as_mut() {
+                    f.stack_trace = None;
+                }
+                t
+            })
+            .collect();
+        doc["tests"] = serde_json::json!({
+            "passed": tests.passed, "failed": tests.failed, "skipped": tests.skipped, "failures": failures,
+        });
+    }
+    if let Some(e) = error {
+        doc["error"] = e.into();
+    }
+    doc
 }
 
 #[derive(Debug, Default, Clone, Copy)]

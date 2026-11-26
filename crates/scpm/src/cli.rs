@@ -102,6 +102,8 @@ pub enum Command {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// Serve the Model Context Protocol on stdio for agents (keeps a compile worker warm).
+    Mcp,
     /// Explain why an artifact is on the classpath (`org::name`, `org:name_3` or `name`).
     Why { artifact: String },
     /// Print a variant's classpath (installs first if the lockfile is stale).
@@ -436,6 +438,10 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 Err(e) => Err(Failure::Command(e.to_string())),
             }
         }
+        Command::Mcp => {
+            crate::mcp::Server::new(start).serve().map_err(|e| Failure::Command(e.to_string()))?;
+            Ok(())
+        }
         Command::Why { artifact } => {
             let (ws, graph) = load(&start)?;
             let (lock, install_notices) = ensure_installed(&ws, &graph, false)?;
@@ -573,7 +579,7 @@ fn load(start: &std::path::Path) -> Result<(Workspace, Graph), Failure> {
 /// Install-before-run (design §5.4): re-lock and fetch as needed (frozen in CI), then read the lock.
 /// Warnings and notices are printed on stderr; the notices are returned too, for `--json` reports.
 fn ensure_installed(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<(Lockfile, Vec<String>), Failure> {
-    let summary = install::install(ws, graph, InstallOptions { frozen: frozen || in_ci(), verify: false })?;
+    let (lock, summary) = install::ensure(ws, graph, frozen)?;
     for w in &summary.warnings {
         eprintln!("warning: {w}");
     }
@@ -583,9 +589,6 @@ fn ensure_installed(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<(Lock
     if !summary.relocked.is_empty() || summary.fetch.downloaded > 0 {
         eprintln!("installed: {} re-locked, {} downloaded", summary.relocked.len(), summary.fetch.downloaded);
     }
-    let lock = Lockfile::read(&ws.root)
-        .map_err(|e| Failure::Command(e.to_string()))?
-        .ok_or_else(|| Failure::Command("no scpm-lock.yaml; run `scpm install`".into()))?;
     Ok((lock, summary.notices))
 }
 
@@ -601,7 +604,7 @@ fn run_id() -> String {
 
 /// CI mode (implied `--frozen`) is `CI=true` (any case: AppVeyor sets `True`).
 fn in_ci() -> bool {
-    std::env::var("CI").is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+    install::in_ci()
 }
 
 fn print_install_summary(s: &InstallSummary) -> io::Result<()> {
