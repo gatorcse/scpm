@@ -40,14 +40,26 @@ pub enum CoursierError {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Repo {
     pub id: String,
-    /// Always ends with `/`.
+    /// Always ends with `/`. What the lock and its inputs hash know the repository by.
     pub url: String,
-    /// Credentials sent to [`Self::fetch_url`]: the workspace's, else the user config's
-    /// (design §5.9). Coursier's own credentials are looked up separately.
+    /// The user config mirror that replaces `url` for downloads (design §5.9).
+    pub mirror: Option<Mirror>,
+    /// Credentials sent to [`Self::fetch_url`]: the workspace's (unless mirrored), else the user
+    /// config's (design §5.9). Coursier's own credentials are looked up separately.
     pub credentials: Option<RepoCredentials>,
     pub credentials_from: CredentialsFrom,
-    /// `allowInsecureCredentials`: credentials may go to this `http://` repository's origin.
+    /// `allowInsecureCredentials`: credentials may go to this `http://` repository's origin
+    /// (its mirror's, when mirrored).
     pub allow_insecure_credentials: bool,
+}
+
+/// A mirror applied to a repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mirror {
+    /// Ends with `/`.
+    pub url: String,
+    /// The `mirrorOf` entry that matched: the repository id, a URL prefix, or `*`.
+    pub matched: String,
 }
 
 /// Where a repository's credentials are configured.
@@ -175,11 +187,17 @@ impl Auth {
 }
 
 impl Repo {
-    /// `scheme://host[:port]` of the URL.
+    /// Where artifacts are downloaded from: the mirror's URL, else the repository's. Ends with `/`.
+    pub fn fetch_url(&self) -> &str {
+        self.mirror.as_ref().map_or(&self.url, |m| &m.url)
+    }
+
+    /// `scheme://host[:port]` of [`Self::fetch_url`]: where credentials are sent.
     pub fn origin(&self) -> Option<&str> {
-        let (scheme, rest) = self.url.split_once("://")?;
+        let url = self.fetch_url();
+        let (scheme, rest) = url.split_once("://")?;
         let authority = rest.split('/').next().unwrap_or(rest);
-        Some(&self.url[..scheme.len() + 3 + authority.len()])
+        Some(&url[..scheme.len() + 3 + authority.len()])
     }
 
     /// The configured credentials, read from the environment. A missing or empty variable is
@@ -282,11 +300,12 @@ pub(crate) fn is_plain_http(url: &str) -> bool {
 }
 
 /// The origins (`http://host[:port]`) of plain-HTTP repositories that opted in to receiving
-/// credentials (`allowInsecureCredentials`); credentials go over plain HTTP nowhere else.
+/// credentials (`allowInsecureCredentials`); credentials go over plain HTTP nowhere else. A
+/// mirrored repository is reached at its mirror's origin, so that is the one opted in.
 pub fn insecure_credential_origins(repos: &[Repo]) -> Vec<String> {
     repos
         .iter()
-        .filter(|r| r.allow_insecure_credentials && is_plain_http(&r.url))
+        .filter(|r| r.allow_insecure_credentials && is_plain_http(r.fetch_url()))
         .filter_map(|r| r.origin().map(str::to_string))
         .collect()
 }
@@ -699,8 +718,13 @@ const UNSEALED_ENV: &[&str] = &["COURSIER_EXTRA_MIRRORS", "COURSIER_REPOSITORIES
 /// regardless, so it is removed). `COURSIER_MAVEN_SETTINGS=false` turns off Maven `settings.xml`.
 fn add_common_args(cmd: &mut Command, repos: &[Repo], cache: &Path) -> Result<CommonArgs, CoursierError> {
     cmd.arg("--cache").arg(cache).arg("--no-default").arg("--user-agent").arg(user_agent());
+    // Mirrors already applied, so `cs` asks the mirror directly; once per URL.
+    let mut urls: Vec<&str> = Vec::new();
     for repo in repos {
-        cmd.arg("--repository").arg(&repo.url);
+        if !urls.contains(&repo.fetch_url()) {
+            urls.push(repo.fetch_url());
+            cmd.arg("--repository").arg(repo.fetch_url());
+        }
     }
     let mut missing_credentials = Vec::new();
     let properties =

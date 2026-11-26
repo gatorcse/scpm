@@ -558,6 +558,58 @@ fn user_config_credentials_reach_cs_and_the_fetcher() {
 }
 
 #[test]
+fn mirrors_serve_both_paths_and_never_reach_the_lock() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    let real = Server::maven(hello_repo_files(b"hello jar"), None);
+    let mirrored: std::collections::HashMap<String, Vec<u8>> =
+        hello_repo_files(b"hello jar").into_iter().map(|(p, b)| (p.replace("/maven/", "/mirror/"), b)).collect();
+    let mirror = Server::maven(mirrored, Some(("alice", "mirror-pass")));
+    let manifest =
+        format!("repositories:\n  - {{id: local, url: '{}', allowInsecureCredentials: true}}\n", real.url("/maven"));
+    let deps = "dependencies:\n  com.example:hello: '1.0'\n";
+    let plain = tempfile::tempdir().unwrap();
+    java_workspace(plain.path(), &manifest, deps);
+    scpm(plain.path(), tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    let real_requests = real.requests.lock().unwrap().len();
+    assert!(real_requests > 0);
+
+    // The same workspace through a mirror; its credentials are matched against the mirror's URL.
+    let ws = tempfile::tempdir().unwrap();
+    java_workspace(ws.path(), &manifest, deps);
+    let config = ws.path().join("user-config.yaml");
+    fs::write(
+        &config,
+        format!(
+            "mirrors:\n  - {{url: '{m}', mirrorOf: [local]}}\ncredentials:\n  - {{url: '{m}', user: alice, password: 'env:MIRROR_PASS'}}\n",
+            m = mirror.url("/mirror")
+        ),
+    )
+    .unwrap();
+    let with_mirror = |cache: &Path| {
+        let mut cmd = scpm(ws.path(), cache);
+        cmd.env("SCPM_CONFIG", &config).env("MIRROR_PASS", "mirror-pass");
+        cmd
+    };
+    with_mirror(tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    assert_eq!(
+        fs::read(ws.path().join("scpm-lock.yaml")).unwrap(),
+        fs::read(plain.path().join("scpm-lock.yaml")).unwrap(),
+        "the lock is byte-identical with and without the mirror"
+    );
+    // A restore downloads from the mirror too, into the mirror's place in coursier's cache.
+    let empty = tempfile::tempdir().unwrap();
+    with_mirror(empty.path()).args(["install", "--frozen"]).assert().success();
+    let jar = empty
+        .path()
+        .join(format!("http/alice%40127.0.0.1%3A{}/mirror/com/example/hello/1.0/hello-1.0.jar", mirror.port));
+    assert_eq!(fs::read(&jar).unwrap(), b"hello jar");
+    assert!(mirror.count("/mirror/com/example/hello/1.0/hello-1.0.jar") >= 2, "both paths used the mirror");
+    assert_eq!(real.requests.lock().unwrap().len(), real_requests, "the repository itself is never asked");
+}
+
+#[test]
 fn concurrent_installs_all_succeed() {
     if !cs_available() {
         return;

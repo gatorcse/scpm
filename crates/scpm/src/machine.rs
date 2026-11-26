@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::coursier::{self, CredentialsFrom, Repo, RepoCredentials, Secret};
+use crate::coursier::{self, CredentialsFrom, Mirror, Repo, RepoCredentials, Secret};
 use crate::diag::{Diagnostic, Diagnostics};
 
 /// Names the user config file, replacing the default location.
@@ -204,10 +204,38 @@ impl Machine {
         self.credentials.iter().filter(|c| c.target.covers(&target)).max_by_key(|c| c.target.path.len())
     }
 
-    /// Applies the machine settings to the workspace's repositories (design §5.9): a repository
-    /// without workspace credentials gets the user config's for its URL. Over plain HTTP that
-    /// needs the repository's `allowInsecureCredentials`.
+    /// The mirror for `repo`: the first whose `mirrorOf` names its id or a prefix of its URL,
+    /// else the first for `*`.
+    pub fn mirror_for(&self, repo: &Repo) -> Option<Mirror> {
+        let named = |p: &str| {
+            if p.contains("://") {
+                let prefix =
+                    if p.ends_with('/') { p.to_ascii_lowercase() } else { format!("{}/", p.to_ascii_lowercase()) };
+                repo.url.to_ascii_lowercase().starts_with(&prefix)
+            } else {
+                p == repo.id
+            }
+        };
+        let found = self
+            .mirrors
+            .iter()
+            .find_map(|m| m.mirror_of.iter().find(|p| *p != "*" && named(p)).map(|p| (m, p)))
+            .or_else(|| self.mirrors.iter().find_map(|m| m.mirror_of.iter().find(|p| *p == "*").map(|p| (m, p))))?;
+        (found.0.url != repo.url).then(|| Mirror { url: found.0.url.clone(), matched: found.1.clone() })
+    }
+
+    /// Applies the machine settings to the workspace's repositories (design §5.9):
+    /// - a mirror replaces the repository's URL for downloads (never in the lock);
+    /// - a mirrored repository's workspace credentials are not sent to the mirror;
+    /// - a repository without workspace credentials gets the user config's for its download URL.
+    ///   Over plain HTTP that needs the repository's `allowInsecureCredentials`.
     pub fn apply(&self, mut repos: Vec<Repo>) -> Vec<Repo> {
+        for repo in &mut repos {
+            repo.mirror = self.mirror_for(repo);
+            if repo.mirror.is_some() && repo.credentials_from == CredentialsFrom::Workspace {
+                repo.credentials = None;
+            }
+        }
         let insecure = coursier::insecure_credential_origins(&repos);
         for repo in &mut repos {
             if repo.credentials.is_some() {
@@ -223,9 +251,9 @@ impl Machine {
 
     /// The user config credential that applies to `repo`, if the plain-HTTP policy allows it.
     fn user_credential(&self, repo: &Repo, insecure_origins: &[String]) -> Option<&UserCredential> {
-        let c = self.credential_for(&repo.url)?;
-        let allowed = !coursier::is_plain_http(&repo.url)
-            || origin_of(&repo.url).is_some_and(|o| insecure_origins.iter().any(|i| i.eq_ignore_ascii_case(o)));
+        let c = self.credential_for(repo.fetch_url())?;
+        let allowed = !coursier::is_plain_http(repo.fetch_url())
+            || repo.origin().is_some_and(|o| insecure_origins.iter().any(|i| i.eq_ignore_ascii_case(o)));
         allowed.then_some(c)
     }
 
@@ -234,7 +262,7 @@ impl Machine {
         if repo.credentials.is_some() && repo.credentials_from == CredentialsFrom::Workspace {
             return None;
         }
-        let c = self.credential_for(&repo.url)?;
+        let c = self.credential_for(repo.fetch_url())?;
         let insecure = coursier::insecure_credential_origins(repos);
         if self.user_credential(repo, &insecure).is_some() {
             return None;
@@ -372,13 +400,6 @@ fn check_url(url: &str) -> Result<UrlParts, String> {
     }
 }
 
-/// `scheme://host[:port]` of a URL, as written.
-fn origin_of(url: &str) -> Option<&str> {
-    let (scheme, rest) = url.split_once("://")?;
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    Some(&url[..scheme.len() + 3 + authority.len()])
-}
-
 /// The file's permission bits when group or others may read it (Unix only).
 #[cfg(unix)]
 fn group_or_other_readable(path: &Path) -> Option<u32> {
@@ -490,6 +511,46 @@ mod tests {
         // Missing variables are reported with where they were configured.
         let err = repos[0].auth().unwrap_err().to_string();
         assert!(err.contains("`ACME`") && err.contains("user config entry for https://acme.example"), "{err}");
+    }
+
+    #[test]
+    fn mirrors_match_ids_then_url_prefixes_then_everything() {
+        let m = machine(
+            "mirrors:\n\
+             \x20 - {url: 'https://all.example/m', mirrorOf: ['*']}\n\
+             \x20 - {url: 'https://central.example/m/', mirrorOf: [central]}\n\
+             \x20 - {url: 'https://acme-mirror.example/m', mirrorOf: ['https://ACME.example/maven']}\n\
+             \x20 - {url: 'https://self.example/m', mirrorOf: [self]}\n\
+             credentials:\n\
+             \x20 - {url: 'https://acme.example', token: 'env:ACME'}\n\
+             \x20 - {url: 'https://central.example', user: alice, password: 'env:CENTRAL'}\n",
+        )
+        .unwrap();
+        let repo = |id: &str, url: &str| Repo { id: id.into(), url: url.into(), ..Default::default() };
+        let declared = Repo {
+            credentials: Some(RepoCredentials::Bearer { token: Secret::Env("DECLARED".into()) }),
+            ..repo("declared", "https://declared.example/m/")
+        };
+        let repos = m.apply(vec![
+            repo("central", "https://repo1.maven.org/maven2/"),
+            repo("acme", "https://acme.example/maven/releases/"),
+            repo("other", "https://other.example/m/"),
+            repo("self", "https://self.example/m/"),
+            declared,
+        ]);
+        let mirror = |i: usize| repos[i].mirror.as_ref().map(|m| (m.url.as_str(), m.matched.as_str()));
+        assert_eq!(mirror(0), Some(("https://central.example/m/", "central")), "an id beats `*`");
+        assert_eq!(mirror(1), Some(("https://acme-mirror.example/m/", "https://ACME.example/maven")));
+        assert_eq!(mirror(2), Some(("https://all.example/m/", "*")));
+        assert_eq!(mirror(3), None, "a mirror of itself is no mirror");
+        assert_eq!(repos[0].fetch_url(), "https://central.example/m/");
+        assert_eq!(repos[0].url, "https://repo1.maven.org/maven2/", "the lock still sees the repository");
+        // Credentials are matched against the mirror's URL, not the repository's.
+        assert!(matches!(&repos[0].credentials, Some(RepoCredentials::Basic { .. })));
+        assert_eq!(repos[1].credentials, None, "acme's entry is not sent to its mirror");
+        // Workspace credentials never go to a mirror (another host).
+        assert_eq!(repos[4].mirror.as_ref().unwrap().url, "https://all.example/m/");
+        assert_eq!(repos[4].credentials, None);
     }
 
     #[test]

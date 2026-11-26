@@ -800,13 +800,13 @@ fn record_artifacts<'a>(
         }
         let repo = repo_for_url(repos, &a.url).ok_or_else(|| {
             InstallError::Resolve(format!(
-                "{} was downloaded from {}, which matches no configured repository",
+                "{} was downloaded from {}, which matches no configured repository or mirror",
                 a.key, a.url
             ))
         })?;
         let path = coursier::maven_path(&a.key)
             .ok_or_else(|| InstallError::Resolve(format!("coursier resolved an invalid artifact key `{}`", a.key)))?;
-        let expected = format!("{}{path}", repo.url);
+        let expected = format!("{}{path}", repo.fetch_url());
         if expected != a.url {
             return Err(InstallError::Resolve(format!(
                 "{}: unexpected repository layout (got {}, expected {expected}); snapshots and non-Maven layouts are not supported yet",
@@ -845,9 +845,17 @@ fn record_artifacts<'a>(
     Ok(())
 }
 
-/// The configured repository serving `url` (longest URL prefix wins).
+/// The configured repository serving `url`, matched against where it is downloaded from (its
+/// mirror, if any), so a mirror maps back to the repository id. The longest prefix wins; between
+/// repositories sharing a mirror, the first in resolution order.
 fn repo_for_url<'a>(repos: &'a [Repo], url: &str) -> Option<&'a Repo> {
-    repos.iter().filter(|r| url.starts_with(&r.url)).max_by_key(|r| r.url.len())
+    let mut best: Option<&Repo> = None;
+    for r in repos.iter().filter(|r| url.starts_with(r.fetch_url())) {
+        if best.is_none_or(|b| r.fetch_url().len() > b.fetch_url().len()) {
+            best = Some(r);
+        }
+    }
+    best
 }
 
 /// How the fetcher reaches a repository: its credentials (read lazily; an error only matters
@@ -878,8 +886,9 @@ fn repo_access(repo: &Repo, creds: &CoursierCredentials) -> RepoAccess {
     // scoped to a realm only apply after a challenge, so they don't name the cache directory.
     let basic =
         |c: &crate::credentials::CoursierCredential| Auth::Basic { user: c.user.clone(), password: c.password.clone() };
-    let challenge = creds.challenge_candidates(&repo.url).into_iter().map(|c| (c.realm.clone(), basic(c))).collect();
-    match creds.find(&repo.url) {
+    let url = repo.fetch_url();
+    let challenge = creds.challenge_candidates(url).into_iter().map(|c| (c.realm.clone(), basic(c))).collect();
+    match creds.find(url) {
         Some(c) => RepoAccess { auth: Ok(Some(basic(c))), challenge, cache_user: CacheUser::Known(c.user.clone()) },
         None => RepoAccess { auth: Ok(None), challenge, cache_user: CacheUser::Anonymous },
     }
@@ -909,7 +918,8 @@ pub fn fetch_items(
         let path = coursier::maven_path(key).ok_or_else(|| {
             InstallError::Resolve(format!("{} has an invalid artifact key `{key}`", crate::lockfile::LOCK_FILE))
         })?;
-        let url = format!("{}{path}", repo.url);
+        // The lock names the repository; a mirror only changes where the bytes come from.
+        let url = format!("{}{path}", repo.fetch_url());
         let bad_url = || InstallError::Resolve(format!("{key}: {url} has no place in the coursier cache"));
         let access = &access[repo.id.as_str()];
         let mut verify_cached = false;
@@ -1149,5 +1159,46 @@ mod tests {
         assert_eq!(repo_for_url(&repos, "https://h/maven/x.jar").unwrap().id, "b");
         assert_eq!(repo_for_url(&repos, "https://h/other/x.jar").unwrap().id, "a");
         assert!(repo_for_url(&repos, "https://elsewhere/x.jar").is_none());
+    }
+
+    #[test]
+    fn mirror_urls_map_back_to_repository_ids() {
+        let mirror = |url: &str| Some(coursier::Mirror { url: url.into(), matched: "*".into() });
+        let repos = vec![
+            Repo {
+                id: "central".into(),
+                url: "https://c/".into(),
+                mirror: mirror("https://m/all/"),
+                ..Default::default()
+            },
+            Repo {
+                id: "acme".into(),
+                url: "https://a/".into(),
+                mirror: mirror("https://m/all/"),
+                ..Default::default()
+            },
+            Repo {
+                id: "own".into(),
+                url: "https://o/".into(),
+                mirror: mirror("https://m/all/own/"),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(repo_for_url(&repos, "https://m/all/g/a/1/a-1.jar").unwrap().id, "central", "the first sharer");
+        assert_eq!(repo_for_url(&repos, "https://m/all/own/g/a/1/a-1.jar").unwrap().id, "own");
+        assert!(repo_for_url(&repos, "https://c/g/a/1/a-1.jar").is_none(), "not downloaded from the mirror");
+
+        // The lock records the repository id, and the fetcher downloads from the mirror.
+        let mut lock = Lockfile::default();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-1.jar");
+        std::fs::write(&file, b"jar").unwrap();
+        let resolved = ResolvedArtifact { key: "g:a:1".into(), file, url: "https://m/all/own/g/a/1/a-1.jar".into() };
+        record_artifacts(&mut lock, [&resolved], &repos).unwrap();
+        assert_eq!(lock.artifacts["g:a:1"].repo, "own");
+        lock.boot.insert("b".into(), vec!["g:a:1".into()]);
+        let items = fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c")).unwrap();
+        assert_eq!(items[0].url, "https://m/all/own/g/a/1/a-1.jar");
+        assert_eq!(items[0].dest, Path::new("/c/https/m/all/own/g/a/1/a-1.jar"));
     }
 }

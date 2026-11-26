@@ -808,6 +808,15 @@ The Rust fetcher gets the same resolved values: the same mirror URL, the same cr
      noProxy: [localhost, .example.com]
    ```
    Literal secrets are allowed, as in `credentials.properties`, but scpm warns when the file is readable by group or others. A credential for a mirror is matched against the mirror's URL, not the repository it replaces.
+
+   Details settled in the implementation:
+   - The file is parsed strictly (an unknown key is an error, like the workspace files); a missing file, even one `SCPM_CONFIG` names, means no settings. `scpm schema user-config` prints its JSON Schema.
+   - Item 1's `credentials` live on the repository definitions in `scpm-workspace.yaml`.
+   - When several credential entries match a URL, the longest path wins. A `file:` value is read without one trailing newline; `~` is the home directory and a relative path is relative to the user config's directory.
+   - A mirror whose `mirrorOf` names the repository's id or a prefix of its URL wins over one for `*`; otherwise the first entry wins.
+   - **A mirrored repository's workspace credentials are not sent to the mirror**, which is another host: they were declared for the repository. Its credentials are the user config's entry for the mirror's URL, else coursier's for the mirror's host.
+   - **Plain HTTP:** user config credentials for an `http://` URL need the repository's `allowInsecureCredentials`, as coursier's entries do (§5.7). For a mirrored repository the opt-in covers the mirror's scheme, host and port, the origin actually contacted, and nothing else.
+   - Repositories that share one mirror (`mirrorOf: ["*"]`) can't be told apart by URL; `cs` gets the mirror once and the lock records the first of them, in resolution order. Only an artifact that the first repository lacks is then recorded differently from a resolution without the mirror.
 3. **Compatibility imports**, read by scpm and put through the same policy: coursier's `COURSIER_CREDENTIALS` / `credentials.properties` (§5.7), and the standard `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` variables when the user config sets no proxy. People already have these for sbt and coursier, so they keep working, but scpm reports when it uses them.
 
 **Ignored on purpose:** Maven `settings.xml`, coursier's mirror files and variables, the Scala CLI config, and JVM proxy properties. They belong to other tools, live in places nobody looks (coursier's macOS config directory is `~/Library/Application Support/Coursier`), and reading them live is how the two paths drifted. When one of them configures something for a repository or host the current command uses, scpm prints one notice naming the file and the setting, and how to move it (`scpm config import maven` converts `settings.xml` mirrors, servers and proxies into the user config, once and explicitly). There is no notice for sources that don't touch the repositories in use.
