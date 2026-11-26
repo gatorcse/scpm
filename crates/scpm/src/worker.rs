@@ -96,19 +96,8 @@ fn detect_java() -> Result<Java, WorkerError> {
             Some((Path::new(&home).join("bin").join(exe), format!("${var}")))
         })
         .unwrap_or_else(|| (PathBuf::from(exe), "PATH".to_string()));
-    let out = Command::new(&path).arg("-version").output().map_err(|e| WorkerError::Spawn {
-        java: format!("{} (from {source})", path.display()),
-        message: format!("{e}; install a JDK {MIN_JAVA}+ or set SCPM_JAVA_HOME / JAVA_HOME"),
-    })?;
-    // `openjdk version "25.0.2" 2026-01-20` or `java version "1.8.0_402"`.
-    // The ` version "…"` line (other output, e.g. from JAVA_TOOL_OPTIONS, may contain quotes).
-    let text = String::from_utf8_lossy(&out.stderr);
-    let version = parse_java_version(&text).unwrap_or_default();
-    let major = match version.split(['.', '-', '+']).collect::<Vec<_>>().as_slice() {
-        ["1", minor, ..] => minor.parse().unwrap_or(0),
-        [major, ..] => major.parse().unwrap_or(0),
-        _ => 0,
-    };
+    let version = java_version(&path, &source)?;
+    let major = major_version(&version);
     if major < MIN_JAVA {
         return Err(WorkerError::Setup(format!(
             "{} (from {source}) is Java {}; scpm needs JDK {MIN_JAVA} or newer (set SCPM_JAVA_HOME)",
@@ -117,6 +106,88 @@ fn detect_java() -> Result<Java, WorkerError> {
         )));
     }
     Ok(Java { path, source, version, major })
+}
+
+/// The version `java -version` reports for `java`, read from its JDK's `release` file when it
+/// has a usable one (no JVM start); otherwise by running `java -version`.
+fn java_version(java: &Path, source: &str) -> Result<String, WorkerError> {
+    if let Some(version) = release_version(java) {
+        return Ok(version);
+    }
+    let out = Command::new(java).arg("-version").output().map_err(|e| WorkerError::Spawn {
+        java: format!("{} (from {source})", java.display()),
+        message: format!("{e}; install a JDK {MIN_JAVA}+ or set SCPM_JAVA_HOME / JAVA_HOME"),
+    })?;
+    // `openjdk version "25.0.2" 2026-01-20` or `java version "1.8.0_402"`.
+    // The ` version "…"` line (other output, e.g. from JAVA_TOOL_OPTIONS, may contain quotes).
+    let text = String::from_utf8_lossy(&out.stderr);
+    Ok(parse_java_version(&text).unwrap_or_default())
+}
+
+/// `25` from `25.0.2` or `25-ea`, `8` from `1.8.0_402`; 0 if there is no number.
+fn major_version(version: &str) -> u32 {
+    match version.split(['.', '-', '+']).collect::<Vec<_>>().as_slice() {
+        ["1", minor, ..] => minor.parse().unwrap_or(0),
+        [major, ..] => major.parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// The version in the `release` file of the JDK `java` belongs to: `<home>/release`, where
+/// `<home>/bin/java` is `java` with a bare name looked up on `PATH` (as spawning does) and
+/// symlinks resolved. `None` when `java` is not an executable in a `bin` directory or the file
+/// is missing or has no usable `JAVA_VERSION`; a wrapper script outside a JDK has none.
+fn release_version(java: &Path) -> Option<String> {
+    let java = if java.components().count() == 1 {
+        env::split_paths(&env::var_os("PATH")?).map(|d| d.join(java)).find(|p| runnable(p))?
+    } else {
+        java.to_path_buf()
+    };
+    let java = java.canonicalize().ok().filter(|p| runnable(p))?;
+    let bin = java.parent().filter(|b| b.file_name().is_some_and(|n| n == "bin"))?;
+    parse_release(&std::fs::read_to_string(bin.parent()?.join("release")).ok()?)
+}
+
+/// Whether spawning `p` can run it: an executable file.
+fn runnable(p: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        p.is_file()
+    }
+}
+
+/// What `java -version` would report, from a JDK `release` file: `JAVA_VERSION` (`25.0.2`,
+/// `21`, `1.8.0_402`; quoted or not), plus the pre-release tag that `java -version` shows and
+/// `JAVA_VERSION` omits (`25-ea`), taken from `JAVA_RUNTIME_VERSION` (`25-ea+3-2345`).
+/// `None` unless `JAVA_VERSION` starts with a version number.
+fn parse_release(text: &str) -> Option<String> {
+    let value = |key: &str| {
+        text.lines().find_map(|l| {
+            let v = l.trim().strip_prefix(key)?.trim_start().strip_prefix('=')?.trim();
+            let v = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(v);
+            Some(v.trim().to_string())
+        })
+    };
+    let version = value("JAVA_VERSION")?;
+    if major_version(&version) == 0 {
+        return None;
+    }
+    // JEP 223: `$VNUM(-$PRE)?(+$BUILD)?(-$OPT)?`; `java -version` prints `$VNUM(-$PRE)?`.
+    // Pre-9 strings (`1.8.0_402-b06`) have no `$PRE`.
+    let pre = value("JAVA_RUNTIME_VERSION").filter(|_| !version.starts_with("1.")).and_then(|full| {
+        let rest = full.split('+').next()?.strip_prefix(version.as_str())?.strip_prefix('-')?;
+        let pre = rest.split('-').next()?;
+        (!pre.is_empty() && pre.chars().all(|c| c.is_ascii_alphanumeric())).then(|| pre.to_string())
+    });
+    Some(match pre {
+        Some(pre) => format!("{version}-{pre}"),
+        None => version,
+    })
 }
 
 /// `25.0.2` from `openjdk version "25.0.2" 2026-01-20` (and `java -version` noise around it).
@@ -382,6 +453,64 @@ mod version_tests {
         let out = "Picked up JAVA_TOOL_OPTIONS: -Dfoo=\"bar baz\"\nopenjdk version \"25.0.2\" 2026-01-20 LTS\n";
         assert_eq!(parse_java_version(out).as_deref(), Some("25.0.2"));
         assert_eq!(parse_java_version("java version \"1.8.0_402\"").as_deref(), Some("1.8.0_402"));
+    }
+
+    #[test]
+    fn release_files_give_the_version_java_reports() {
+        use super::parse_release;
+        let v = parse_release;
+        assert_eq!(v("IMPLEMENTOR=\"Eclipse Adoptium\"\nJAVA_VERSION=\"25.0.5\"\n").as_deref(), Some("25.0.5"));
+        assert_eq!(v("JAVA_VERSION=\"17\"").as_deref(), Some("17"));
+        assert_eq!(v("JAVA_VERSION=\"21.0.2\"\r\n").as_deref(), Some("21.0.2"));
+        assert_eq!(v("JAVA_VERSION=25\n").as_deref(), Some("25"));
+        assert_eq!(
+            v("JAVA_VERSION=\"1.8.0_402\"\nJAVA_RUNTIME_VERSION=\"1.8.0_402-b06\"").as_deref(),
+            Some("1.8.0_402")
+        );
+        // `JAVA_VERSION_DATE` is not `JAVA_VERSION`.
+        assert_eq!(v("JAVA_VERSION_DATE=\"2026-01-20\"\nJAVA_VERSION=\"25.0.2\"").as_deref(), Some("25.0.2"));
+        // GA builds: `java -version` prints `JAVA_VERSION`; pre-release builds add the tag.
+        let ga = "JAVA_RUNTIME_VERSION=\"25.0.5.1+2-LTS\"\nJAVA_VERSION=\"25.0.5.1\"";
+        assert_eq!(v(ga).as_deref(), Some("25.0.5.1"));
+        assert_eq!(v("JAVA_VERSION=\"26\"\nJAVA_RUNTIME_VERSION=\"26-ea+3-2345\"").as_deref(), Some("26-ea"));
+        assert_eq!(
+            v("JAVA_VERSION=\"25\"\nJAVA_RUNTIME_VERSION=\"25-internal-adhoc.me.jdk\"").as_deref(),
+            Some("25-internal")
+        );
+        // Nothing usable: the caller runs `java -version`.
+        assert_eq!(v(""), None);
+        assert_eq!(v("JAVA_VERSION=\"\""), None);
+        assert_eq!(v("JAVA_VERSION=\"unknown\""), None);
+        assert_eq!(v("IMPLEMENTOR=\"x\""), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn java_version_reads_release_and_falls_back_to_the_probe() {
+        use super::java_version;
+        use std::os::unix::fs::PermissionsExt;
+        // A fake JDK whose `java` reports 21.0.3 when run.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("bin")).unwrap();
+        let java = home.path().join("bin/java");
+        std::fs::write(&java, "#!/bin/sh\necho 'openjdk version \"21.0.3\" 2024-04-16' >&2\n").unwrap();
+        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // No `release` file: the probe runs.
+        assert_eq!(java_version(&java, "$JAVA_HOME").unwrap(), "21.0.3");
+        // A `release` file without a usable `JAVA_VERSION`: still the probe.
+        std::fs::write(home.path().join("release"), "IMPLEMENTOR=\"x\"\n").unwrap();
+        assert_eq!(java_version(&java, "$JAVA_HOME").unwrap(), "21.0.3");
+        // With one, `java` is not started; also through a symlink from another `bin`.
+        std::fs::write(home.path().join("release"), "JAVA_VERSION=\"25.0.2\"\n").unwrap();
+        assert_eq!(java_version(&java, "$JAVA_HOME").unwrap(), "25.0.2");
+        let link = tempfile::tempdir().unwrap();
+        std::fs::create_dir(link.path().join("bin")).unwrap();
+        std::os::unix::fs::symlink(&java, link.path().join("bin/java")).unwrap();
+        assert_eq!(java_version(&link.path().join("bin/java"), "$JAVA_HOME").unwrap(), "25.0.2");
+        // A non-executable `java` is not trusted: spawning reports it as before.
+        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = java_version(&java, "$JAVA_HOME").unwrap_err().to_string();
+        assert!(err.contains("(from $JAVA_HOME)"), "{err}");
     }
 
     #[test]
