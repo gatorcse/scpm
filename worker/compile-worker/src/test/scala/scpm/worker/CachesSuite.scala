@@ -101,9 +101,32 @@ class CachesSuite extends munit.FunSuite:
 
     undeletable.write(file, emptyAnalysis(dir))
     assert(undeletable.read(file).isDefined, "a successful write makes it readable again")
-    assert(!Files.exists(marker) && !Files.exists(marker.getParent))
+    assert(!Files.exists(marker))
     assert(AnalysisCache().read(file).isDefined)
     assertEquals(Files.readString(neighbour), "another target")
+  }
+
+  dir.test("AnalysisCache keeps a sibling's marker, and the marker directory, when its own write succeeds") { dir =>
+    val a = dir.resolve("a.zip")
+    val b = dir.resolve("b.zip")
+    val analyses = AnalysisCache(delete = _ => throw java.io.IOException("cannot delete"))
+    analyses.write(a, emptyAnalysis(dir))
+    analyses.write(b, emptyAnalysis(dir))
+    val markerA = AnalysisCache.marker(Validation.canonical(a))
+    val markerB = AnalysisCache.marker(Validation.canonical(b))
+
+    intercept[IllegalStateException](analyses.write(b, unwritable))
+    analyses.write(b, emptyAnalysis(dir))
+    assert(!Files.exists(markerB))
+    // A failed write elsewhere in this directory may be between creating it and its marker.
+    assert(Files.isDirectory(markerB.getParent), "a successful write leaves the marker directory")
+
+    intercept[IllegalStateException](analyses.write(a, unwritable))
+    intercept[IllegalStateException](analyses.write(b, unwritable))
+    analyses.write(b, emptyAnalysis(dir))
+    assert(Files.exists(markerA), "a's marker survives b's successful write")
+    assertEquals(AnalysisCache().read(a), None)
+    assert(AnalysisCache().read(b).isDefined)
   }
 
   dir.test("AnalysisCache forgets an analysis whose rewrite failed in a read-only directory") { dir =>

@@ -32,8 +32,10 @@ final class AnalysisCache(capacity: Int = 64, delete: Path => Unit = Files.delet
    * Writes `contents` to `file`. If that fails, the class files are already in place, so an older
    * analysis in `file` would not match them: [[read]] returns none for `file` until a write
    * succeeds. `file` is deleted, or, if it cannot be, an invalid marker is left for it (see
-   * [[AnalysisCache.marker]]), so a restarted worker does not read it either. The next compile starts from an empty classes
-   * directory.
+   * [[AnalysisCache.marker]]), so a restarted worker does not read it either. The next compile
+   * starts from an empty classes directory. A successful write removes only its own marker, never
+   * the marker directory, which other analysis files in the same directory may be creating
+   * markers in.
    */
   def write(file: Path, contents: AnalysisContents): Unit =
     val canonical = key(file)
@@ -54,11 +56,8 @@ final class AnalysisCache(capacity: Int = 64, delete: Path => Unit = Files.delet
               case m: IOException                => e.addSuppressed(m)
         throw e
     // If the marker cannot go, reads keep returning none: the next compile is a full one.
-    try
-      if Files.deleteIfExists(marker) then
-        Files.deleteIfExists(marker.getParent)
-        ()
-    catch case _: IOException => () // also a directory other markers keep
+    try Files.deleteIfExists(marker)
+    catch case _: IOException => ()
     invalid.remove(canonical)
     cache.put(file, contents)
 
