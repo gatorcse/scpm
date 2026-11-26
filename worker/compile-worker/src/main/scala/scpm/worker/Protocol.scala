@@ -85,6 +85,23 @@ object CompileParams:
   // Otherwise an omitted `sources` would compile nothing and delete every class file.
   given JsonValueCodec[CompileParams] = JsonCodecMaker.make(CodecMakerConfig.withTransientEmpty(false).withRequireCollectionFields(true))
 
+  /** The required lists as sent: jsoniter decodes a JSON `null` list as empty, this as `None`. */
+  private final case class RequiredLists(
+      sources: Option[List[String]] = None,
+      scalaCompilerClasspath: Option[List[String]] = None,
+      scalaLibraryClasspath: Option[List[String]] = None
+  )
+  private given JsonValueCodec[RequiredLists] = JsonCodecMaker.make
+
+  /** Problems with compile params that decoding lets through: a `null` required list. */
+  def nullLists(raw: RawJson): List[String] =
+    val lists = raw.decode[RequiredLists]
+    List(
+      "sources" -> lists.sources,
+      "scalaCompilerClasspath" -> lists.scalaCompilerClasspath,
+      "scalaLibraryClasspath" -> lists.scalaLibraryClasspath
+    ).collect { case (field, None) => s"$field: must be an array, not null" }
+
 enum CompileStatus:
   @named("ok") case Ok
   @named("failed") case Failed

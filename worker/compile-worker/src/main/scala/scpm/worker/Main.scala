@@ -78,7 +78,7 @@ final class Server(out: Output, compiler: CompileService, exit: Int => Unit):
             )
         case "compile" =>
           val params = request.params.decode[CompileParams]
-          Validation.compile(params) match
+          CompileParams.nullLists(request.params) ++ Validation.compile(params) match
             case Nil      => startCompile(id, params)
             case problems => out.error(Some(id), "bad_request", problems.mkString("; "))
         case "cancel" =>

@@ -68,17 +68,17 @@ belong to. Unknown fields must be ignored by both sides (forward compatibility).
 | `scalaLibraryClasspath` | string[] | The library jars that belong on the user classpath (scala-library, scala3-library). |
 | `compilerBridge` | string | Binary bridge jar: `org.scala-lang:scala3-sbt-bridge:<scalaVersion>` for Scala 3, `org.scala-sbt:compiler-bridge_2.13:<zinc version>` for 2.13. |
 | `sources` | string[] | Absolute paths to `.scala` and `.java` files. |
-| `classpath` | string[] | Dependency jars plus upstream modules' classes dirs, in order. Excludes the scala library (added from `scalaLibraryClasspath`) and `classesDir` (the worker puts it first). |
+| `classpath` | string[]? | Dependency jars plus upstream modules' classes dirs, in order. Excludes the scala library (added from `scalaLibraryClasspath`) and `classesDir` (the worker puts it first). |
 | `classesDir` | string | Output directory. Created if missing. |
 | `analysisFile` | string | Zinc analysis store path. Missing → full compile. |
-| `scalacOptions` | string[] | |
-| `javacOptions` | string[] | |
+| `scalacOptions` | string[]? | |
+| `javacOptions` | string[]? | |
 | `javaHome` | string? | For javac; defaults to the worker's JVM. |
 | `rootPaths` | object? | Portable-analysis markers, e.g. `{"WS": "/abs/ws", "CACHE": "/abs/coursier/cache"}`. When present, analysis is written with paths relative to these roots (`${WS}/src/A.scala`); paths under no root stay absolute. Events always carry absolute paths. |
 | `upstreamAnalyses` | object[]? | `[{"classesDir": "/abs/core/classes", "analysisFile": "/abs/core/analysis.zip"}]`: one entry per workspace module whose classes dir is on `classpath`. `analysisFile` may not exist yet. The worker gives Zinc these analyses (as sbt does between projects), so an API change or a removed class upstream invalidates the sources that use it. Upstream must be compiled before its dependents, so its analysis matches its classes dir; an analysis whose classes dir or any recorded class file is missing is ignored. Without an entry, a classes dir is treated like a jar: its class files are compared by name, size and modification time. |
 
-Fields without `?` are required, lists included (`"sources": []` is allowed; an omitted
-`sources` is not). All paths must be absolute. The request is checked before it is queued: a missing compiler,
+Fields without `?` are required, lists included: `"sources": []` is allowed, an omitted or
+`null` `sources` is not. Optional lists default to empty. All paths must be absolute. The request is checked before it is queued: a missing compiler,
 library or bridge jar, a missing source, a relative path, or a source inside `classesDir` (after
 resolving `.`, `..` and symbolic links) is a `bad_request` naming the field and path.
 

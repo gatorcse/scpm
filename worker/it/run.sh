@@ -334,6 +334,9 @@ send compile "$(compile_params bad@jvm-3 "$SCALA3" "$BAD" "" "{\"compilerBridge\
 expect "a jar that is not a compiler bridge crashes the compile" "$(await "$ID")" '.result.status == "crashed"'
 compile core@jvm-3 "$SCALA3" "$S3"
 expect "the worker keeps serving after a crash" "$R" '.result.status == "ok"'
+send compile "$(compile_params core@jvm-3 "$SCALA3" "$S3" "" '{"sources": null}')"
+expect "a null sources list is a bad request, not an empty compile" "$(await "$ID")" \
+  '.error.code == "bad_request" and (.error.message | test("sources: must be an array"))'
 send compile '{"target": "x"}'
 expect "a compile request missing fields is answered with its id" "$(await "$ID")" \
   ".id == $ID and .error.code == \"bad_request\""
