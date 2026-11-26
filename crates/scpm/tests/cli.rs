@@ -187,6 +187,20 @@ fn unmatched_filter_is_a_usage_error() {
 }
 
 #[test]
+fn classpath_targets_respect_the_global_filter() {
+    // Both checks fail before anything is installed, so no coursier or network is needed.
+    scpm(&fixture("basic"))
+        .args(["classpath", "core@jvm-3", "-F", "!core"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("`core@jvm-3` is excluded by --filter"));
+    // The filter narrows an ambiguous target to one variant, which then needs a lock (frozen in CI).
+    scpm(&fixture("basic")).args(["classpath", "core", "-F", "!*@*-2.13"]).env("CI", "true").assert().code(1).stderr(
+        predicate::str::contains("scpm-lock.yaml is out of date").and(predicate::str::contains("matches").not()),
+    );
+}
+
+#[test]
 fn single_module_project_without_workspace_file() {
     let dir = workspace(&[("scpm.yaml", "name: solo\nscala: '2.13.18'\n")]);
     assert_eq!(stdout(dir.path(), &["ls"]), "solo@jvm-2.13  .\n");

@@ -34,6 +34,13 @@ pub struct FetchItem {
     /// Credentials for the URL's repository; an error (e.g. an unset environment variable) is
     /// only reported if the file actually has to be downloaded.
     pub auth: Result<Option<Auth>, String>,
+    /// Credentials sent only after an unauthenticated request is answered with a Basic
+    /// challenge, as coursier does: `(realm, auth)`, the first whose realm is unset or equal to
+    /// the challenge's wins.
+    pub challenge: Vec<(Option<String>, Auth)>,
+    /// `dest` may hold a file cached under another identity: trust it only if its sha256
+    /// matches the lock.
+    pub verify_cached: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +147,19 @@ pub fn fetch_all(items: Vec<FetchItem>, opts: FetchOptions) -> Result<FetchRepor
             present.push(item);
         } else {
             missing.push((item, false));
+        }
+    }
+    if !opts.verify {
+        // Files possibly cached by another identity are only trusted after a hash check.
+        let (unverified, trusted): (Vec<_>, Vec<_>) = present.into_iter().partition(|i| i.verify_cached);
+        present = trusted;
+        let hashes = hash_files(unverified.iter().map(|i| i.dest.as_path()).collect());
+        for (item, hash) in unverified.into_iter().zip(hashes) {
+            if hash.as_deref().is_ok_and(|h| h == item.sha256) {
+                present.push(item);
+            } else {
+                missing.push((item, true));
+            }
         }
     }
     if opts.verify {
@@ -304,6 +324,29 @@ fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
+/// The realm of a `WWW-Authenticate: Basic realm="…"` challenge.
+fn basic_realm(resp: &reqwest::Response) -> Option<&str> {
+    resp.headers().get_all(reqwest::header::WWW_AUTHENTICATE).iter().find_map(|v| parse_basic_realm(v.to_str().ok()?))
+}
+
+fn parse_basic_realm(header: &str) -> Option<&str> {
+    let (scheme, params) = header.trim().split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let mut rest = params;
+    loop {
+        rest = rest.trim_start_matches([' ', ',']);
+        let (name, after) = rest.split_once('=')?;
+        let after = after.strip_prefix('"')?;
+        let (value, tail) = after.split_once('"')?;
+        if name.trim().eq_ignore_ascii_case("realm") {
+            return Some(value);
+        }
+        rest = tail;
+    }
+}
+
 async fn download(
     client: &reqwest::Client,
     item: &FetchItem,
@@ -316,13 +359,24 @@ async fn download(
         host: host_of(&item.url),
         message: error_chain(&e),
     };
-    let mut req = client.get(&item.url);
-    match auth {
-        Some(Auth::Bearer(token)) => req = req.bearer_auth(token),
-        Some(Auth::Basic { user, password }) => req = req.basic_auth(user, Some(password)),
-        None => {}
+    let send = |auth: Option<&Auth>| {
+        let mut req = client.get(&item.url);
+        match auth {
+            Some(Auth::Bearer(token)) => req = req.bearer_auth(token),
+            Some(Auth::Basic { user, password }) => req = req.basic_auth(user, Some(password)),
+            None => {}
+        }
+        req.send()
+    };
+    let mut resp = send(auth).await.map_err(transport)?;
+    // Like coursier, credentials scoped to a realm go out only once the server asks for them.
+    if resp.status().as_u16() == 401
+        && auth.is_none()
+        && let Some(realm) = basic_realm(&resp)
+        && let Some((_, challenge_auth)) = item.challenge.iter().find(|(r, _)| r.as_deref().is_none_or(|r| r == realm))
+    {
+        resp = send(Some(challenge_auth)).await.map_err(transport)?;
     }
-    let resp = req.send().await.map_err(transport)?;
     let status = resp.status().as_u16();
     if status != 200 {
         let hint = match status {
@@ -340,8 +394,20 @@ async fn download(
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(transport)?;
+        let len = chunk.len() as u64;
+        if len > item.size - bytes {
+            // Never write more than the lock's size: an oversized body could fill the disk.
+            drop(file);
+            let _ = fs::remove_file(part);
+            return Err(FetchError::Size {
+                key: item.key.clone(),
+                url: item.url.clone(),
+                expected: item.size,
+                actual: bytes + len,
+            });
+        }
         hasher.update(&chunk);
-        bytes += chunk.len() as u64;
+        bytes += len;
         file.write_all(&chunk).await.map_err(io_err)?;
     }
     file.sync_all().await.map_err(io_err)?;
@@ -413,13 +479,39 @@ fn acquire(lock_path: &Path, key: &str) -> Result<File, FetchError> {
             .truncate(false)
             .open(lock_path)
             .map_err(|source| FetchError::Io { key: key.to_string(), path: lock_path.to_path_buf(), source })?;
-        match try_lock(&file) {
-            Ok(true) => return Ok(file),
-            Ok(false) if started.elapsed() < LOCK_WAIT => std::thread::sleep(Duration::from_millis(50)),
-            Ok(false) => return Err(FetchError::LockTimeout { key: key.to_string(), path: lock_path.to_path_buf() }),
+        match lock_opened(file, lock_path) {
+            Ok(Some(file)) => return Ok(file),
+            Ok(None) if started.elapsed() < LOCK_WAIT => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => return Err(FetchError::LockTimeout { key: key.to_string(), path: lock_path.to_path_buf() }),
             Err(source) => return Err(FetchError::Io { key: key.to_string(), path: lock_path.to_path_buf(), source }),
         }
     }
+}
+
+/// Locks an opened lock file, keeping it only if it is still the file at `lock_path`. A
+/// waiter may open the file just before its owner unlinks it in [`release`]; locking that
+/// orphaned inode would not exclude a process that locks a new file at the same path, so the
+/// caller retries with whatever is at the path now.
+fn lock_opened(file: File, lock_path: &Path) -> io::Result<Option<File>> {
+    if !try_lock(&file)? {
+        return Ok(None);
+    }
+    Ok(is_current(&file, lock_path).then_some(file))
+}
+
+#[cfg(unix)]
+fn is_current(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), fs::metadata(path)) {
+        (Ok(held), Ok(at_path)) => held.dev() == at_path.dev() && held.ino() == at_path.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_current(_file: &File, path: &Path) -> bool {
+    // Windows can't delete a file another handle has open, so an open lock file is still there.
+    path.exists()
 }
 
 fn release(lock: File, lock_path: &Path) {
@@ -490,6 +582,36 @@ mod tests {
                 assert_eq!(status.code(), Some(3), "another process must not get the lock");
             }
         }
+    }
+
+    #[test]
+    fn a_waiter_never_keeps_an_unlinked_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.jar.lock");
+        let open = || OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path).unwrap();
+        // B opens the lock file, then pauses before locking it.
+        let waiter = open();
+        // A finishes and releases: the lock file is unlinked.
+        let owner = lock_opened(open(), &path).unwrap().expect("A gets the lock");
+        release(owner, &path);
+        // C opens and locks a new file at the same path.
+        let newcomer = lock_opened(open(), &path).unwrap().expect("C gets the new lock file");
+        // B resumes: it can lock its orphaned inode, but must not use it.
+        assert!(lock_opened(waiter, &path).unwrap().is_none());
+        assert!(is_current(&newcomer, &path));
+        release(newcomer, &path);
+        // B retries from the path and gets a lock on the file that is there now.
+        let retried = acquire(&path, "k").unwrap();
+        assert!(is_current(&retried, &path));
+    }
+
+    #[test]
+    fn basic_realms() {
+        assert_eq!(parse_basic_realm("Basic realm=\"Sonatype Nexus\""), Some("Sonatype Nexus"));
+        assert_eq!(parse_basic_realm("BASIC charset=\"UTF-8\", realm=\"R\""), Some("R"));
+        assert_eq!(parse_basic_realm("Basic realm=\"R\", charset=\"UTF-8\""), Some("R"));
+        assert_eq!(parse_basic_realm("Bearer realm=\"R\""), None);
+        assert_eq!(parse_basic_realm("Basic charset=\"UTF-8\""), None);
     }
 
     #[test]

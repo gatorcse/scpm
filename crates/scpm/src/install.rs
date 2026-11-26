@@ -63,7 +63,7 @@ pub enum InstallError {
     #[error("{} is out of date for: {}\n  help: run `scpm install` and commit the result", crate::lockfile::LOCK_FILE, .0.join(", "))]
     Stale(Vec<String>),
     #[error(
-        "{0}\n  help: delete {lock} and run `scpm install`, or resolve the merge conflict",
+        "{0}\n  help: resolve the merge conflict, or re-create {lock} locally with `scpm install` (not frozen, outside CI) and commit it",
         lock = crate::lockfile::LOCK_FILE
     )]
     CorruptLock(LockError),
@@ -92,7 +92,7 @@ impl ClasspathKind {
         [ClasspathKind::Compile, ClasspathKind::Runtime, ClasspathKind::TestCompile, ClasspathKind::TestRuntime];
 
     /// Own dependency scopes included in this classpath.
-    fn own_scopes(self) -> &'static [Scope] {
+    pub(crate) fn own_scopes(self) -> &'static [Scope] {
         match self {
             ClasspathKind::Compile => &[Scope::Compile, Scope::Provided],
             ClasspathKind::Runtime => &[Scope::Compile, Scope::Runtime],
@@ -102,7 +102,7 @@ impl ClasspathKind {
     }
 
     /// Scopes an upstream module contributes (never its provided or test dependencies).
-    fn upstream_scopes(self) -> &'static [Scope] {
+    pub(crate) fn upstream_scopes(self) -> &'static [Scope] {
         match self {
             ClasspathKind::Compile | ClasspathKind::TestCompile => &[Scope::Compile],
             ClasspathKind::Runtime | ClasspathKind::TestRuntime => &[Scope::Compile, Scope::Runtime],
@@ -196,6 +196,9 @@ struct UpstreamInputs<'a> {
 struct DependencyInput<'a> {
     scope: Scope,
     coord: String,
+    /// The spec as written: it decides how the version is selected (a plain range reuses the
+    /// variant's selection, `catalog` the workspace's), even when the effective range is equal.
+    spec: &'a str,
     version: String,
     exclude: &'a [String],
     classifier: Option<&'a str>,
@@ -208,6 +211,7 @@ impl<'a> From<&'a Dependency> for DependencyInput<'a> {
         DependencyInput {
             scope: d.scope,
             coord: d.coord.to_string(),
+            spec: &d.spec,
             version: d.version.to_string(),
             exclude: &d.exclude,
             classifier: d.classifier.as_deref(),
@@ -254,12 +258,19 @@ fn sha256_json(doc: &serde_json::Value) -> String {
 }
 
 fn inputs_hash(ws: &Workspace, graph: &Graph, v: &Variant, repos: &[Repo], ctx: &ResolutionContextLock) -> String {
-    let upstream: BTreeSet<String> =
-        ClasspathKind::ALL.iter().flat_map(|k| upstream_variants(graph, &v.id, *k)).collect();
+    // Each classpath's upstream closure separately, in order: an upstream workspace edge that is
+    // added, removed or changes scope moves variants between closures without changing their union.
+    let upstream: BTreeMap<&str, Vec<UpstreamInputs<'_>>> = ClasspathKind::ALL
+        .iter()
+        .map(|k| {
+            let closure = upstream_variants(graph, &v.id, *k);
+            (k.name(), closure.iter().filter_map(|id| ws.variant(id)).map(upstream_inputs).collect())
+        })
+        .collect();
     let overrides: Vec<String> = ws.config.overrides.iter().map(|(k, v)| format!("{k}:{v}")).collect();
     sha256_json(&serde_json::json!({
         "variant": variant_inputs(v),
-        "upstream": upstream.iter().filter_map(|id| ws.variant(id)).map(upstream_inputs).collect::<Vec<_>>(),
+        "upstream": upstream,
         "overrides": overrides,
         "repositories": repo_inputs(repos),
         "context": ctx,
@@ -772,21 +783,41 @@ fn record_artifacts(lock: &mut Lockfile, resolved: &[ResolvedArtifact], repos: &
                 a.key, a.url
             ))
         })?;
-        let expected = format!("{}{}", repo.url, coursier::maven_path(&a.key).unwrap_or_default());
+        let path = coursier::maven_path(&a.key)
+            .ok_or_else(|| InstallError::Resolve(format!("coursier resolved an invalid artifact key `{}`", a.key)))?;
+        let expected = format!("{}{path}", repo.url);
         if expected != a.url {
             return Err(InstallError::Resolve(format!(
                 "{}: unexpected repository layout (got {}, expected {expected}); snapshots and non-Maven layouts are not supported yet",
                 a.key, a.url
             )));
         }
+        let file_err = |e: std::io::Error| InstallError::Resolve(format!("{}: {e}", a.file.display()));
         match lock.artifacts.get_mut(&a.key) {
-            Some(existing) => existing.repo = repo.id.clone(),
+            Some(existing) if existing.repo == repo.id => {}
+            // Moving to another repository keeps the locked integrity only if that repository
+            // serves the same bytes; otherwise a restore could never pass the lock's checks.
+            Some(existing) => {
+                let size = std::fs::metadata(&a.file).map_err(file_err)?.len();
+                let sha256 = fetch::sha256_file(&a.file).map_err(file_err)?;
+                if (size, &sha256) != (existing.size, &existing.sha256) {
+                    return Err(InstallError::Resolve(format!(
+                        "{key}: repository `{new}` serves different bytes than the copy locked from `{old}` \
+                         (sha256 {sha256}, locked {locked}); a published artifact must not change\n  \
+                         help: if the new bytes are expected, remove `{key}` from the `artifacts` of {lock_file} and run `scpm install`",
+                        key = a.key,
+                        new = repo.id,
+                        old = existing.repo,
+                        locked = existing.sha256,
+                        lock_file = crate::lockfile::LOCK_FILE,
+                    )));
+                }
+                existing.repo = repo.id.clone();
+            }
             None => {
-                let meta = std::fs::metadata(&a.file)
-                    .map_err(|e| InstallError::Resolve(format!("{}: {e}", a.file.display())))?;
-                let sha256 = fetch::sha256_file(&a.file)
-                    .map_err(|e| InstallError::Resolve(format!("{}: {e}", a.file.display())))?;
-                lock.artifacts.insert(a.key.clone(), ArtifactLock { repo: repo.id.clone(), sha256, size: meta.len() });
+                let size = std::fs::metadata(&a.file).map_err(file_err)?.len();
+                let sha256 = fetch::sha256_file(&a.file).map_err(file_err)?;
+                lock.artifacts.insert(a.key.clone(), ArtifactLock { repo: repo.id.clone(), sha256, size });
             }
         }
     }
@@ -802,6 +833,8 @@ fn repo_for_url<'a>(repos: &'a [Repo], url: &str) -> Option<&'a Repo> {
 /// if something must be downloaded) and the `user@` segment coursier uses in cache paths.
 struct RepoAccess {
     auth: Result<Option<Auth>, String>,
+    /// Coursier credentials sent only after a Basic challenge (see [`FetchItem::challenge`]).
+    challenge: Vec<(Option<String>, Auth)>,
     cache_user: CacheUser,
 }
 
@@ -818,15 +851,16 @@ fn repo_access(repo: &Repo, creds: &CoursierCredentials) -> RepoAccess {
             Some(user) => CacheUser::Known(user),
             None => CacheUser::Unknown,
         };
-        return RepoAccess { auth: repo.auth().map_err(|e| e.to_string()), cache_user };
+        return RepoAccess { auth: repo.auth().map_err(|e| e.to_string()), challenge: Vec::new(), cache_user };
     }
-    // No configured credentials: use coursier's own, as `cs` would (design §5.7).
+    // No configured credentials: use coursier's own, as `cs` would (design §5.7). Entries
+    // scoped to a realm only apply after a challenge, so they don't name the cache directory.
+    let basic =
+        |c: &crate::credentials::CoursierCredential| Auth::Basic { user: c.user.clone(), password: c.password.clone() };
+    let challenge = creds.challenge_candidates(&repo.url).into_iter().map(|c| (c.realm.clone(), basic(c))).collect();
     match creds.find(&repo.url) {
-        Some(c) => RepoAccess {
-            auth: Ok(Some(Auth::Basic { user: c.user.clone(), password: c.password.clone() })),
-            cache_user: CacheUser::Known(c.user.clone()),
-        },
-        None => RepoAccess { auth: Ok(None), cache_user: CacheUser::Anonymous },
+        Some(c) => RepoAccess { auth: Ok(Some(basic(c))), challenge, cache_user: CacheUser::Known(c.user.clone()) },
+        None => RepoAccess { auth: Ok(None), challenge, cache_user: CacheUser::Anonymous },
     }
 }
 
@@ -849,14 +883,21 @@ pub fn fetch_items(
         let repo = repos.iter().find(|r| r.id == art.repo).ok_or_else(|| {
             InstallError::Resolve(format!("{key} comes from repository `{}`, which is not configured", art.repo))
         })?;
-        let url = format!("{}{}", repo.url, coursier::maven_path(key).unwrap_or_default());
-        let bad_url = || InstallError::Resolve(format!("bad URL {url}"));
+        let path = coursier::maven_path(key).ok_or_else(|| {
+            InstallError::Resolve(format!("{} has an invalid artifact key `{key}`", crate::lockfile::LOCK_FILE))
+        })?;
+        let url = format!("{}{path}", repo.url);
+        let bad_url = || InstallError::Resolve(format!("{key}: {url} has no place in the coursier cache"));
         let access = &access[repo.id.as_str()];
+        let mut verify_cached = false;
         let dest = match &access.cache_user {
             CacheUser::Anonymous => coursier::cache_path(cache, &url, None).ok_or_else(bad_url)?,
             CacheUser::Known(user) => coursier::cache_path(cache, &url, Some(user)).ok_or_else(bad_url)?,
             CacheUser::Unknown => match coursier::cached_with_any_user(cache, &url) {
-                Some(found) => found,
+                Some(found) => {
+                    verify_cached = true;
+                    found
+                }
                 None => coursier::cache_path(cache, &url, None).ok_or_else(bad_url)?,
             },
         };
@@ -867,6 +908,8 @@ pub fn fetch_items(
             sha256: art.sha256.clone(),
             size: art.size,
             auth: access.auth.clone(),
+            challenge: access.challenge.clone(),
+            verify_cached,
         });
     }
     Ok(items)
@@ -929,6 +972,99 @@ mod tests {
         assert_eq!(base, boot_inputs_hash(&central, &ctx));
         assert_ne!(base, boot_inputs_hash(&other, &ctx));
         assert_ne!(base, boot_inputs_hash(&central, &ResolutionContextLock { jdk: "21".into(), ..ctx.clone() }));
+    }
+
+    /// Loads a workspace of `modules/<name>/scpm.yaml` files on Scala 3.9.0.
+    fn workspace(modules: &[(&str, &str)]) -> (tempfile::TempDir, Workspace, Graph) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("scpm-workspace.yaml"), "modules: ['modules/*']\ntoolchain:\n  scala: 3.9.0\n")
+            .unwrap();
+        for (name, manifest) in modules {
+            let module = dir.path().join("modules").join(name);
+            std::fs::create_dir_all(&module).unwrap();
+            std::fs::write(module.join("scpm.yaml"), manifest).unwrap();
+        }
+        let ws = crate::workspace::load(dir.path()).unwrap();
+        let graph = Graph::build(&ws).unwrap();
+        (dir, ws, graph)
+    }
+
+    fn hash_of(modules: &[(&str, &str)], id: &str) -> String {
+        let (_dir, ws, graph) = workspace(modules);
+        let ctx = resolution_context(&ws);
+        inputs_hash(&ws, &graph, ws.variant(id).unwrap(), &[], &ctx)
+    }
+
+    #[test]
+    fn upstream_edge_changes_reach_downstream_hashes() {
+        // a compile-depends on b and runtime-depends on c; b then gains a compile edge to c,
+        // which moves c into a's compile closure without changing the union of a's closures.
+        let a = "dependencies:\n  b: workspace:*\nruntimeDependencies:\n  c: workspace:*\n";
+        let c = "dependencies:\n  org.typelevel::cats-core: 2.13.0\n";
+        let before = hash_of(&[("a", a), ("b", "dependencies:\n  g:x: '1.0'\n"), ("c", c)], "a@jvm-3");
+        let after = hash_of(&[("a", a), ("b", "dependencies:\n  g:x: '1.0'\n  c: workspace:*\n"), ("c", c)], "a@jvm-3");
+        assert_ne!(before, after);
+        let runtime = hash_of(
+            &[("a", a), ("b", "dependencies:\n  g:x: '1.0'\nruntimeDependencies:\n  c: workspace:*\n"), ("c", c)],
+            "a@jvm-3",
+        );
+        assert_ne!(after, runtime, "an upstream edge changing scope re-locks downstream");
+    }
+
+    #[test]
+    fn the_spec_as_written_is_hashed() {
+        // The same effective range, selected through the catalog instead of the variant.
+        let plain = "dependencies:\n  g:x: ^1.0\n";
+        let via_catalog = "dependencies:\n  g:x: catalog\n";
+        let (dir, _, _) = workspace(&[("a", plain)]);
+        std::fs::write(
+            dir.path().join("scpm-workspace.yaml"),
+            "modules: ['modules/*']\ntoolchain:\n  scala: 3.9.0\ncatalog:\n  g:x: ^1.0\n",
+        )
+        .unwrap();
+        let hash = |manifest: &str| {
+            std::fs::write(dir.path().join("modules/a/scpm.yaml"), manifest).unwrap();
+            let ws = crate::workspace::load(dir.path()).unwrap();
+            let graph = Graph::build(&ws).unwrap();
+            inputs_hash(&ws, &graph, ws.variant("a@jvm-3").unwrap(), &[], &resolution_context(&ws))
+        };
+        assert_ne!(hash(plain), hash(via_catalog));
+    }
+
+    #[test]
+    fn a_repository_move_keeps_integrity_only_for_identical_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x-1.jar");
+        std::fs::write(&file, b"bytes").unwrap();
+        let repos = vec![
+            Repo { id: "a".into(), url: "https://a.example/".into(), credentials: None },
+            Repo { id: "b".into(), url: "https://b.example/".into(), credentials: None },
+        ];
+        let resolved = |repo: &str| ResolvedArtifact {
+            key: "g:x:1".into(),
+            file: file.clone(),
+            url: format!("https://{repo}.example/g/x/1/x-1.jar"),
+        };
+        let mut lock = Lockfile::default();
+        record_artifacts(&mut lock, &[resolved("a")], &repos).unwrap();
+        let locked = lock.artifacts["g:x:1"].clone();
+        record_artifacts(&mut lock, &[resolved("b")], &repos).unwrap();
+        assert_eq!(lock.artifacts["g:x:1"], ArtifactLock { repo: "b".into(), ..locked.clone() });
+
+        std::fs::write(&file, b"other").unwrap();
+        let err = record_artifacts(&mut lock, &[resolved("a")], &repos).unwrap_err().to_string();
+        assert!(err.contains("serves different bytes"), "{err}");
+        assert_eq!(lock.artifacts["g:x:1"].repo, "b", "the lock entry is unchanged");
+    }
+
+    #[test]
+    fn invalid_lock_keys_are_errors() {
+        let mut lock = Lockfile::default();
+        lock.boot.insert("x".into(), vec!["g:..:1".into()]);
+        lock.artifacts.insert("g:..:1".into(), ArtifactLock { repo: "central".into(), sha256: "0".into(), size: 1 });
+        let repos = vec![Repo { id: "central".into(), url: coursier::CENTRAL_URL.into(), credentials: None }];
+        let err = fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c")).unwrap_err();
+        assert!(err.to_string().contains("invalid artifact key"), "{err}");
     }
 
     #[test]

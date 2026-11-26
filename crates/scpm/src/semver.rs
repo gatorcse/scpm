@@ -4,8 +4,11 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt;
 
-/// A version compared the way Maven's `ComparableVersion` does: numeric parts numerically,
-/// qualifiers by rank (`alpha < beta < milestone < rc < snapshot < release < sp < other`).
+/// A version compared the way Maven's `ComparableVersion` does (a total order): `.` and `-`
+/// separate items and each `-` (or a switch between digits and letters) opens a nested list;
+/// numbers compare numerically, qualifiers by rank (`alpha < beta < milestone < rc < snapshot <
+/// release < sp < other`, others lexically), with `a`/`b`/`m` before a digit and `cr` as
+/// aliases. At one position, a number beats a nested list, which beats a qualifier.
 #[derive(Debug, Clone)]
 pub struct MavenVersion {
     raw: String,
@@ -14,8 +17,107 @@ pub struct MavenVersion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Item {
-    Num(u128),
-    Qual(String),
+    /// Decimal digits without leading zeros (`0` is `"0"`), compared by length then text.
+    Int(String),
+    /// A lower-cased qualifier with Maven's aliases applied (`ga`/`final`/`release` → ``).
+    Str(String),
+    List(Vec<Item>),
+}
+
+impl Item {
+    fn int(digits: &str) -> Item {
+        let trimmed = digits.trim_start_matches('0');
+        Item::Int(if trimmed.is_empty() { "0".to_string() } else { trimmed.to_string() })
+    }
+
+    fn string(value: &str, followed_by_digit: bool) -> Item {
+        let value = match value {
+            "a" if followed_by_digit => "alpha",
+            "b" if followed_by_digit => "beta",
+            "m" if followed_by_digit => "milestone",
+            "ga" | "final" | "release" => "",
+            "cr" => "rc",
+            other => other,
+        };
+        Item::Str(value.to_string())
+    }
+
+    fn parse(is_digit: bool, text: &str) -> Item {
+        if is_digit { Item::int(text) } else { Item::string(text, false) }
+    }
+
+    /// `0`, the release qualifier and an empty list are no-ops at the end of a list.
+    fn is_null(&self) -> bool {
+        match self {
+            Item::Int(n) => n == "0",
+            Item::Str(s) => s.is_empty(),
+            Item::List(l) => l.is_empty(),
+        }
+    }
+
+    /// How the item compares with an absent one (a release with nothing more).
+    fn cmp_absent(&self) -> Ordering {
+        match self {
+            Item::Int(n) => {
+                if n == "0" {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            Item::Str(s) => comparable_qualifier(s).cmp(&RELEASE_RANK.to_string()),
+            Item::List(l) => l.iter().map(Item::cmp_absent).find(|o| o.is_ne()).unwrap_or(Ordering::Equal),
+        }
+    }
+}
+
+fn cmp_item(a: &Item, b: &Item) -> Ordering {
+    match (a, b) {
+        (Item::Int(x), Item::Int(y)) => x.len().cmp(&y.len()).then_with(|| x.cmp(y)),
+        (Item::Int(_), _) => Ordering::Greater,
+        (_, Item::Int(_)) => Ordering::Less,
+        (Item::Str(x), Item::Str(y)) => comparable_qualifier(x).cmp(&comparable_qualifier(y)),
+        (Item::Str(_), Item::List(_)) => Ordering::Less,
+        (Item::List(_), Item::Str(_)) => Ordering::Greater,
+        (Item::List(x), Item::List(y)) => cmp_lists(x, y),
+    }
+}
+
+fn cmp_lists(a: &[Item], b: &[Item]) -> Ordering {
+    for i in 0..a.len().max(b.len()) {
+        let ord = match (a.get(i), b.get(i)) {
+            (Some(x), Some(y)) => cmp_item(x, y),
+            (Some(x), None) => x.cmp_absent(),
+            (None, Some(y)) => y.cmp_absent().reverse(),
+            (None, None) => Ordering::Equal,
+        };
+        if ord.is_ne() {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Maven's sort key for a qualifier: its rank as a digit, or `7-<qualifier>` for unknown ones.
+fn comparable_qualifier(q: &str) -> String {
+    const ORDER: [&str; 7] = ["alpha", "beta", "milestone", "rc", "snapshot", "", "sp"];
+    match ORDER.iter().position(|o| *o == q) {
+        Some(i) => i.to_string(),
+        None => format!("{}-{q}", ORDER.len()),
+    }
+}
+
+/// Drops trailing no-op items (`1.0.0` → `1`, `1-final` → `1`), also before a nested list.
+fn normalize(list: &mut Vec<Item>) {
+    let mut i = list.len();
+    while i > 0 {
+        i -= 1;
+        if list[i].is_null() {
+            list.remove(i);
+        } else if !matches!(list[i], Item::List(_)) {
+            break;
+        }
+    }
 }
 
 const RELEASE_RANK: u8 = 5;
@@ -39,39 +141,50 @@ fn is_prerelease_qualifier(q: &str) -> bool {
 }
 
 impl MavenVersion {
+    /// Parses like Maven's `ComparableVersion.parseVersion`.
     pub fn parse(raw: &str) -> MavenVersion {
-        let mut items = Vec::new();
-        let mut current = String::new();
-        let mut current_is_digit = false;
-        let flush = |current: &mut String, items: &mut Vec<Item>, is_digit: bool| {
-            if current.is_empty() {
-                return;
+        let version = raw.to_ascii_lowercase();
+        // The innermost open list is last; each nested list ends up as its parent's last item.
+        let mut stack: Vec<Vec<Item>> = vec![Vec::new()];
+        let mut is_digit = false;
+        let mut start = 0;
+        for (i, c) in version.char_indices() {
+            let list = stack.last_mut().expect("the root list");
+            match c {
+                '.' | '-' => {
+                    list.push(if i == start { Item::int("0") } else { Item::parse(is_digit, &version[start..i]) });
+                    start = i + 1;
+                    if c == '-' {
+                        stack.push(Vec::new());
+                    }
+                }
+                c if c.is_ascii_digit() => {
+                    if !is_digit && i > start {
+                        list.push(Item::string(&version[start..i], true));
+                        start = i;
+                        stack.push(Vec::new());
+                    }
+                    is_digit = true;
+                }
+                _ => {
+                    if is_digit && i > start {
+                        list.push(Item::int(&version[start..i]));
+                        start = i;
+                        stack.push(Vec::new());
+                    }
+                    is_digit = false;
+                }
             }
-            items.push(if is_digit {
-                current.parse().map(Item::Num).unwrap_or_else(|_| Item::Qual(current.clone()))
-            } else {
-                Item::Qual(current.to_ascii_lowercase())
-            });
-            current.clear();
-        };
-        for c in raw.chars() {
-            if c == '.' || c == '-' || c == '_' || c == '+' {
-                flush(&mut current, &mut items, current_is_digit);
-                continue;
-            }
-            let digit = c.is_ascii_digit();
-            if !current.is_empty() && digit != current_is_digit {
-                flush(&mut current, &mut items, current_is_digit);
-            }
-            current_is_digit = digit;
-            current.push(c);
         }
-        flush(&mut current, &mut items, current_is_digit);
-        // Trailing zeros and release qualifiers don't change ordering: 1.0 == 1.0.0 == 1.0-final.
-        while matches!(items.last(), Some(Item::Num(0)))
-            || matches!(items.last(), Some(Item::Qual(q)) if qualifier_rank(q) == RELEASE_RANK)
-        {
-            items.pop();
+        if version.len() > start {
+            stack.last_mut().expect("the root list").push(Item::parse(is_digit, &version[start..]));
+        }
+        let mut items = stack.pop().expect("the root list");
+        normalize(&mut items);
+        while let Some(mut parent) = stack.pop() {
+            parent.push(Item::List(items));
+            normalize(&mut parent);
+            items = parent;
         }
         MavenVersion { raw: raw.to_string(), items }
     }
@@ -83,7 +196,14 @@ impl MavenVersion {
     /// Pre-releases (`-RC1`, `-M3`, `-SNAPSHOT`, …) and dynver builds (`1.2.3+4-abcdef12`),
     /// which are never releases.
     pub fn is_prerelease(&self) -> bool {
-        self.raw.contains('+') || self.items.iter().any(|i| matches!(i, Item::Qual(q) if is_prerelease_qualifier(q)))
+        fn any_prerelease(items: &[Item]) -> bool {
+            items.iter().any(|i| match i {
+                Item::Str(q) => is_prerelease_qualifier(q),
+                Item::List(l) => any_prerelease(l),
+                Item::Int(_) => false,
+            })
+        }
+        self.raw.contains('+') || any_prerelease(&self.items)
     }
 
     /// The release "flavour" a qualifier selects, e.g. `jre` in `33.4.0-jre`, `android` in
@@ -103,15 +223,17 @@ impl MavenVersion {
         (!tokens.is_empty()).then(|| tokens.join("-"))
     }
 
-    /// The first three numeric components, padding with zeros: `1.2` → `[1, 2, 0]`.
-    fn numeric_prefix(&self) -> [u128; 3] {
+    /// The first three numeric components, padding with zeros: `1.2` → `[1, 2, 0]`. `None` if
+    /// one does not fit a `u128`.
+    fn numeric_prefix(&self) -> Option<[u128; 3]> {
         let mut out = [0; 3];
-        for (slot, item) in out.iter_mut().zip(self.items.iter().take_while(|i| matches!(i, Item::Num(_)))) {
-            if let Item::Num(n) = item {
-                *slot = *n;
+        for (slot, item) in out.iter_mut().zip(&self.items) {
+            match item {
+                Item::Int(n) => *slot = n.parse().ok()?,
+                _ => break,
             }
         }
-        out
+        Some(out)
     }
 }
 
@@ -137,37 +259,7 @@ impl PartialOrd for MavenVersion {
 
 impl Ord for MavenVersion {
     fn cmp(&self, other: &Self) -> Ordering {
-        let len = self.items.len().max(other.items.len());
-        for i in 0..len {
-            let ord = match (self.items.get(i), other.items.get(i)) {
-                (Some(a), Some(b)) => cmp_items(a, b),
-                (Some(a), None) => cmp_with_missing(a),
-                (None, Some(b)) => cmp_with_missing(b).reverse(),
-                (None, None) => Ordering::Equal,
-            };
-            if ord != Ordering::Equal {
-                return ord;
-            }
-        }
-        Ordering::Equal
-    }
-}
-
-fn cmp_items(a: &Item, b: &Item) -> Ordering {
-    match (a, b) {
-        (Item::Num(x), Item::Num(y)) => x.cmp(y),
-        (Item::Num(_), Item::Qual(_)) => Ordering::Greater,
-        (Item::Qual(_), Item::Num(_)) => Ordering::Less,
-        (Item::Qual(x), Item::Qual(y)) => qualifier_rank(x).cmp(&qualifier_rank(y)).then_with(|| x.cmp(y)),
-    }
-}
-
-/// How an item compares with the absent item (a release with nothing more): `1.0.1 > 1.0`,
-/// `1.0-rc1 < 1.0`, `1.0-sp1 > 1.0`.
-fn cmp_with_missing(item: &Item) -> Ordering {
-    match item {
-        Item::Num(n) => n.cmp(&0),
-        Item::Qual(q) => qualifier_rank(q).cmp(&RELEASE_RANK),
+        cmp_lists(&self.items, &other.items)
     }
 }
 
@@ -222,8 +314,16 @@ impl Range {
             if !v.starts_with(|c: char| c.is_ascii_digit()) {
                 return Err(err(format!("`{v}` is not a version")));
             }
+            if v.ends_with('+') {
+                return Err(err(format!(
+                    "Ivy dynamic versions (`{v}`) are not supported; use a wildcard such as `1.2.x`"
+                )));
+            }
             Ok(MavenVersion::parse(v))
         };
+        let too_big = |v: &str| err(format!("`{v}` is too large to compute an upper bound"));
+        let prefix = |low: &MavenVersion, v: &str| low.numeric_prefix().ok_or_else(|| too_big(v));
+        let next = |n: u128, v: &str| n.checked_add(1).ok_or_else(|| too_big(v));
         let mut bounds = Vec::new();
         for part in s.split_whitespace() {
             if part == "*" || part == "x" {
@@ -234,16 +334,17 @@ impl Range {
             match op {
                 "^" => {
                     let low = version(v)?;
-                    let [major, minor, _] = low.numeric_prefix();
-                    let high = if major > 0 { format!("{}.0.0", major + 1) } else { format!("0.{}.0", minor + 1) };
+                    let [major, minor, _] = prefix(&low, v)?;
+                    let high =
+                        if major > 0 { format!("{}.0.0", next(major, v)?) } else { format!("0.{}.0", next(minor, v)?) };
                     bounds.push((Op::Ge, low));
                     bounds.push((Op::Lt, MavenVersion::parse(&high)));
                 }
                 "~" => {
                     let low = version(v)?;
-                    let [major, minor, _] = low.numeric_prefix();
+                    let [major, minor, _] = prefix(&low, v)?;
                     bounds.push((Op::Ge, low));
-                    bounds.push((Op::Lt, MavenVersion::parse(&format!("{major}.{}.0", minor + 1))));
+                    bounds.push((Op::Lt, MavenVersion::parse(&format!("{major}.{}.0", next(minor, v)?))));
                 }
                 "" if v.ends_with(".x") || v.ends_with(".*") => {
                     let prefix = &v[..v.len() - 2];
@@ -251,7 +352,8 @@ impl Range {
                     let parts: Vec<u128> =
                         prefix.split('.').map(|p| p.parse().map_err(|_| bad())).collect::<Result<_, _>>()?;
                     let mut high = parts.clone();
-                    *high.last_mut().ok_or_else(bad)? += 1;
+                    let last = high.last_mut().ok_or_else(bad)?;
+                    *last = next(*last, v)?;
                     let high: Vec<String> = high.iter().map(u128::to_string).collect();
                     bounds.push((Op::Ge, MavenVersion::parse(prefix)));
                     bounds.push((Op::Lt, MavenVersion::parse(&high.join("."))));
@@ -364,6 +466,88 @@ mod tests {
         }
         assert_eq!(v("1.0"), v("1.0.0"));
         assert_eq!(v("1.0"), v("1.0-final"));
+    }
+
+    #[test]
+    fn ordering_is_total() {
+        // `1 < 1-sp`, `1.0-rc1 < 1` and `1-sp > 1.0-rc1` used to form a cycle.
+        let corpus = [
+            "1",
+            "1-sp",
+            "1.0-rc1",
+            "1.0-RC2",
+            "1.0-cr2",
+            "1.0.0-RC1",
+            "1.0-jre",
+            "1.0.1",
+            "1-1",
+            "1.0-1",
+            "1-sp1",
+            "1.0-alpha",
+            "1.0-a1",
+            "1-b2",
+            "1.0-M1",
+            "1.0-SNAPSHOT",
+            "1.0-final",
+            "1.0.0",
+            "1.1",
+            "1.0-foo",
+            "1.0-bar",
+            "1.0.0.1",
+            "1.0-0",
+            "2",
+            "2.0-rc1",
+            "0.9",
+            "1-ga",
+            "1.0-sp-1",
+            "1.0rc1",
+            "1.0.jre7",
+            "1.2.3+4-abc",
+        ];
+        let vs: Vec<MavenVersion> = corpus.iter().map(|s| v(s)).collect();
+        for a in &vs {
+            for b in &vs {
+                assert_eq!(a.cmp(b), b.cmp(a).reverse(), "{a} vs {b}");
+                for c in &vs {
+                    if a <= b && b <= c {
+                        assert!(a <= c, "{a} <= {b} <= {c}");
+                    }
+                }
+            }
+        }
+        // The highest version doesn't depend on the listing order.
+        let range = Range::parse("<2.0-rc1").unwrap();
+        for order in [["1", "1-sp", "1.0-rc1"], ["1.0-rc1", "1-sp", "1"], ["1-sp", "1", "1.0-rc1"]] {
+            assert_eq!(range.select(order), Some("1-sp"), "{order:?}");
+        }
+    }
+
+    #[test]
+    fn qualifiers_follow_maven() {
+        assert!(v("1.0-RC2") > v("1.0.0-RC1"));
+        assert!(Range::parse(">=1.0.0-RC1").unwrap().matches(&v("1.0-RC2")));
+        assert_eq!(v("1.0-cr1"), v("1.0-rc1"), "cr is an alias of rc");
+        assert!(Range::parse(">=1.0-rc1").unwrap().matches(&v("1.0-cr2")));
+        assert!(Range::parse(">=1.0-rc1").unwrap().matches(&v("1.0-cr1")));
+        assert_eq!(v("1.0-a1"), v("1.0-alpha1"));
+        assert!(v("1.0-foo") < v("1.0-goo"), "unknown qualifiers sort lexically");
+    }
+
+    #[test]
+    fn upper_bounds_that_overflow_are_errors() {
+        let max = u128::MAX;
+        for r in [format!("^{max}.0.0"), format!("^0.{max}.0"), format!("~1.{max}"), format!("1.{max}.x")] {
+            assert!(Range::parse(&r).unwrap_err().reason.contains("too large"), "{r}");
+        }
+        assert!(Range::parse(&format!("^{max}0.0")).unwrap_err().reason.contains("too large"));
+        assert!(Range::parse("^1.2.3").is_ok());
+    }
+
+    #[test]
+    fn ivy_selectors_are_rejected() {
+        assert!(Range::parse("1.2.+").unwrap_err().reason.contains("Ivy"));
+        assert!(Range::parse(">=1.2.+").unwrap_err().reason.contains("Ivy"));
+        assert!(Range::parse("1.2.x").is_ok() && Range::parse("1.2.3+4-abcdef12").is_ok());
     }
 
     #[test]

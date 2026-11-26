@@ -541,7 +541,7 @@ fn corrupt_or_conflicted_locks() {
 
     let err = stderr_of(scpm(ws.path(), &shared_cache()).args(["install", "--frozen"]));
     assert!(err.contains("merge conflict markers"), "{err}");
-    assert!(err.contains("help: delete scpm-lock.yaml and run `scpm install`, or resolve the merge conflict"), "{err}");
+    assert!(err.contains("help: resolve the merge conflict, or re-create scpm-lock.yaml locally"), "{err}");
 
     let out = scpm(ws.path(), &shared_cache()).arg("install").assert().success().get_output().stderr.clone();
     assert!(String::from_utf8_lossy(&out).contains("re-locking from scratch"));

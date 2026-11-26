@@ -105,38 +105,79 @@ pub fn why(
             found.iter().map(|k| k.split(':').take(2).collect::<Vec<_>>().join(":")).collect();
         let mut owners = vec![id.clone()];
         owners.extend(upstream_variants(graph, id, ClasspathKind::TestRuntime));
-        let mut explained = false;
+        let mut unexplained: Vec<String> = Vec::new();
         for module in &modules {
-            for chain in coursier::what_depends_on(&req, module, &repos, &cache)? {
-                explained = true;
-                let root = chain[0].split(':').take(2).collect::<Vec<_>>().join(":");
-                let declared_by = owners
-                    .iter()
-                    .find(|o| {
-                        ws.variant(o).is_some_and(|ov| {
-                            ov.dependencies.iter().any(|d| format!("{}:{}", d.coord.org, artifact_name(ov, d)) == root)
-                        })
-                    })
-                    .unwrap_or(id)
-                    .clone();
+            let chains = coursier::what_depends_on(&req, module, &repos, &cache)?;
+            if chains.is_empty() {
+                unexplained.extend(found.iter().filter(|k| module_of(k) == *module).map(|k| k.to_string()));
+            }
+            for chain in chains {
+                let declared_by = declared_by(ws, id, &owners, &module_of(&chain[0]));
                 let path = WhyPath { variant: id.clone(), declared_by, chain };
                 if !report.paths.contains(&path) {
                     report.paths.push(path);
                 }
             }
         }
-        if !explained {
-            report
-                .unexplained
-                .push(Unexplained { variant: id.clone(), artifacts: found.iter().map(|k| k.to_string()).collect() });
+        if !unexplained.is_empty() {
+            report.unexplained.push(Unexplained { variant: id.clone(), artifacts: unexplained });
         }
     }
     Ok(report)
 }
 
+/// The first of `owners` (the variant `id`, then its upstream variants) whose declaration of
+/// `root` (`org:name`) is part of `id`'s test runtime request: the variant's own in every scope,
+/// an upstream variant's only in the scopes it passes downstream (never provided or test).
+fn declared_by(ws: &Workspace, id: &str, owners: &[String], root: &str) -> String {
+    owners
+        .iter()
+        .find(|o| {
+            let scopes = if o.as_str() == id {
+                ClasspathKind::TestRuntime.own_scopes()
+            } else {
+                ClasspathKind::TestRuntime.upstream_scopes()
+            };
+            ws.variant(o).is_some_and(|ov| {
+                ov.dependencies
+                    .iter()
+                    .any(|d| scopes.contains(&d.scope) && format!("{}:{}", d.coord.org, artifact_name(ov, d)) == root)
+            })
+        })
+        .map_or(id, String::as_str)
+        .to_string()
+}
+
+/// `org:name` of a key or coordinate (`org:name:version…`).
+fn module_of(key: &str) -> String {
+    key.split(':').take(2).collect::<Vec<_>>().join(":")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attribution_follows_the_scopes_on_the_classpath() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("scpm-workspace.yaml"), "modules: ['modules/*']\ntoolchain:\n  scala: 3.9.0\n")
+            .unwrap();
+        for (name, manifest) in [
+            ("a", "providedDependencies:\n  g:x: '1.0'\ntestDependencies:\n  g:y: '1.0'\n"),
+            ("b", "dependencies:\n  g:x: '1.0'\n  g:y: '1.0'\n"),
+            ("c", "dependencies:\n  a: workspace:*\n  b: workspace:*\n"),
+        ] {
+            std::fs::create_dir_all(dir.path().join("modules").join(name)).unwrap();
+            std::fs::write(dir.path().join("modules").join(name).join("scpm.yaml"), manifest).unwrap();
+        }
+        let ws = crate::workspace::load(dir.path()).unwrap();
+        let owners = ["c@jvm-3".to_string(), "a@jvm-3".into(), "b@jvm-3".into()];
+        // a's provided and test dependencies never reach c's classpath; b's do.
+        assert_eq!(declared_by(&ws, "c@jvm-3", &owners, "g:x"), "b@jvm-3");
+        assert_eq!(declared_by(&ws, "c@jvm-3", &owners, "g:y"), "b@jvm-3");
+        // A variant's own provided and test dependencies are on its own test classpath.
+        assert_eq!(declared_by(&ws, "a@jvm-3", &["a@jvm-3".to_string()], "g:y"), "a@jvm-3");
+    }
 
     #[test]
     fn pattern_matching() {

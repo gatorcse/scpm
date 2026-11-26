@@ -86,9 +86,11 @@ impl Auth {
 }
 
 impl Repo {
-    /// `host[:port]` of the URL.
-    pub fn host(&self) -> Option<&str> {
-        self.url.split_once("://").map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+    /// `scheme://host[:port]` of the URL.
+    pub fn origin(&self) -> Option<&str> {
+        let (scheme, rest) = self.url.split_once("://")?;
+        let authority = rest.split('/').next().unwrap_or(rest);
+        Some(&self.url[..scheme.len() + 3 + authority.len()])
     }
 
     /// The configured credentials, read from the environment. A missing or empty variable is
@@ -162,6 +164,15 @@ pub fn repositories(config: &[Repository]) -> Result<Vec<Repo>, CoursierError> {
                         password_var: env_name(&def.id, password, "password")?,
                     }),
                 };
+                // `user:password@` would reach `cs`'s command line (and the lock's URLs).
+                if def.url.split_once("://").is_some_and(|(_, rest)| {
+                    rest.split(['/', '?', '#']).next().is_some_and(|authority| authority.contains('@'))
+                }) {
+                    return Err(CoursierError::Config(format!(
+                        "repository `{}`: the URL must not contain credentials (`user@`); use `credentials: {{user: env:U, password: env:P}}`",
+                        def.id
+                    )));
+                }
                 let url = if def.url.ends_with('/') { def.url.clone() } else { format!("{}/", def.url) };
                 Ok(Repo { id: def.id.clone(), url, credentials })
             }
@@ -192,10 +203,14 @@ pub fn cache_dir() -> PathBuf {
 }
 
 /// Where coursier stores the file for `url` (mirrors `coursier.paths.CachePath.localFile`).
+/// `None` if the path would leave the cache (`.`/`..` or empty segments, or an absolute path).
 pub fn cache_path(cache: &Path, url: &str, user: Option<&str>) -> Option<PathBuf> {
     let (protocol, rest) = url.split_once("://")?;
     let user_part = user.map(|u| format!("{u}@")).unwrap_or_default();
-    Some(cache.join(escape(&format!("{protocol}/{user_part}{rest}"))))
+    let rel = escape(&format!("{protocol}/{user_part}{rest}"));
+    let contained = rel.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains('\\'))
+        && Path::new(&rel).is_relative();
+    contained.then(|| cache.join(rel))
 }
 
 /// The cached file for `url` downloaded with *some* user (`<protocol>/<user>@<host>/…`), for
@@ -248,23 +263,27 @@ pub fn url_from_cache_path(cache: &Path, file: &Path) -> Option<String> {
     Some(format!("{protocol}://{rest}"))
 }
 
+/// Inverse of [`escape`]: each `%XX` is one UTF-16 code unit (coursier escapes units, not
+/// UTF-8 bytes, so `é` is `%E9`).
 fn unescape(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("zz"), 16)
-        {
-            out.push(b);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
+    let mut units: Vec<u16> = Vec::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let mut ahead = chars.clone();
+            let hex: String = ahead.by_ref().take(2).collect();
+            if hex.len() == 2
+                && let Ok(unit) = u16::from_str_radix(&hex, 16)
+            {
+                units.push(unit);
+                chars = ahead;
+                continue;
+            }
         }
+        let mut buf = [0u16; 2];
+        units.extend_from_slice(c.encode_utf16(&mut buf));
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf16_lossy(&units)
 }
 
 /// The `cs` binary: `SCPM_CS` or `cs` on `PATH`.
@@ -547,13 +566,14 @@ fn add_common_args(cmd: &mut Command, repos: &[Repo], cache: &Path) -> Result<Co
     let mut missing_credentials = Vec::new();
     for (i, repo) in repos.iter().enumerate() {
         cmd.arg("--repository").arg(&repo.url);
-        let Some(host) = repo.host() else { continue };
+        let Some(origin) = repo.origin() else { continue };
         match repo.auth() {
             Ok(Some(auth)) => {
-                let https_only = !repo.url.starts_with("http://");
+                // `scheme://host[:port]` scopes the credentials to the repository's scheme, host
+                // and port (coursier 2.1.27 ignores `https-only` for a host with a scheme).
                 properties.push_str(&format!(
-                    "scpm{i}.host={}\nscpm{i}.username={}\nscpm{i}.password={}\nscpm{i}.auto=true\nscpm{i}.https-only={https_only}\n",
-                    escape_property(crate::credentials::hostname(host)),
+                    "scpm{i}.host={}\nscpm{i}.username={}\nscpm{i}.password={}\nscpm{i}.auto=true\n",
+                    escape_property(origin),
                     escape_property(auth.user()),
                     escape_property(auth.password()),
                 ));
@@ -591,6 +611,9 @@ fn escape_property(value: &str) -> String {
             }
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
+            // Java's reader drops leading tabs and form feeds of a value; escaped, they survive.
+            '\t' => out.push_str("\\t"),
+            '\u{c}' => out.push_str("\\f"),
             c => out.push(c),
         }
     }
@@ -634,6 +657,8 @@ pub fn artifact_key(coord: &str, file: &Path) -> Option<String> {
 }
 
 /// The Maven repository path for a lock key: `g/r/o/u/p/artifact/version/artifact-version[-classifier].ext`.
+/// `None` for a malformed key, including components that would navigate paths (empty, `.`,
+/// `..`, or containing `/` or `\`), since lock keys become cache paths.
 pub fn maven_path(key: &str) -> Option<String> {
     let (coords, ext) = match key.split_once('@') {
         Some((c, e)) => (c, e),
@@ -645,6 +670,10 @@ pub fn maven_path(key: &str) -> Option<String> {
         [g, a, v, c] => (*g, *a, *v, Some(*c)),
         _ => return None,
     };
+    let safe = |s: &str| !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\']);
+    if !(group.split('.').all(safe) && [artifact, version, ext].into_iter().chain(classifier).all(safe)) {
+        return None;
+    }
     let suffix = classifier.map(|c| format!("-{c}")).unwrap_or_default();
     Some(format!("{}/{artifact}/{version}/{artifact}-{version}{suffix}.{ext}", group.replace('.', "/")))
 }
@@ -686,6 +715,72 @@ mod tests {
         let aar = artifact_key("g.x:a:1.0", Path::new("a-1.0.aar")).unwrap();
         assert_eq!(aar, "g.x:a:1.0@aar");
         assert_eq!(maven_path(&aar).unwrap(), "g/x/a/1.0/a-1.0.aar");
+    }
+
+    #[test]
+    fn lock_keys_cannot_leave_the_cache() {
+        for key in [
+            "g:a:..",
+            "g:..:1",
+            "..:a:1",
+            "g..x:a:1",
+            "g:a/b:1",
+            "g:a:1:../../x",
+            "g:a:1@../x",
+            "g:a:1@",
+            "g:a:1\\x",
+            "g::1",
+        ] {
+            assert_eq!(maven_path(key), None, "{key}");
+        }
+        let cache = Path::new("/c");
+        assert!(cache_path(cache, "https://h/a/../../../etc/passwd", None).is_none());
+        assert!(cache_path(cache, "https://h/a//b", None).is_none());
+        assert!(cache_path(cache, "https://h/./a", None).is_none());
+        assert!(cache_path(cache, "https://h/a/b.jar", None).is_some());
+    }
+
+    #[test]
+    fn non_ascii_cache_paths_round_trip() {
+        let cache = Path::new("/c");
+        let url = "https://h.example/dépôt/g/a/1/a-1.jar";
+        let path = cache_path(cache, url, None).unwrap();
+        assert_eq!(path, Path::new("/c/https/h.example/d%E9p%F4t/g/a/1/a-1.jar"));
+        assert_eq!(url_from_cache_path(cache, &path).unwrap(), url);
+    }
+
+    #[test]
+    fn repository_urls_must_not_carry_credentials() {
+        let repo = |url: &str| {
+            repositories(&[Repository::Full(crate::config::RepositoryDef {
+                id: "acme".into(),
+                url: url.into(),
+                credentials: None,
+            })])
+        };
+        let err = repo("https://alice:hunter2@acme.example/maven").unwrap_err().to_string();
+        assert!(err.contains("must not contain credentials") && !err.contains("hunter2"), "{err}");
+        assert!(repo("https://acme.example/maven/@scope/").is_ok(), "an `@` in the path is fine");
+    }
+
+    #[test]
+    fn configured_credentials_are_scoped_to_the_repository_origin() {
+        let var = "SCPM_TEST_ORIGIN_SCOPE_TOKEN";
+        // SAFETY: the variable name is unique to this test.
+        unsafe { env::set_var(var, "tok3n") };
+        let repos = vec![Repo {
+            id: "r".into(),
+            url: "https://repo.example:8443/maven/".into(),
+            credentials: Some(RepoCredentials::Bearer { token_var: var.into() }),
+        }];
+        let mut cmd = Command::new("cs");
+        let common = add_common_args(&mut cmd, &repos, Path::new("/c")).unwrap();
+        let text = fs::read_to_string(common._credential_file.as_ref().unwrap().path()).unwrap();
+        assert!(!cmd.get_args().any(|a| a.to_string_lossy().contains("tok3n")));
+        let parsed = crate::credentials::CoursierCredentials { entries: crate::credentials::parse_properties(&text) };
+        assert_eq!(parsed.find("https://repo.example:8443/maven/x.jar").unwrap().password, "tok3n");
+        assert!(parsed.find("https://repo.example/maven/x.jar").is_none(), "another port");
+        assert!(parsed.find("https://repo.example:9443/maven/x.jar").is_none(), "another port");
     }
 
     fn repo_with(credentials: Credentials) -> Result<Vec<Repo>, CoursierError> {
@@ -742,6 +837,13 @@ mod tests {
             escape_property("p=a:s#s\\")
         ));
         assert_eq!(parsed[0].password, "p=a:s#s\\");
+        for value in ["\tpw", "\u{c}pw", " pw", "p\tw"] {
+            let parsed = crate::credentials::parse_properties(&format!(
+                "x.host=h\nx.username=u\nx.password={}\n",
+                escape_property(value)
+            ));
+            assert_eq!(parsed[0].password, value, "{value:?}");
+        }
     }
 
     #[test]

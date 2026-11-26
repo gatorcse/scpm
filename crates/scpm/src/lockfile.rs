@@ -133,6 +133,18 @@ impl Lockfile {
         }) {
             return Err(LockError::Conflict(line + 1));
         }
+        // The version first, leniently: a newer format may add fields this version's strict
+        // schema rejects, and such a lock must not be mistaken for a corrupt (rebuildable) one.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Header {
+            lockfile_version: Option<u32>,
+        }
+        if let Ok(Header { lockfile_version: Some(version) }) = serde_yaml_ng::from_str::<Header>(&text)
+            && version != LOCKFILE_VERSION
+        {
+            return Err(LockError::Version(version));
+        }
         let lock: Lockfile = serde_yaml_ng::from_str(&text).map_err(|e| LockError::Parse(e.to_string()))?;
         if lock.lockfile_version != LOCKFILE_VERSION {
             return Err(LockError::Version(lock.lockfile_version));
@@ -235,6 +247,15 @@ mod tests {
         assert!(Lockfile::read(dir.path()).unwrap_err().is_corrupt());
         fs::write(&path, "lockfileVersion: 99\nresolutionContext: {os: linux, arch: x86_64, jdk: '25'}\n").unwrap();
         assert!(!Lockfile::read(dir.path()).unwrap_err().is_corrupt());
+        // A newer format with fields this version doesn't know is a version error, not corruption.
+        fs::write(&path, "lockfileVersion: 2\nresolutionContext: {os: linux, arch: x86_64, jdk: '25'}\nnewField: {}\n")
+            .unwrap();
+        let err = Lockfile::read(dir.path()).unwrap_err();
+        assert!(matches!(err, LockError::Version(2)) && !err.is_corrupt(), "{err}");
+        // An unknown field in a v1 lock is still corruption.
+        fs::write(&path, "lockfileVersion: 1\nresolutionContext: {os: linux, arch: x86_64, jdk: '25'}\nnewField: {}\n")
+            .unwrap();
+        assert!(Lockfile::read(dir.path()).unwrap_err().is_corrupt());
     }
 
     #[test]

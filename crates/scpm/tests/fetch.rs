@@ -31,7 +31,58 @@ fn item(url: String, dest: &Path, body: &[u8]) -> FetchItem {
         sha256: sha256(body),
         size: body.len() as u64,
         auth: Ok(None),
+        challenge: Vec::new(),
+        verify_cached: false,
     }
+}
+
+#[test]
+fn oversized_bodies_are_rejected_before_they_are_written() {
+    let big = vec![b'x'; 4 << 20];
+    let server = Server::start(move |_, _| Reply::Ok(big.clone()));
+    let cache = tempfile::tempdir().unwrap();
+    let dest = cache.path().join("hello-1.0.jar");
+    let err =
+        fetch_all(vec![item(server.url(HELLO_JAR_PATH), &dest, JAR)], FetchOptions::default()).unwrap_err().to_string();
+    assert!(err.contains("but the lock says"), "{err}");
+    assert!(!dest.exists());
+    assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 0, "no partial file is left behind");
+}
+
+#[test]
+fn realm_scoped_credentials_wait_for_a_matching_challenge() {
+    // The test server challenges with `Basic realm="test"`.
+    let server = Server::maven(hello_repo_files(JAR), Some(("alice", "s3cret")));
+    let repos = vec![Repo { id: "local".into(), url: server.url("/maven/"), credentials: None }];
+    let cache = tempfile::tempdir().unwrap();
+
+    let other = CoursierCredentials::from_env_value(&format!("http://127.0.0.1:{}(other) alice:s3cret", server.port));
+    let items = fetch_items(&hello_lock(), &repos, &other, cache.path()).unwrap();
+    assert!(matches!(items[0].auth, Ok(None)), "realm-scoped credentials are not sent up front");
+    let err = fetch_all(items, FetchOptions::default()).unwrap_err().to_string();
+    assert!(err.contains("HTTP 401"), "{err}");
+    assert!(server.requests.lock().unwrap().iter().all(|r| r.authorization.is_none()), "wrong realm: never sent");
+
+    let creds = CoursierCredentials::from_env_value(&format!("http://127.0.0.1:{}(test) alice:s3cret", server.port));
+    let items = fetch_items(&hello_lock(), &repos, &creds, cache.path()).unwrap();
+    // Not matched up front, so coursier's cache path has no `user@`.
+    assert!(!items[0].dest.to_string_lossy().contains("alice"));
+    assert_eq!(fetch_all(items, FetchOptions::default()).unwrap().downloaded, 1);
+}
+
+#[test]
+fn files_cached_under_another_user_are_hash_checked() {
+    let cache = tempfile::tempdir().unwrap();
+    let dest = cache.path().join("hello-1.0.jar");
+    let tampered = vec![b'!'; JAR.len()];
+    fs::write(&dest, &tampered).unwrap();
+    let mut it = item("http://127.0.0.1:9/never".into(), &dest, JAR);
+    it.auth = Err("repository `acme`: environment variable `ACME_USER` (user) is not set".into());
+    it.verify_cached = true;
+    let err = fetch_all(vec![it.clone()], FetchOptions::default()).unwrap_err().to_string();
+    assert!(err.contains("ACME_USER"), "a same-size file with other bytes is not trusted: {err}");
+    fs::write(&dest, JAR).unwrap();
+    assert_eq!(fetch_all(vec![it], FetchOptions::default()).unwrap().present, 1);
 }
 
 #[test]
@@ -142,7 +193,7 @@ fn coursier_credentials_authenticate_and_name_the_cache_directory() {
     let props = dir.path().join("credentials.properties");
     fs::write(&props, "local.host=127.0.0.1\nlocal.username=alice\nlocal.password=s3cret\nlocal.https-only=false\n")
         .unwrap();
-    let creds = CoursierCredentials::from_env_value(&props.display().to_string());
+    let creds = CoursierCredentials::from_env_value(&format!("file:{}", props.display()));
     let cache = tempfile::tempdir().unwrap();
 
     // Without credentials the server refuses.

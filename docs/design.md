@@ -524,7 +524,7 @@ resolutionContext: { os: linux, arch: x86_64, jdk: 25 }   # see below; a change 
 bootInputs: sha256:…             # repositories + resolution context; a change re-resolves every boot entry
 
 boot:                            # everything needed before a JVM starts; lists reference `artifacts`
-  jdk:                           # project JDK per os-arch; Phase 1 records only the JVM index id
+  jdk:                           # planned format (not written by Phase 1): project JDK per os-arch, a JVM index id
     linux-x86_64:  { id: temurin:25.0.1 }
     macos-aarch64: { id: temurin:25.0.1 }
   scala-compiler@3.9.0: [org.scala-lang:scala3-compiler_3:3.9.0, org.scala-lang:scala3-library_3:3.9.0, …]
@@ -532,7 +532,7 @@ boot:                            # everything needed before a JVM starts; lists 
   compiler-bridge@2.13.18+zinc-2.1.0: [org.scala-sbt:compiler-bridge_2.13:2.1.0]   # Scala 2 bridges come from Zinc
   worker: [dev.scpm:scpm-worker_3:0.4.2, …]
   test-runner: [dev.scpm:scpm-test-runner_3:0.4.2, org.scala-sbt:test-interface:1.0, …]
-  tools:
+  tools:                         # planned format (not written by Phase 1)
     scalafmt@3.10.1: [org.scalameta:scalafmt-cli_2.13:3.10.1, …]
     scalafix@0.14.4: [ch.epfl.scala:scalafix-cli_2.13.18:0.14.4, …]
 
@@ -582,7 +582,7 @@ Each variant locks four ordered classpaths:
 - **`inputsHash`** is a sha256 over every effective input that affects the variant's resolution, after presets and `variants` (§4.4): platform and full Scala version, dependencies of every scope (catalog references replaced by their entries), `compilerPlugins`, BOMs, overrides, repositories (ids and URLs), the resolution context and `policy.minimumReleaseAge` / `minimumReleaseAgeExclude`, plus what joint resolution consumes from each upstream variant in its workspace closure: its compile and runtime dependencies, BOMs and Scala version. An upstream variant's test or provided dependencies and compiler plugins don't affect downstream variants, so editing them re-locks only that variant.
 - A variant with `compilerPlugins` also has an ordered `compilerPlugins` list.
 
-**Artifacts** are keyed `group:artifact:version[:classifier][@type]`, with `@type` omitted for `jar`. Each file has one entry, shared by every variant that uses it, holding `repo`, `sha256` and `size`. The lock records no dependency graph between artifacts: it would depend on the order variants happened to be locked in, so `scpm why` asks coursier instead (below). Declared classifiers and types (`classifier: sources`, `type: exe`, `aar`, `test-jar`, `bundle`, …) are locked like any other file, and a direct dependency that resolves to no file is an error naming it. **IDE sources jars are not in the lock.** They are fetched on demand and verified against the repository's checksum.
+**Artifacts** are keyed `group:artifact:version[:classifier][@type]`, with `@type` omitted for `jar`. Each file has one entry, shared by every variant that uses it, holding `repo`, `sha256` and `size`. The lock records no dependency graph between artifacts: it would depend on the order variants happened to be locked in, so `scpm why` asks coursier instead (below). Declared classifiers and types (`classifier: sources`, `type: exe`, `aar`, `test-jar`, `bundle`, …) are locked like any other file, and a direct dependency that resolves to no file is an error naming it, except a plain POM-packaged aggregator (no classifier or non-jar type, such as `groovy-all`), which contributes only its transitive artifacts. **IDE sources jars are not in the lock.** They are fetched on demand and verified against the repository's checksum.
 
 **Boot** holds the closures of the Scala compiler, compiler bridge, scpm worker, test runner and tools (scalafmt, scalafix), each a list of references into `artifacts`. A CI run can then fetch everything it needs in parallel from Rust before any JVM starts. `boot.jdk` is the project JDK (§6.3), keyed by `os-arch` (`linux-x86_64`, `macos-aarch64`, …). In Phase 1 it records only the JVM index id, which `cs java-home --jvm <id>` turns into a cached JDK; the Rust JDK fetcher (Phase 3) adds a URL and sha256 per entry. Boot entries re-resolve when their inputs change: a Scala 2 compiler bridge's key carries the Zinc version (`compiler-bridge@2.13.18+zinc-2.1.0`), and the top-level `bootInputs` hash covers the repositories and the resolution context, so changing either re-resolves every boot entry.
 
@@ -601,7 +601,7 @@ A variant is **stale** when its recomputed `inputsHash` differs from the lock's.
 - `scpm install` — re-lock stale variants, then fetch whatever is missing.
 - `scpm install --frozen` — the default when `CI=true`; a stale variant is an error.
 - `scpm install --verify` — also re-hash cached files against the lock and re-download any that don't match.
-- A corrupt or merge-conflicted lock is re-locked from scratch (with a warning); with `--frozen` it is an error suggesting to delete `scpm-lock.yaml` and run `scpm install`, or to resolve the conflict.
+- A corrupt or merge-conflicted lock is re-locked from scratch (with a warning); with `--frozen` (and so in CI) it is an error suggesting to resolve the conflict, or to re-create the lock locally with a non-frozen `scpm install` and commit it.
 - `scpm compile|test|run` — locally, a stale lock is installed first (aube-style install-before-run) and scpm prints what changed. With `CI=true` or `--frozen`, a stale lock is an error.
 - `scpm ci` — `scpm install --frozen`, then `compile` and `test` over the whole workspace; from Phase 3, `scpm install --frozen` then `scpm pipeline`.
 - `scpm update [selector]` — re-resolve within the declared ranges.
@@ -679,7 +679,7 @@ The trust anchor is the advisory database's "fixed in" data (curated GHSA/OSV), 
 
 ### 5.7 Enterprise repositories (optional fast paths)
 
-**Credentials.** A repository's `credentials` is either `env:VAR` (sent as a bearer token) or `{user: env:U, password: env:P}` (basic auth). Phase 1's Rust fetcher reads those, plus coursier's `COURSIER_CREDENTIALS` / `credentials.properties` for matching hosts. Coursier's credential sources only express basic auth, so when `cs` resolves a stale lock scpm passes a bearer token as a basic-auth password of the user `token` (which Artifactory and GitHub Packages accept) **[verify per repository type in Phase 1]**. Secrets never go on `cs`'s command line: scpm writes them to a private (0600) temporary `--credential-file`, matching the host without its port, as coursier does. The environment variables are read only when a repository is actually contacted, so cached `classpath`, `why` and a frozen restore with everything cached work without them; an empty variable is an error.
+**Credentials.** A repository's `credentials` is either `env:VAR` (sent as a bearer token) or `{user: env:U, password: env:P}` (basic auth). Phase 1's Rust fetcher reads those, plus coursier's `COURSIER_CREDENTIALS` / `credentials.properties` for matching hosts. Coursier's credential sources only express basic auth, so when `cs` resolves a stale lock scpm passes a bearer token as a basic-auth password of the user `token` (which Artifactory and GitHub Packages accept) **[verify per repository type in Phase 1]**. Secrets never go on `cs`'s command line (a repository URL with `user@` is rejected): scpm writes them to a private (0600) temporary `--credential-file`, scoped to the repository's scheme, host and port (coursier 2.1.27's `scheme://host:port` form). Coursier's own entries are matched the same way, a realm-scoped one only after a challenge naming its realm. The environment variables are read only when needed: a frozen restore and `classpath` with every artifact cached work without them. `why` and re-locking start `cs`, which passes the credentials it can read and needs them for any POM it has not cached (a Rust restore fetches jars, not POMs); an empty variable is an error.
 
 Correctness always comes from coursier. These only speed up `outdated`, version listing and checksums:
 
