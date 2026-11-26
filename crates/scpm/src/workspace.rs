@@ -713,6 +713,9 @@ fn discover_modules(
     }
     let mut include = GlobSetBuilder::new();
     let mut exclude = GlobSetBuilder::new();
+    // The part before `/**` of each `!…/**` exclusion: everything under a match is excluded.
+    let mut recursive = GlobSetBuilder::new();
+    let mut exclude_all = false;
     // Only the literal prefix of each include glob is walked (`modules/*` walks `modules/`), so
     // large trees elsewhere in the workspace are never traversed.
     let mut walk_roots = BTreeSet::new();
@@ -726,6 +729,13 @@ fn discover_modules(
             Ok(glob) => {
                 if negated {
                     exclude.add(glob);
+                    if pat == "**" {
+                        exclude_all = true;
+                    } else if let Some(prefix) = pat.strip_suffix("/**")
+                        && let Ok(g) = GlobBuilder::new(prefix).literal_separator(true).build()
+                    {
+                        recursive.add(g);
+                    }
                 } else {
                     include.add(glob);
                     walk_roots.extend(literal_prefix(pat));
@@ -742,6 +752,15 @@ fn discover_modules(
     }
     let (include, exclude): (GlobSet, GlobSet) =
         (include.build().unwrap_or_default(), exclude.build().unwrap_or_default());
+    let recursive = recursive.build().unwrap_or_default();
+    // Whether `dir` and everything beneath it is excluded: `dir` itself is, and a `!…/**`
+    // exclusion covers it (its prefix matches `dir` or an ancestor). `!modules/b` alone leaves
+    // `modules/b/c` included, and finite-depth patterns (`!modules/b/*/*`) never cover a subtree.
+    let fully_excluded = |dir: &Path| {
+        !dir.as_os_str().is_empty()
+            && exclude.is_match(dir)
+            && (exclude_all || dir.ancestors().any(|a| !a.as_os_str().is_empty() && recursive.is_match(a)))
+    };
     // A root nested in another is walked as part of it.
     let walk_roots: Vec<PathBuf> = walk_roots
         .iter()
@@ -772,10 +791,7 @@ fn discover_modules(
             Ok(entry) => entry,
             Err(e) if is_skippable_walk_error(&e) => continue,
             // Errors inside a fully excluded subtree don't matter.
-            Err(e)
-                if walk_error_path(&e)
-                    .is_some_and(|p| rel(root, p).ancestors().any(|a| fully_excluded(&exclude, a))) =>
-            {
+            Err(e) if walk_error_path(&e).is_some_and(|p| rel(root, p).ancestors().any(fully_excluded)) => {
                 continue;
             }
             Err(e) => {
@@ -815,21 +831,6 @@ fn is_skippable_walk_error(err: &ignore::Error) -> bool {
         ignore::Error::Io(e) => e.kind() == std::io::ErrorKind::NotFound,
         _ => false,
     }
-}
-
-/// Whether `dir` and everything beneath it is excluded (`!modules/b` plus `!modules/b/**`).
-/// Exclusions are checked per module directory, so `!modules/b` alone leaves `modules/b/c`
-/// included. Globs can't be compared, so this probes a few levels down; when unsure it says no,
-/// and the walk error is reported.
-fn fully_excluded(exclude: &GlobSet, dir: &Path) -> bool {
-    if dir.as_os_str().is_empty() || !exclude.is_match(dir) {
-        return false;
-    }
-    let mut probe = dir.to_path_buf();
-    (0..3).all(|_| {
-        probe.push("scpm-probe");
-        exclude.is_match(&probe)
-    })
 }
 
 /// The path a walk error is about, if it names one.

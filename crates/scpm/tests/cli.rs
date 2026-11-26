@@ -833,7 +833,12 @@ fn module_discovery_reports_unreadable_directories() {
         fs::write(dir.path().join("scpm-workspace.yaml"), ws).unwrap();
         let err = config_error(dir.path(), &["ls"]);
         assert!(err.contains("cannot search for modules"), "{err}");
-        // A fully excluded subtree's errors don't.
+        // Finite-depth exclusions leave deeper module directories included.
+        let ws = "toolchain: {scala: '3.9.0'}\nmodules: ['modules/**', '!modules/b', '!modules/b/*', '!modules/b/*/*', '!modules/b/*/*/*']\n";
+        fs::write(dir.path().join("scpm-workspace.yaml"), ws).unwrap();
+        let err = config_error(dir.path(), &["ls"]);
+        assert!(err.contains("cannot search for modules"), "{err}");
+        // A fully excluded subtree's errors don't matter.
         let ws = "toolchain: {scala: '3.9.0'}\nmodules: ['modules/**', '!modules/b', '!modules/b/**']\n";
         fs::write(dir.path().join("scpm-workspace.yaml"), ws).unwrap();
         assert_eq!(ls_ids(dir.path(), &[]), vec!["a@jvm-3"]);
