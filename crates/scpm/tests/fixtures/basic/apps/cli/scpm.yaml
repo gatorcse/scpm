@@ -1,0 +1,9 @@
+name: cli
+platforms: [jvm]
+mainClass: example.Main
+dependencies:
+  core: workspace:*
+  javalib: workspace:*
+testDependencies:
+  util: workspace:*
+jvmOptions: [-Xmx512m]

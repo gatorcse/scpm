@@ -1,0 +1,30 @@
+$schema: https://scpm.dev/schema/workspace-1.json
+modules:
+  - modules/*
+  - apps/*
+  - '!modules/fixtures-*'
+organization: com.example
+toolchain:
+  scala: catalog
+catalog:
+  scala: 3.9.0
+  org.typelevel::cats-core: 2.13.0
+  org.scalameta::munit: 1.2.1
+catalogs:
+  scala213:
+    scala: 2.13.18
+    org.typelevel::cats-core: 2.12.0
+boms:
+  - com.fasterxml.jackson:jackson-bom:2.20.1
+presets:
+  library:
+    scalacOptions: [-deprecation, -feature]
+    publish: true
+    versionScheme: early-semver
+    testDependencies:
+      org.scalameta::munit: catalog
+  strict:
+    extends: [library]
+    scalacOptions: [-Werror]
+  cross:
+    scala: [catalog, catalog:scala213]
