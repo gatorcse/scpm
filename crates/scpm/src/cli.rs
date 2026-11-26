@@ -267,6 +267,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
             if cli.json {
                 print_json(&report)?;
             } else {
+                for n in &report.notices {
+                    eprintln!("note: {n}");
+                }
                 let mut out = io::stdout().lock();
                 if report.paths.is_empty() && report.unexplained.is_empty() {
                     writeln!(out, "`{artifact}` is not on any selected classpath")?;
@@ -392,6 +395,9 @@ fn ensure_installed(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<Lockf
     for w in &summary.warnings {
         eprintln!("warning: {w}");
     }
+    for n in &summary.notices {
+        eprintln!("note: {n}");
+    }
     if !summary.relocked.is_empty() || summary.fetch.downloaded > 0 {
         eprintln!("installed: {} re-locked, {} downloaded", summary.relocked.len(), summary.fetch.downloaded);
     }
@@ -408,6 +414,9 @@ fn in_ci() -> bool {
 fn print_install_summary(s: &InstallSummary) -> io::Result<()> {
     for w in &s.warnings {
         eprintln!("warning: {w}");
+    }
+    for n in &s.notices {
+        eprintln!("note: {n}");
     }
     let mut out = io::stdout().lock();
     let removed = if s.removed.is_empty() { String::new() } else { format!("removed {}", s.removed.join(", ")) };

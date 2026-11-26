@@ -974,16 +974,37 @@ fn foreign_mirror_settings_do_not_redirect_cs() {
         "dependencies:\n  com.example:hello: '1.0'\n",
     );
     let cache = tempfile::tempdir().unwrap();
-    scpm(ws.path(), cache.path())
-        .envs(hostile.iter().map(|(k, v)| (*k, v.as_os_str())))
-        .env("COURSIER_MODE", "offline")
-        .env("COURSIER_TTL", "0")
-        .env("COURSIER_REPOSITORIES", &elsewhere)
-        .arg("install")
-        .assert()
-        .success();
+    let hostile_scpm = || {
+        let mut cmd = scpm(ws.path(), cache.path());
+        cmd.envs(hostile.iter().map(|(k, v)| (*k, v.as_os_str())))
+            .env("COURSIER_MODE", "offline")
+            .env("COURSIER_TTL", "0")
+            .env("COURSIER_REPOSITORIES", &elsewhere)
+            // Not the developer's own ~/.m2.
+            .env("HOME", ws.path());
+        cmd
+    };
+    let out = hostile_scpm().arg("install").assert().success();
     assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "local");
     let jar = cache.path().join(format!("http/127.0.0.1%3A{}/maven/com/example/hello/1.0/hello-1.0.jar", server.port));
     assert_eq!(fs::read(jar).unwrap(), b"the real jar");
     assert!(server.count(HELLO_JAR_PATH) >= 1);
+
+    // One notice names an ignored setting that touched the repository, and how to see more.
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert_eq!(stderr.matches("note:").count(), 1, "{stderr}");
+    assert!(stderr.contains("~/hostile-m2/settings.xml (CS_MAVEN_HOME): mirror \"corp\" for *"), "{stderr}");
+    assert!(stderr.contains("is ignored for local (and 2 more settings)"), "{stderr}");
+    assert!(stderr.contains("scpm config explain"), "{stderr}");
+    // Nothing contacted, no notice.
+    let out = hostile_scpm().arg("install").assert().success();
+    assert!(!String::from_utf8_lossy(&out.get_output().stderr).contains("note:"));
+    // A failure that may be caused by an ignored setting carries the notice too.
+    java_workspace(
+        ws.path(),
+        "repositories:\n  - {id: local, url: 'http://127.0.0.1:1/maven'}\n",
+        "dependencies:\n  com.example:hello: '1.0'\n",
+    );
+    let err = stderr_of(hostile_scpm().arg("install"));
+    assert!(err.contains("note: ") && err.contains("scpm config explain"), "{err}");
 }

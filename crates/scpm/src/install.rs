@@ -53,6 +53,10 @@ pub struct InstallSummary {
     pub resolved_on: Option<HostPlatform>,
     pub fetch: FetchReport,
     pub warnings: Vec<String>,
+    /// Settings of other tools (Maven `settings.xml`, …) that touch the repositories this run
+    /// contacted and that scpm ignored (design §5.9).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
     pub resolve_ms: u128,
     pub fetch_ms: u128,
 }
@@ -625,7 +629,8 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
 
     let all: Vec<&ResolveRequest> =
         requests.values().chain(plugin_requests.values()).chain(boot_requests.values()).collect();
-    let results = resolve_concurrently(&all, &labels, &repos, &machine.proxy, &cache, scratch.path())?;
+    let results = resolve_concurrently(&all, &labels, &repos, &machine.proxy, &cache, scratch.path())
+        .map_err(|e| with_notice(e, &repos))?;
 
     record_artifacts(&mut lock, all.iter().flat_map(|req| &results[*req]), &repos)?;
     for (name, req) in &boot_requests {
@@ -690,7 +695,9 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     let fetch_started = Instant::now();
     let items = fetch_items(&lock, &repos, &CoursierCredentials::load(), &cache)?;
     let fetch = fetch::fetch_all(items, FetchOptions { verify: opts.verify, proxy: machine.proxy.clone() })
-        .map_err(InstallError::Fetch)?;
+        .map_err(|f| with_notice(InstallError::Fetch(f), &repos))?;
+    let contacted = !stale.is_empty() || !missing_boot.is_empty() || fetch.downloaded > 0;
+    let notices = if contacted { crate::foreign::take_notice(&repos).into_iter().collect() } else { Vec::new() };
     if fetch.repaired > 0 {
         warnings.push(format!(
             "{} cached artifact{} did not match the lock and {} downloaded again",
@@ -708,9 +715,19 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
         resolved_on,
         fetch,
         warnings,
+        notices,
         resolve_ms,
         fetch_ms: fetch_started.elapsed().as_millis(),
     })
+}
+
+/// Adds the notice about ignored settings of other tools to an error from contacting the
+/// repositories: one of them may be why it failed (design §5.9).
+pub(crate) fn with_notice(e: InstallError, repos: &[Repo]) -> InstallError {
+    match crate::foreign::take_notice(repos) {
+        Some(notice) => InstallError::Resolve(format!("{e}\n  note: {notice}")),
+        None => e,
+    }
 }
 
 fn same_arch(a: &str, b: &str) -> bool {
