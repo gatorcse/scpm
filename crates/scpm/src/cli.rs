@@ -84,6 +84,8 @@ pub enum GraphFormat {
 pub enum SchemaFile {
     Workspace,
     Module,
+    /// The user config with machine-local settings (design §5.9).
+    UserConfig,
 }
 
 /// Exit codes: 0 success, 1 the command failed (including writing its output), 2 invalid
@@ -147,7 +149,10 @@ enum Failure {
 
 impl From<install::InstallError> for Failure {
     fn from(e: install::InstallError) -> Self {
-        Failure::Command(e.to_string())
+        match e {
+            install::InstallError::MachineConfig(diags) => Failure::Config(diags),
+            other => Failure::Command(other.to_string()),
+        }
     }
 }
 
@@ -180,6 +185,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let schema = match file {
                 SchemaFile::Workspace => schemars::schema_for!(WorkspaceFile),
                 SchemaFile::Module => schemars::schema_for!(ModuleFile),
+                SchemaFile::UserConfig => schemars::schema_for!(crate::machine::UserConfigFile),
             };
             Ok(print_json(&schema)?)
         }

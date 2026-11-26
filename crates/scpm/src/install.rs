@@ -18,6 +18,7 @@ use crate::lockfile::{
     ArtifactLock, CatalogSelection, ClasspathEntry, LOCKFILE_VERSION, LockError, Lockfile, Platform as HostPlatform,
     ResolutionContextLock, Specifier, VariantLock,
 };
+use crate::machine::Machine;
 use crate::platform::Platform;
 use crate::semver::{Range, latest_release};
 use crate::version::VersionSpec;
@@ -75,6 +76,16 @@ pub enum InstallError {
     Resolve(String),
     #[error("{0}")]
     Fetch(fetch::FetchFailure),
+    /// The user config is invalid (design §5.9).
+    #[error("{0}")]
+    MachineConfig(crate::diag::Diagnostics),
+}
+
+/// The workspace's repositories with the machine settings applied (design §5.9).
+pub fn repositories(ws: &Workspace) -> Result<(Vec<Repo>, &'static Machine), InstallError> {
+    let machine = crate::machine::current().map_err(InstallError::MachineConfig)?;
+    let repos = coursier::repositories(&ws.repositories())?;
+    Ok((machine.apply(repos), machine))
 }
 
 /// The four locked classpaths of a variant (design §5.4).
@@ -485,10 +496,10 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
             unsupported.join(", ")
         )));
     }
-    let repos = coursier::repositories(&ws.repositories())?;
+    let (repos, machine) = repositories(ws)?;
     let cache = coursier::cache_dir();
     let ctx = resolution_context(ws);
-    let mut warnings = Vec::new();
+    let mut warnings = machine.warnings.clone();
     let previous = read_previous(&ws.root, opts.frozen, &mut warnings)?;
 
     let hashes: BTreeMap<String, String> =
@@ -935,7 +946,7 @@ pub fn classpath_files(
     id: &str,
     kind: ClasspathKind,
 ) -> Result<Vec<PathBuf>, InstallError> {
-    let repos = coursier::repositories(&ws.repositories())?;
+    let (repos, _) = repositories(ws)?;
     let cache = coursier::cache_dir();
     let variant = lock.variants.get(id).ok_or_else(|| InstallError::Stale(vec![id.to_string()]))?;
     let by_key: HashMap<String, FetchItem> = fetch_items(lock, &repos, &CoursierCredentials::load(), &cache)?
@@ -982,12 +993,14 @@ mod tests {
             url: coursier::CENTRAL_URL.into(),
             credentials: None,
             allow_insecure_credentials: false,
+            ..Default::default()
         }];
         let other = vec![Repo {
             id: "apache".into(),
             url: "https://repo.maven.apache.org/maven2/".into(),
             credentials: None,
             allow_insecure_credentials: false,
+            ..Default::default()
         }];
         let base = boot_inputs_hash(&central, &ctx);
         assert_eq!(base, boot_inputs_hash(&central, &ctx));
@@ -1063,12 +1076,14 @@ mod tests {
                 url: "https://a.example/".into(),
                 credentials: None,
                 allow_insecure_credentials: false,
+                ..Default::default()
             },
             Repo {
                 id: "b".into(),
                 url: "https://b.example/".into(),
                 credentials: None,
                 allow_insecure_credentials: false,
+                ..Default::default()
             },
         ];
         let resolved = |repo: &str| ResolvedArtifact {
@@ -1107,6 +1122,7 @@ mod tests {
             url: coursier::CENTRAL_URL.into(),
             credentials: None,
             allow_insecure_credentials: false,
+            ..Default::default()
         }];
         let err = fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c")).unwrap_err();
         assert!(err.to_string().contains("invalid artifact key"), "{err}");
@@ -1115,12 +1131,19 @@ mod tests {
     #[test]
     fn repo_matching_prefers_longest_prefix() {
         let repos = vec![
-            Repo { id: "a".into(), url: "https://h/".into(), credentials: None, allow_insecure_credentials: false },
+            Repo {
+                id: "a".into(),
+                url: "https://h/".into(),
+                credentials: None,
+                allow_insecure_credentials: false,
+                ..Default::default()
+            },
             Repo {
                 id: "b".into(),
                 url: "https://h/maven/".into(),
                 credentials: None,
                 allow_insecure_credentials: false,
+                ..Default::default()
             },
         ];
         assert_eq!(repo_for_url(&repos, "https://h/maven/x.jar").unwrap().id, "b");

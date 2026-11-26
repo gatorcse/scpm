@@ -58,6 +58,7 @@ fn realm_scoped_credentials_wait_for_a_matching_challenge() {
         url: server.url("/maven/"),
         credentials: None,
         allow_insecure_credentials: true,
+        ..Default::default()
     }];
     let cache = tempfile::tempdir().unwrap();
 
@@ -198,6 +199,7 @@ fn coursier_credentials_authenticate_and_name_the_cache_directory() {
         url: server.url("/maven/"),
         credentials: None,
         allow_insecure_credentials: true,
+        ..Default::default()
     }];
     let dir = tempfile::tempdir().unwrap();
     let props = dir.path().join("credentials.properties");
@@ -234,6 +236,7 @@ fn coursier_credentials_need_the_repository_opt_in_over_http() {
             url: server.url("/maven/"),
             credentials: None,
             allow_insecure_credentials: allow,
+            ..Default::default()
         }]
     };
     let cache = tempfile::tempdir().unwrap();
@@ -258,6 +261,7 @@ fn https_only_coursier_credentials_are_not_sent_over_http() {
         url: "http://127.0.0.1:1/maven/".into(),
         credentials: None,
         allow_insecure_credentials: false,
+        ..Default::default()
     }];
     let cache = tempfile::tempdir().unwrap();
     let items = fetch_items(&hello_lock(), &repos, &creds, cache.path()).unwrap();

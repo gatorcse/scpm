@@ -34,23 +34,109 @@ pub enum CoursierError {
     NoArtifact(String),
 }
 
-/// A configured repository. Credentials stay environment variable names until a request
-/// actually needs them (design §5.7), so cached operations work without the secrets.
-#[derive(Debug, Clone, PartialEq)]
+/// A configured repository. Credentials stay references (environment variable or file names)
+/// until a request actually needs them (design §5.7), so cached operations work without the
+/// secrets.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Repo {
     pub id: String,
     /// Always ends with `/`.
     pub url: String,
+    /// Credentials sent to [`Self::fetch_url`]: the workspace's, else the user config's
+    /// (design §5.9). Coursier's own credentials are looked up separately.
     pub credentials: Option<RepoCredentials>,
+    pub credentials_from: CredentialsFrom,
     /// `allowInsecureCredentials`: credentials may go to this `http://` repository's origin.
     pub allow_insecure_credentials: bool,
 }
 
-/// Where a repository's configured credentials come from: environment variable names.
+/// Where a repository's credentials are configured.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CredentialsFrom {
+    /// The repository's `credentials` in the workspace file.
+    #[default]
+    Workspace,
+    /// The user config entry for this URL (design §5.9).
+    UserConfig { url: String },
+}
+
+impl CredentialsFrom {
+    pub fn describe(&self) -> &'static str {
+        match self {
+            CredentialsFrom::Workspace => crate::config::WORKSPACE_FILE,
+            CredentialsFrom::UserConfig { .. } => "user config",
+        }
+    }
+}
+
+/// A repository's configured credentials, as references read only when needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoCredentials {
-    Bearer { token_var: String },
-    Basic { user_var: String, password_var: String },
+    Bearer { token: Secret },
+    Basic { user: Secret, password: Secret },
+}
+
+/// Where one credential value comes from.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Secret {
+    /// An environment variable.
+    Env(String),
+    /// A file's content, without a trailing newline (user config only).
+    File(PathBuf),
+    /// The value itself (user config only).
+    Literal(String),
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Secret::Env(var) => write!(f, "Env({var})"),
+            Secret::File(path) => write!(f, "File({})", path.display()),
+            Secret::Literal(_) => f.write_str("Literal(<redacted>)"),
+        }
+    }
+}
+
+impl Secret {
+    /// Reads the value; `what` names it in errors (`token`, `user`, `password`).
+    fn read(&self, repo: &Repo, what: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<String, CoursierError> {
+        let origin = match &repo.credentials_from {
+            CredentialsFrom::Workspace => String::new(),
+            CredentialsFrom::UserConfig { url } => format!(", from the user config entry for {url}"),
+        };
+        match self {
+            Secret::Env(var) => match lookup(var) {
+                Some(v) if !v.is_empty() => Ok(v),
+                Some(_) => Err(CoursierError::Config(format!(
+                    "repository `{}`: environment variable `{var}` ({what}{origin}) is empty",
+                    repo.id
+                ))),
+                None => Err(CoursierError::Config(format!(
+                    "repository `{}`: environment variable `{var}` ({what}{origin}) is not set",
+                    repo.id
+                ))),
+            },
+            Secret::File(path) => {
+                let text = fs::read_to_string(path).map_err(|e| {
+                    CoursierError::Config(format!(
+                        "repository `{}`: cannot read {what} file {} ({e}){origin}",
+                        repo.id,
+                        path.display()
+                    ))
+                })?;
+                let value = text.strip_suffix('\n').map(|t| t.strip_suffix('\r').unwrap_or(t)).unwrap_or(&text);
+                if value.is_empty() {
+                    return Err(CoursierError::Config(format!(
+                        "repository `{}`: {what} file {} is empty{origin}",
+                        repo.id,
+                        path.display()
+                    )));
+                }
+                Ok(value.to_string())
+            }
+            Secret::Literal(value) => Ok(value.clone()),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -104,35 +190,23 @@ impl Repo {
 
     /// [`Self::auth`] with the variables read through `lookup`.
     fn auth_with(&self, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Option<Auth>, CoursierError> {
-        let read = |var: &str, what: &str| -> Result<String, CoursierError> {
-            match lookup(var) {
-                Some(v) if !v.is_empty() => Ok(v),
-                Some(_) => Err(CoursierError::Config(format!(
-                    "repository `{}`: environment variable `{var}` ({what}) is empty",
-                    self.id
-                ))),
-                None => Err(CoursierError::Config(format!(
-                    "repository `{}`: environment variable `{var}` ({what}) is not set",
-                    self.id
-                ))),
-            }
-        };
         Ok(match &self.credentials {
             None => None,
-            Some(RepoCredentials::Bearer { token_var }) => Some(Auth::Bearer(read(token_var, "token")?)),
-            Some(RepoCredentials::Basic { user_var, password_var }) => {
-                Some(Auth::Basic { user: read(user_var, "user")?, password: read(password_var, "password")? })
-            }
+            Some(RepoCredentials::Bearer { token }) => Some(Auth::Bearer(token.read(self, "token", lookup)?)),
+            Some(RepoCredentials::Basic { user, password }) => Some(Auth::Basic {
+                user: user.read(self, "user", lookup)?,
+                password: password.read(self, "password", lookup)?,
+            }),
         })
     }
 
     /// The user in coursier's cache path for configured credentials, if known without the
-    /// password (`token` for bearer tokens; the user variable for basic auth).
+    /// password (`token` for bearer tokens; the user for basic auth).
     pub fn configured_user(&self) -> Option<String> {
         match &self.credentials {
             None => None,
             Some(RepoCredentials::Bearer { .. }) => Some("token".to_string()),
-            Some(RepoCredentials::Basic { user_var, .. }) => env::var(user_var).ok().filter(|u| !u.is_empty()),
+            Some(RepoCredentials::Basic { user, .. }) => user.read(self, "user", &|var| env::var(var).ok()).ok(),
         }
     }
 }
@@ -156,7 +230,7 @@ pub fn repositories(config: &[Repository]) -> Result<Vec<Repo>, CoursierError> {
         .iter()
         .map(|r| match r {
             Repository::Named(name) if name == "central" => {
-                Ok(Repo { id: "central".into(), url: CENTRAL_URL.into(), credentials: None, allow_insecure_credentials: false })
+                Ok(Repo { id: "central".into(), url: CENTRAL_URL.into(), ..Default::default() })
             }
             Repository::Named(name) => Err(CoursierError::Config(format!(
                 "unknown repository `{name}`; the only built-in name is `central`, others need `{{id, url}}`"
@@ -165,11 +239,11 @@ pub fn repositories(config: &[Repository]) -> Result<Vec<Repo>, CoursierError> {
                 let credentials = match &def.credentials {
                     None => None,
                     Some(Credentials::Bearer(token)) => {
-                        Some(RepoCredentials::Bearer { token_var: env_name(&def.id, token, "token")? })
+                        Some(RepoCredentials::Bearer { token: Secret::Env(env_name(&def.id, token, "token")?) })
                     }
                     Some(Credentials::Basic { user, password }) => Some(RepoCredentials::Basic {
-                        user_var: env_name(&def.id, user, "user")?,
-                        password_var: env_name(&def.id, password, "password")?,
+                        user: Secret::Env(env_name(&def.id, user, "user")?),
+                        password: Secret::Env(env_name(&def.id, password, "password")?),
                     }),
                 };
                 // `user:password@` would reach `cs`'s command line (and the lock's URLs).
@@ -196,13 +270,14 @@ pub fn repositories(config: &[Repository]) -> Result<Vec<Repo>, CoursierError> {
                     url,
                     credentials,
                     allow_insecure_credentials: def.allow_insecure_credentials,
+                    ..Default::default()
                 })
             }
         })
         .collect()
 }
 
-fn is_plain_http(url: &str) -> bool {
+pub(crate) fn is_plain_http(url: &str) -> bool {
     url.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://"))
 }
 
@@ -896,8 +971,9 @@ mod tests {
         let repos = vec![Repo {
             id: "r".into(),
             url: "https://repo.example:8443/maven/".into(),
-            credentials: Some(RepoCredentials::Bearer { token_var: "REPO_TOKEN".into() }),
+            credentials: Some(RepoCredentials::Bearer { token: Secret::Env("REPO_TOKEN".into()) }),
             allow_insecure_credentials: false,
+            ..Default::default()
         }];
         let lookup = |var: &str| (var == "REPO_TOKEN").then(|| "tok3n".to_string());
         let mut missing = Vec::new();
@@ -945,6 +1021,7 @@ mod tests {
             url: url.into(),
             credentials: None,
             allow_insecure_credentials: allow,
+            ..Default::default()
         };
         let coursier = crate::credentials::CoursierCredentials {
             entries: crate::credentials::parse_properties(
@@ -1002,6 +1079,7 @@ mod tests {
             url: "http://127.0.0.1:8080/m/".into(),
             credentials: None,
             allow_insecure_credentials: false,
+            ..Default::default()
         }];
         let common = add_common_args(&mut cmd, &repos, Path::new("/c")).unwrap();
         let file = common._credential_file.as_ref().unwrap();
@@ -1027,6 +1105,7 @@ mod tests {
             url: "https://repo.example/m/".into(),
             credentials: None,
             allow_insecure_credentials: false,
+            ..Default::default()
         }];
         let common = add_common_args(&mut cmd, &repos, Path::new("/c")).unwrap();
         let sealed = common._sealed_dir.as_ref().unwrap().path();

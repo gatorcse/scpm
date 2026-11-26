@@ -64,7 +64,7 @@ pub fn why(
     pattern: &str,
     selected: &[String],
 ) -> Result<WhyReport, InstallError> {
-    let repos = coursier::repositories(&ws.repositories())?;
+    let (repos, _) = crate::install::repositories(ws)?;
     let cache = coursier::cache_dir();
     let mut report = WhyReport::default();
     for id in selected {

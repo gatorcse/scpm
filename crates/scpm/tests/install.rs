@@ -46,6 +46,8 @@ fn copy_dir(from: &Path, to: &Path) {
 fn scpm(dir: &Path, cache: &Path) -> Command {
     let mut cmd = Command::cargo_bin("scpm").unwrap();
     cmd.arg("-C").arg(dir).env("COURSIER_CACHE", cache).env_remove("CI").env_remove("COURSIER_CREDENTIALS");
+    // Never the developer's own machine settings.
+    cmd.env("SCPM_CONFIG", Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-user-config.yaml"));
     cmd
 }
 
@@ -499,6 +501,60 @@ fn coursier_credentials_are_used_for_repositories_without_configured_ones() {
         .join(format!("http/alice%40127.0.0.1%3A{}/maven/com/example/hello/1.0/hello-1.0.jar", server.port));
     assert_eq!(fs::read(&jar).unwrap(), b"hello jar");
     assert!(server.count(HELLO_JAR_PATH) >= 2);
+}
+
+#[test]
+fn user_config_credentials_reach_cs_and_the_fetcher() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    let server = Server::maven(hello_repo_files(b"hello jar"), Some(("alice", "s3cret-pass")));
+    let ws = tempfile::tempdir().unwrap();
+    let config = ws.path().join("user-config.yaml");
+    fs::write(
+        &config,
+        format!("credentials:\n  - {{url: '{}', user: alice, password: 'env:NEXUS_PASS'}}\n", server.url("/")),
+    )
+    .unwrap();
+    let workspace = |opt_in: &str| {
+        java_workspace(
+            ws.path(),
+            &format!("repositories:\n  - {{id: local, url: '{}'{opt_in}}}\n", server.url("/maven")),
+            "dependencies:\n  com.example:hello: '1.0'\n",
+        )
+    };
+    let (wrapper, log) = logging_cs(ws.path());
+    let with_config = |cache: &Path| {
+        let mut cmd = scpm(ws.path(), cache);
+        cmd.env("SCPM_CONFIG", &config).env("NEXUS_PASS", "s3cret-pass").env("SCPM_CS", &wrapper);
+        cmd
+    };
+    // Over plain HTTP they need the repository's opt-in, like coursier's own.
+    workspace("");
+    let cache = tempfile::tempdir().unwrap();
+    let err = stderr_of(with_config(cache.path()).arg("install"));
+    assert!(err.contains("401") || err.contains("nauthorized"), "{err}");
+    assert!(server.requests.lock().unwrap().iter().all(|r| r.authorization.is_none()));
+
+    workspace(", allowInsecureCredentials: true");
+    with_config(cache.path()).arg("install").assert().success();
+    assert!(!fs::read_to_string(&log).unwrap().contains("s3cret-pass"));
+    let empty = tempfile::tempdir().unwrap();
+    with_config(empty.path()).args(["install", "--frozen"]).assert().success();
+    let jar = empty
+        .path()
+        .join(format!("http/alice%40127.0.0.1%3A{}/maven/com/example/hello/1.0/hello-1.0.jar", server.port));
+    assert_eq!(fs::read(&jar).unwrap(), b"hello jar");
+
+    // A missing variable names the user config.
+    let other = tempfile::tempdir().unwrap();
+    let err = stderr_of(scpm(ws.path(), other.path()).env("SCPM_CONFIG", &config).args(["install", "--frozen"]));
+    assert!(err.contains("`NEXUS_PASS`") && err.contains("user config"), "{err}");
+    // The file is parsed strictly: an unknown key is a configuration error.
+    fs::write(&config, "mirror: []\n").unwrap();
+    let out = scpm(ws.path(), other.path()).env("SCPM_CONFIG", &config).arg("install").assert().code(2);
+    let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(err.contains("user-config.yaml") && err.contains("mirrors"), "{err}");
 }
 
 #[test]

@@ -14,7 +14,8 @@ fn fixture(name: &str) -> PathBuf {
 
 fn scpm(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("scpm").unwrap();
-    cmd.arg("-C").arg(dir);
+    // Never the developer's own machine settings.
+    cmd.arg("-C").arg(dir).env("SCPM_CONFIG", Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-user-config.yaml"));
     cmd
 }
 
@@ -358,7 +359,9 @@ fn no_workspace_found() {
 
 #[test]
 fn committed_schemas_are_up_to_date() {
-    for (kind, file) in [("workspace", "workspace.json"), ("module", "module.json")] {
+    for (kind, file) in
+        [("workspace", "workspace.json"), ("module", "module.json"), ("user-config", "user-config.json")]
+    {
         let generated = stdout(&fixture("basic"), &["schema", kind]);
         let committed = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schema").join(file))
             .unwrap_or_default();
