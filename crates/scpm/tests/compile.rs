@@ -220,6 +220,23 @@ fn deleting_every_source_clears_old_classes() {
 }
 
 #[test]
+fn deleting_every_test_source_clears_old_test_classes() {
+    if !prerequisites() {
+        return;
+    }
+    let ws = workspace();
+    assert!(compile_json(ws.path(), &["--tests", "app"]).0);
+    let out = ws.path().join(".scpm/out/app@jvm-3");
+    assert!(out.join("test-classes/app/MainSuite.class").is_file());
+    fs::remove_file(ws.path().join("modules/app/src/test/scala/app/MainSuite.scala")).unwrap();
+    let (ok, doc) = compile_json(ws.path(), &["--tests", "app"]);
+    assert!(ok, "{doc:#}");
+    assert!(!out.join("test-classes").exists());
+    assert!(!out.join("test-analysis.zip").exists());
+    assert!(!out.join("test-fingerprint").exists());
+}
+
+#[test]
 fn json_output_is_one_document_when_the_worker_cannot_start() {
     if !prerequisites() {
         return;

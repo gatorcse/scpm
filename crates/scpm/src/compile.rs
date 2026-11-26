@@ -373,12 +373,19 @@ pub fn compile(
     let mut deps: BTreeMap<Node, Vec<Node>> = BTreeMap::new();
     let mut frontier: Vec<Node> = targets.iter().map(|t| Node::main(t)).collect();
     if with_tests {
-        frontier.extend(
-            targets
-                .iter()
-                .filter(|t| tc.ws.variant(t).is_some_and(|v| !source_files(&tc.ws.root, &v.test_sources).is_empty()))
-                .map(|t| Node { variant: t.clone(), test: true }),
-        );
+        for t in targets {
+            let Some(v) = tc.ws.variant(t) else { continue };
+            if source_files(&tc.ws.root, &v.test_sources).is_empty() {
+                // No test sources (any more): drop output left by deleted tests rather than
+                // scheduling a test node, which would also build test-only upstream modules.
+                let out_dir = tc.ws.root.join(".scpm/out").join(&v.id);
+                let _ = fs::remove_dir_all(out_dir.join("test-classes"));
+                let _ = fs::remove_file(out_dir.join("test-analysis.zip"));
+                let _ = fs::remove_file(out_dir.join("test-fingerprint"));
+            } else {
+                frontier.push(Node { variant: t.clone(), test: true });
+            }
+        }
     }
     while let Some(node) = frontier.pop() {
         if deps.contains_key(&node) {

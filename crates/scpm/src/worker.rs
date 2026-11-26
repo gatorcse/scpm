@@ -129,31 +129,36 @@ fn parse_java_version(output: &str) -> Option<String> {
 }
 
 /// An identity of the JDK for build fingerprints, found without starting a JVM when possible:
-/// the JDK home's `release` file (via `SCPM_JAVA_HOME`, `JAVA_HOME`, or the resolved `java`
-/// on `PATH`). Falls back to running `java -version`.
+/// the `release` file of the JDK home that `detect_java` uses (`SCPM_JAVA_HOME`, `JAVA_HOME`,
+/// or the resolved `java` on `PATH`). Falls back to running `java -version`, never to another
+/// JDK's `release` file.
 pub fn java_identity() -> Result<String, WorkerError> {
-    let exe = if cfg!(windows) { "java.exe" } else { "java" };
-    let homes = ["SCPM_JAVA_HOME", "JAVA_HOME"]
-        .iter()
-        .filter_map(|v| env::var_os(v).filter(|h| !h.is_empty()).map(PathBuf::from))
-        .chain(
-            env::var_os("PATH")
-                .into_iter()
-                .flat_map(|p| env::split_paths(&p).collect::<Vec<_>>())
-                .map(|d| d.join(exe))
-                .find(|p| p.is_file())
-                .and_then(|p| p.canonicalize().ok())
-                .and_then(|p| p.parent()?.parent().map(Path::to_path_buf)),
-        );
-    for home in homes {
-        if let Ok(release) = std::fs::read_to_string(home.join("release"))
-            && let Some(line) = release.lines().find(|l| l.starts_with("JAVA_VERSION="))
-        {
-            return Ok(format!("{} {line}", home.display()));
-        }
+    if let Some(id) = selected_java_home(|v| env::var_os(v)).as_deref().and_then(release_identity) {
+        return Ok(id);
     }
     let java = java()?;
     Ok(format!("{} {}", java.path.display(), java.version))
+}
+
+/// The JDK home `detect_java` picks, with the same precedence: the first non-empty of
+/// `SCPM_JAVA_HOME` and `JAVA_HOME`, else the home of the `java` found on `PATH`.
+fn selected_java_home(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let exe = if cfg!(windows) { "java.exe" } else { "java" };
+    if let Some(home) = ["SCPM_JAVA_HOME", "JAVA_HOME"].iter().find_map(|v| var(v).filter(|h| !h.is_empty())) {
+        return Some(PathBuf::from(home));
+    }
+    env::split_paths(&var("PATH")?)
+        .map(|d| d.join(exe))
+        .find(|p| p.is_file())
+        .and_then(|p| p.canonicalize().ok())
+        .and_then(|p| p.parent()?.parent().map(Path::to_path_buf))
+}
+
+/// `<home> JAVA_VERSION="…"` from a JDK home's `release` file, if it has one.
+fn release_identity(home: &Path) -> Option<String> {
+    let release = std::fs::read_to_string(home.join("release")).ok()?;
+    let line = release.lines().find(|l| l.starts_with("JAVA_VERSION="))?;
+    Some(format!("{} {line}", home.display()))
 }
 
 /// JVM flags for helper processes: keep HotSpot's own output off stdout (the protocol
@@ -377,5 +382,27 @@ mod version_tests {
         let out = "Picked up JAVA_TOOL_OPTIONS: -Dfoo=\"bar baz\"\nopenjdk version \"25.0.2\" 2026-01-20 LTS\n";
         assert_eq!(parse_java_version(out).as_deref(), Some("25.0.2"));
         assert_eq!(parse_java_version("java version \"1.8.0_402\"").as_deref(), Some("1.8.0_402"));
+    }
+
+    #[test]
+    fn java_identity_reads_only_the_selected_home() {
+        use super::{release_identity, selected_java_home};
+        use std::ffi::OsString;
+        let selected = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("release"), "JAVA_VERSION=\"21.0.1\"\n").unwrap();
+        let env = |v: &str| match v {
+            "SCPM_JAVA_HOME" => Some(OsString::from(selected.path())),
+            "JAVA_HOME" => Some(OsString::from(other.path())),
+            _ => None,
+        };
+        // SCPM_JAVA_HOME wins even though only JAVA_HOME has a release file.
+        let home = selected_java_home(env).unwrap();
+        assert_eq!(home, selected.path());
+        assert_eq!(release_identity(&home), None);
+
+        let env = |v: &str| (v == "JAVA_HOME").then(|| OsString::from(other.path()));
+        let home = selected_java_home(env).unwrap();
+        assert!(release_identity(&home).unwrap().ends_with("JAVA_VERSION=\"21.0.1\""));
     }
 }
