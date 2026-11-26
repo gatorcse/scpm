@@ -349,7 +349,18 @@ impl<'a> WorkerHandle<'a> {
         let reporter = self.reporter.clone();
         let classpath = self.tc.worker_classpath()?;
         let log = root.join(".scpm/logs/worker.log");
-        let w = Worker::spawn(&classpath, "scpm.worker.Main", Some(&log), move |event| {
+        let spec = worker::Spawn {
+            name: "the compile worker",
+            classpath: &classpath,
+            main: "scpm.worker.Main",
+            jvm_options: &[],
+            env: Vec::new(),
+            cwd: None,
+            log_file: Some(&log),
+            initialize: true,
+            own_process_group: false,
+        };
+        let w = Worker::spawn(spec, move |event| {
             if event["t"] == "diagnostic" {
                 let task = event["target"].as_str().unwrap_or_default();
                 reporter.emit(Event::Diagnostic(diagnostic(&root, task, &event)));
@@ -367,15 +378,25 @@ impl<'a> WorkerHandle<'a> {
     }
 }
 
-/// Compiles `targets` (and what they depend on) in dependency order: main sources only, or
-/// main and test sources when `with_tests`. Returns whether everything compiled.
+/// What to build for a set of targets.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Scope {
+    /// Also compile the targets' test sources.
+    pub tests: bool,
+    /// Also compile modules that are only on the runtime classpath (for `run` and `test`).
+    pub runtime: bool,
+}
+
+/// Compiles `targets` (and what they depend on) in dependency order. Returns whether
+/// everything compiled.
 pub fn compile(
     tc: &Toolchain,
     graph: &Graph,
     targets: &BTreeSet<String>,
-    with_tests: bool,
+    scope: Scope,
     worker: &WorkerHandle,
 ) -> Result<bool, CompileError> {
+    let with_tests = scope.tests;
     // Main nodes depend on their compile-scope upstream; test nodes depend on their own main
     // node and on the main nodes of their test-compile upstream. Test-scope workspace edges
     // only ever point from a test node to main nodes, so this graph has no cycles even when
@@ -394,6 +415,14 @@ pub fn compile(
     };
     let mut deps: BTreeMap<Node, Vec<Node>> = BTreeMap::new();
     let mut frontier: Vec<Node> = targets.iter().map(|t| Node::main(t)).collect();
+    if scope.runtime {
+        // Runtime-only workspace dependencies must exist before a JVM is forked, even though
+        // nothing compiles against them.
+        let kind = if with_tests { ClasspathKind::TestRuntime } else { ClasspathKind::Runtime };
+        for t in targets {
+            frontier.extend(install::upstream_variants(graph, t, kind).iter().map(|u| Node::main(u)));
+        }
+    }
     if with_tests {
         for t in targets {
             let Some(v) = tc.ws.variant(t) else { continue };

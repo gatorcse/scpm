@@ -49,6 +49,42 @@ pub struct Diagnostic {
     pub actions: Vec<serde_json::Value>,
 }
 
+/// One test case result (from the test runner, with the file made workspace-relative).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TestCase {
+    pub task: String,
+    pub suite: String,
+    pub name: String,
+    /// passed | failed | error | skipped | ignored | canceled | pending
+    pub status: String,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<TestFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TestFailure {
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack_trace: Option<String>,
+}
+
+impl TestCase {
+    pub fn is_failure(&self) -> bool {
+        matches!(self.status.as_str(), "failed" | "error")
+    }
+
+    pub fn is_skipped(&self) -> bool {
+        matches!(self.status.as_str(), "skipped" | "ignored" | "canceled" | "pending")
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum TaskStatus {
@@ -78,6 +114,8 @@ pub enum Event {
     },
     #[serde(rename = "diagnostic")]
     Diagnostic(Diagnostic),
+    #[serde(rename = "test.case")]
+    TestCase(TestCase),
     #[serde(rename = "log")]
     Log { task: String, level: String, message: String },
     #[serde(rename = "run.end")]
@@ -109,6 +147,10 @@ impl Mode {
     }
 }
 
+/// Most lines of a task's output kept while it runs (older ones are dropped from the terminal
+/// view; the event log keeps everything).
+const MAX_BUFFERED_LINES: usize = 5_000;
+
 /// Collects events, writes the event log, and renders output.
 pub struct Reporter {
     mode: Mode,
@@ -118,11 +160,18 @@ pub struct Reporter {
     color: bool,
     /// Prefix that makes workspace-relative paths repository-relative for annotations.
     repo_prefix: String,
+    /// Print task output immediately rather than per task at its end.
+    stream_logs: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
 struct State {
+    /// Buffered log lines per running task (capped; see `dropped`).
+    logs: std::collections::HashMap<String, Vec<String>>,
+    /// How many leading lines were dropped from each task's buffer.
+    dropped: std::collections::HashMap<String, usize>,
     diagnostics: Vec<Diagnostic>,
+    tests: Vec<TestCase>,
     tasks: Vec<(String, TaskStatus, u64, Option<String>)>,
 }
 
@@ -138,6 +187,7 @@ impl Reporter {
             state: Mutex::new(State::default()),
             color: mode == Mode::Text && io::stderr().is_terminal(),
             repo_prefix: repo_prefix(root),
+            stream_logs: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -159,7 +209,42 @@ impl Reporter {
                 }
                 state.diagnostics.push(d.clone());
             }
+            // The framework's own log output already shows failures as they happen; text mode
+            // recaps them compactly at the end.
+            Event::TestCase(t) => state.tests.push(t.clone()),
+            // Output of parallel tasks is buffered per task and printed together when the task
+            // ends, so it doesn't interleave.
+            Event::Log { task, message, .. } => {
+                if self.prints_text() {
+                    let line = if self.color { message.clone() } else { plain_text(message) };
+                    if self.stream_logs.load(std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("  {line}");
+                    } else {
+                        let buffered = state.logs.entry(task.clone()).or_default();
+                        if buffered.len() == MAX_BUFFERED_LINES {
+                            buffered.remove(0);
+                            *state.dropped.entry(task.clone()).or_default() += 1;
+                        }
+                        state.logs.entry(task.clone()).or_default().push(line);
+                    }
+                }
+            }
             Event::TaskEnd { task, status, duration_ms, message } => {
+                if let Some(dropped) = state.dropped.remove(task) {
+                    eprintln!("  … {dropped} earlier lines of {task} output omitted (see .scpm/runs/latest.ndjson)");
+                }
+                if let Some(lines) = state.logs.remove(task) {
+                    let github = self.mode == Mode::Github;
+                    if github {
+                        eprintln!("::group::{task} output");
+                    }
+                    for line in lines {
+                        eprintln!("  {line}");
+                    }
+                    if github {
+                        eprintln!("::endgroup::");
+                    }
+                }
                 if self.prints_text() {
                     let line = match status {
                         TaskStatus::Ok => format!("✓ {task} ({:.1}s)", *duration_ms as f64 / 1000.0),
@@ -175,6 +260,27 @@ impl Reporter {
             }
             _ => {}
         }
+    }
+
+    /// How many test cases were recorded.
+    pub fn test_count(&self) -> usize {
+        self.state.lock().expect("state").tests.len()
+    }
+
+    /// Test cases that actually ran (passed or failed), excluding skipped/ignored ones.
+    pub fn tests_run(&self) -> usize {
+        self.state.lock().expect("state").tests.iter().filter(|t| !t.is_skipped()).count()
+    }
+
+    /// Print task output as it arrives instead of buffering it per task (when only one task
+    /// produces output, there is nothing to interleave).
+    pub fn set_stream_logs(&self, stream: bool) {
+        self.stream_logs.store(stream, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether every recorded test passed (or was skipped).
+    pub fn tests_ok(&self) -> bool {
+        !self.state.lock().expect("state").tests.iter().any(TestCase::is_failure)
     }
 
     fn render_text(&self, d: &Diagnostic) -> String {
@@ -209,6 +315,7 @@ impl Reporter {
         let state = self.state.lock().expect("state");
         let errors = state.diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
         let warnings = state.diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
+        let tests = TestCounts::of(&state.tests);
         match self.mode {
             Mode::Text | Mode::Github => {
                 if let Some(e) = error {
@@ -216,8 +323,21 @@ impl Reporter {
                 }
                 let failed =
                     state.tasks.iter().filter(|t| matches!(t.1, TaskStatus::Failed | TaskStatus::Crashed)).count();
+                let failures: Vec<&TestCase> = state.tests.iter().filter(|t| t.is_failure()).collect();
+                if !failures.is_empty() {
+                    eprintln!("\nFailed tests:");
+                    for t in failures {
+                        eprintln!("{}", render_failure(t));
+                    }
+                    eprintln!();
+                }
+                let test_part = if tests.total() > 0 {
+                    format!(", tests: {} passed, {} failed, {} skipped", tests.passed, tests.failed, tests.skipped)
+                } else {
+                    String::new()
+                };
                 eprintln!(
-                    "{command}: {} in {:.1}s ({} tasks, {failed} failed, {errors} errors, {warnings} warnings)",
+                    "{command}: {} in {:.1}s ({} tasks, {failed} failed, {errors} errors, {warnings} warnings{test_part})",
                     if ok { "ok" } else { "FAILED" },
                     duration_ms as f64 / 1000.0,
                     state.tasks.len()
@@ -227,18 +347,30 @@ impl Reporter {
         }
         match self.mode {
             Mode::Github => {
+                let prefix = |f: Option<String>| {
+                    f.map(|f| if Path::new(&f).is_absolute() { f } else { format!("{}{f}", self.repo_prefix) })
+                };
                 let diags: Vec<Diagnostic> = state
                     .diagnostics
                     .iter()
                     .cloned()
                     .map(|mut d| {
-                        d.file = d
-                            .file
-                            .map(|f| if Path::new(&f).is_absolute() { f } else { format!("{}{f}", self.repo_prefix) });
+                        d.file = prefix(d.file);
                         d
                     })
                     .collect();
-                github::emit(&diags, &state.tasks, command, ok, error)
+                let tests: Vec<TestCase> = state
+                    .tests
+                    .iter()
+                    .cloned()
+                    .map(|mut t| {
+                        if let Some(f) = t.failure.as_mut() {
+                            f.file = prefix(f.file.take());
+                        }
+                        t
+                    })
+                    .collect();
+                github::emit(&diags, &tests, &state.tasks, command, ok, error)
             }
             Mode::Json => {
                 let tasks: Vec<_> = state
@@ -261,6 +393,24 @@ impl Reporter {
                     "tasks": tasks, "diagnostics": diagnostics,
                     "errors": errors, "warnings": warnings,
                 });
+                if tests.total() > 0 || command == "test" {
+                    // Failures only (without stack traces); passing cases are in the event log.
+                    let failures: Vec<TestCase> = state
+                        .tests
+                        .iter()
+                        .filter(|t| t.is_failure())
+                        .cloned()
+                        .map(|mut t| {
+                            if let Some(f) = t.failure.as_mut() {
+                                f.stack_trace = None;
+                            }
+                            t
+                        })
+                        .collect();
+                    doc["tests"] = serde_json::json!({
+                        "passed": tests.passed, "failed": tests.failed, "skipped": tests.skipped, "failures": failures,
+                    });
+                }
                 if let Some(e) = error {
                     doc["error"] = e.into();
                 }
@@ -269,6 +419,79 @@ impl Reporter {
             Mode::Text => {}
         }
     }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TestCounts {
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+}
+
+impl TestCounts {
+    pub fn of(tests: &[TestCase]) -> TestCounts {
+        let mut c = TestCounts::default();
+        for t in tests {
+            if t.is_failure() {
+                c.failed += 1
+            } else if t.is_skipped() {
+                c.skipped += 1
+            } else {
+                c.passed += 1
+            }
+        }
+        c
+    }
+
+    pub fn total(&self) -> usize {
+        self.passed + self.failed + self.skipped
+    }
+}
+
+fn render_failure(t: &TestCase) -> String {
+    let location = t
+        .failure
+        .as_ref()
+        .and_then(|f| {
+            f.file.as_ref().map(|file| format!(" at {file}{}", f.line.map(|l| format!(":{l}")).unwrap_or_default()))
+        })
+        .unwrap_or_default();
+    format!("  ✗ {} > {} ({}){location}", t.suite, t.name, t.task)
+}
+
+/// Removes ANSI escape sequences and control characters other than newlines and tabs (test
+/// frameworks colour their messages; JSON, annotations and XML want plain text).
+pub fn plain_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.peek() {
+                // CSI: parameters and intermediates, then one final byte in @..~
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC (e.g. window titles): up to BEL or ESC \
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if !c.is_control() || c == '\n' || c == '\t' {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// `<path of the workspace inside the repository>/` when running under GitHub Actions with the
@@ -292,23 +515,53 @@ pub mod github {
 
     pub fn emit(
         diags: &[Diagnostic],
+        tests: &[TestCase],
         tasks: &[(String, TaskStatus, u64, Option<String>)],
         command: &str,
         ok: bool,
         error: Option<&str>,
     ) {
         let mut out = io::stdout().lock();
-        for line in annotations(diags) {
+        let mut all = diags.to_vec();
+        all.extend(tests.iter().filter(|t| t.is_failure()).map(test_failure_diagnostic));
+        for line in annotations(&all) {
             let _ = writeln!(out, "{line}");
         }
         if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY")
             && let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path)
         {
-            let mut text = summary(diags, tasks, command, ok);
+            let mut text = summary(&all, tasks, command, ok);
             if let Some(e) = error {
                 text.push_str(&format!("**Error:** {}\n\n", escape_md(e)));
             }
             let _ = f.write_all(text.as_bytes());
+            let counts = TestCounts::of(tests);
+            if counts.total() > 0 {
+                let _ = f.write_all(
+                    format!(
+                        "Tests: {} passed, {} failed, {} skipped\n\n",
+                        counts.passed, counts.failed, counts.skipped
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+    }
+
+    /// A failed test as an error annotation at its source location.
+    pub fn test_failure_diagnostic(t: &TestCase) -> Diagnostic {
+        let failure = t.failure.as_ref();
+        Diagnostic {
+            task: format!("{} > {} > {}", t.task, t.suite, t.name),
+            severity: Severity::Error,
+            file: failure.and_then(|f| f.file.clone()),
+            range: failure
+                .and_then(|f| f.line)
+                .map(|l| Range { start: Position { line: l, col: 1 }, end: Position { line: l, col: 1 } }),
+            code: None,
+            message: failure.map(|f| f.message.clone()).unwrap_or_else(|| format!("{} {}", t.name, t.status)),
+            rendered: None,
+            actions: Vec::new(),
         }
     }
 
@@ -445,6 +698,12 @@ mod tests {
         assert!(s.contains("❌ failed"));
         assert_eq!(s.matches("| ❌ |").count(), 12);
         assert_eq!(escape_md("List<String> | a & b"), "List&lt;String&gt; \\| a &amp; b");
+    }
+
+    #[test]
+    fn strips_ansi_and_controls() {
+        assert_eq!(super::plain_text("\u{1b}[91m-3\u{1b}[0m\n\u{1b}[1m=> Obtained\u{7}"), "-3\n=> Obtained");
+        assert_eq!(super::plain_text("a\u{1b}]0;title\u{7}b\u{1b}]8;;x\u{1b}\\c"), "abc");
     }
 
     #[test]

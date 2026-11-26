@@ -26,6 +26,11 @@ Milestones land as a stack of PRs; see [docs/roadmap.md](docs/roadmap.md).
   starting a JVM, and every run writes `.scpm/runs/*.ndjson`. Output is text, GitHub
   Actions annotations plus a step summary (automatic under `GITHUB_ACTIONS`), or `--json`.
   Build the worker first: `cd worker && sbt package` (or set `SCPM_WORKER_JAR`).
+- **M4:** `scpm test [targets] [--suite GLOB] [-t NAME]` runs each variant's tests in a forked
+  JVM (sbt test-interface: munit, ScalaTest, weaver, ZIO Test, utest, specs2, JUnit), with
+  a timeout, JUnit XML in `.scpm/out/<id>/test-reports/`, failures as GitHub annotations
+  and in `--json`. `scpm run <module> [--main X] -- args` runs a main class and passes its
+  exit code through.
 
 ## Development
 

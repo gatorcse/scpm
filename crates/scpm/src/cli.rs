@@ -15,6 +15,7 @@ use crate::graph::Graph;
 use crate::install::{self, ClasspathKind, InstallOptions, InstallSummary};
 use crate::lockfile::Lockfile;
 use crate::report::{Event, Mode, Reporter};
+use crate::testing;
 use crate::workspace::{self, Workspace};
 
 #[derive(Debug, Parser)]
@@ -69,6 +70,37 @@ pub enum Command {
         tests: bool,
         #[arg(long)]
         frozen: bool,
+    },
+    /// Compile and run tests (forked JVM per variant; JUnit XML in .scpm/out/<id>/test-reports).
+    /// Tests run with the module directory as their working directory.
+    Test {
+        /// Module names or variant ids; shorthand for `-F`.
+        targets: Vec<String>,
+        /// Only suites whose fully qualified name matches this glob (repeatable).
+        #[arg(long = "suite", value_name = "GLOB")]
+        suites: Vec<String>,
+        /// Only test cases with this name (repeatable).
+        #[arg(short = 't', long = "test", value_name = "NAME")]
+        tests: Vec<String>,
+        /// Kill a variant's test JVM after this many seconds.
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+        #[arg(long)]
+        frozen: bool,
+    },
+    /// Compile a module and run its main class with the remaining arguments. The program runs
+    /// in the current directory (not the module's, and not `-C`'s), like `java` would.
+    Run {
+        /// Variant id or a module with a single variant.
+        target: String,
+        /// Main class (default: the module's `mainClass`).
+        #[arg(long)]
+        main: Option<String>,
+        #[arg(long)]
+        frozen: bool,
+        /// Arguments for the program (after `--`).
+        #[arg(last = true)]
+        args: Vec<String>,
     },
     /// Explain why an artifact is on the classpath (`org::name`, `org:name_3` or `name`).
     Why { artifact: String },
@@ -136,6 +168,7 @@ pub fn main() -> ExitCode {
             ExitCode::from(2)
         }
         Err(Failure::Silent) => ExitCode::FAILURE,
+        Err(Failure::Exit(code)) => ExitCode::from(code),
         // A closed pipe (`scpm ls | head`) is not an error.
         Err(Failure::Output(e)) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(Failure::Output(e)) => {
@@ -168,6 +201,8 @@ enum Failure {
     Command(String),
     /// Failed, and the reporter already said why: exit code 1, nothing more to print.
     Silent,
+    /// Pass through a child process's exit code (`scpm run`).
+    Exit(u8),
     /// Writing to stdout failed.
     Output(io::Error),
 }
@@ -288,7 +323,8 @@ fn run(cli: Cli) -> Result<(), Failure> {
             reporter.emit(Event::RunStart { run: run_id(), command: "compile".into() });
             let result = compile::Toolchain::new(&ws, &lock).and_then(|tc| {
                 let handle = compile::WorkerHandle::new(&tc, reporter.clone());
-                let result = compile::compile(&tc, &graph, &selected, tests, &handle);
+                let result =
+                    compile::compile(&tc, &graph, &selected, compile::Scope { tests, runtime: false }, &handle);
                 handle.shutdown();
                 result
             });
@@ -303,6 +339,87 @@ fn run(cli: Cli) -> Result<(), Failure> {
                     reporter.finish("compile", false, elapsed, Some(&e.to_string()));
                     Err(Failure::Silent)
                 }
+            }
+        }
+        Command::Test { targets, suites, tests, timeout, frozen } => {
+            let (ws, graph) = load(&start)?;
+            let mut selectors = cli.filter.clone();
+            selectors.extend(targets);
+            let selected = filter::select(&ws, &graph, &selectors, &invocation_dir(&start)?)?;
+            let lock = ensure_installed(&ws, &graph, frozen)?;
+            let _guard = compile::workspace_lock(&ws.root).map_err(|e| Failure::Command(e.to_string()))?;
+            let started = std::time::Instant::now();
+            let reporter = std::sync::Arc::new(Reporter::new(Mode::detect(cli.json), &ws.root, &run_id()));
+            reporter.emit(Event::RunStart { run: run_id(), command: "test".into() });
+            let filtered = !suites.is_empty() || !tests.is_empty();
+            let opts = testing::TestOptions {
+                filters: suites,
+                test_names: tests,
+                timeout: (timeout > 0).then(|| std::time::Duration::from_secs(timeout)),
+            };
+            let result = compile::Toolchain::new(&ws, &lock).and_then(|tc| {
+                let variants = testing::with_tests(&tc, &selected);
+                testing::clear_reports(&tc, &variants);
+                // Check the runner before compiling anything.
+                let runner_cp = if variants.is_empty() { Vec::new() } else { testing::runner_classpath(&tc)? };
+                let handle = compile::WorkerHandle::new(&tc, reporter.clone());
+                let compiled =
+                    compile::compile(&tc, &graph, &selected, compile::Scope { tests: true, runtime: true }, &handle);
+                // The compile worker isn't needed while tests run.
+                handle.shutdown();
+                if !compiled? {
+                    return Ok(Ok(false));
+                }
+                if variants.is_empty() {
+                    eprintln!("no test sources in the selected modules");
+                    return Ok(Ok(true));
+                }
+                let ok = testing::run_tests(&tc, &variants, &runner_cp, &opts, &reporter);
+                if filtered && reporter.tests_run() == 0 {
+                    return Ok(Err("no tests matched --suite / --test".to_string()));
+                }
+                Ok(Ok(ok))
+            });
+            let elapsed = started.elapsed().as_millis() as u64;
+            let (ok, error) = match result {
+                Ok(Ok(ok)) => (ok, None),
+                Ok(Err(message)) => (false, Some(message)),
+                Err(e) => (false, Some(e.to_string())),
+            };
+            reporter.finish("test", ok, elapsed, error.as_deref());
+            if ok { Ok(()) } else { Err(Failure::Silent) }
+        }
+        Command::Run { target, main, frozen, args } => {
+            let (ws, graph) = load(&start)?;
+            let selected = filter::select(&ws, &graph, std::slice::from_ref(&target), &invocation_dir(&start)?)?;
+            let [id] = selected.iter().collect::<Vec<_>>()[..] else {
+                return Err(Failure::Usage(format!(
+                    "`{target}` matches {} variants; name one: {}",
+                    selected.len(),
+                    selected.iter().cloned().collect::<Vec<_>>().join(", ")
+                )));
+            };
+            let lock = ensure_installed(&ws, &graph, frozen)?;
+            let tc = compile::Toolchain::new(&ws, &lock).map_err(|e| Failure::Command(e.to_string()))?;
+            let v = ws.variant(id).expect("selected ids exist");
+            {
+                let _guard = compile::workspace_lock(&ws.root).map_err(|e| Failure::Command(e.to_string()))?;
+                // Build output goes to stderr only; stdout belongs to the program.
+                let reporter = std::sync::Arc::new(Reporter::new(Mode::Text, &ws.root, &run_id()));
+                let handle = compile::WorkerHandle::new(&tc, reporter.clone());
+                let target: std::collections::BTreeSet<String> = [v.id.clone()].into();
+                let compiled =
+                    compile::compile(&tc, &graph, &target, compile::Scope { tests: false, runtime: true }, &handle);
+                // Stop the compile worker before the program starts.
+                handle.shutdown();
+                if !compiled.map_err(|e| Failure::Command(e.to_string()))? {
+                    return Err(Failure::Silent);
+                }
+            }
+            match testing::exec_main(&tc, v, main.as_deref(), &args) {
+                Ok(0) => Ok(()),
+                Ok(code) => Err(Failure::Exit(code.clamp(1, 255) as u8)),
+                Err(e) => Err(Failure::Command(e.to_string())),
             }
         }
         Command::Why { artifact } => {
