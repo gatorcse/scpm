@@ -358,8 +358,10 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 timeout: (timeout > 0).then(|| std::time::Duration::from_secs(timeout)),
             };
             let result = compile::Toolchain::new(&ws, &lock).and_then(|tc| {
+                // Clear every selected variant's report, including ones that no longer have tests.
+                let all: Vec<_> = selected.iter().filter_map(|id| ws.variant(id)).collect();
+                testing::clear_reports(&tc, &all);
                 let variants = testing::with_tests(&tc, &selected);
-                testing::clear_reports(&tc, &variants);
                 // Check the runner before compiling anything.
                 let runner_cp = if variants.is_empty() { Vec::new() } else { testing::runner_classpath(&tc)? };
                 let handle = compile::WorkerHandle::new(&tc, reporter.clone());
@@ -371,6 +373,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
                     return Ok(Ok(false));
                 }
                 if variants.is_empty() {
+                    if filtered {
+                        return Ok(Err("no tests matched --suite / --test".to_string()));
+                    }
                     eprintln!("no test sources in the selected modules");
                     return Ok(Ok(true));
                 }
@@ -391,7 +396,12 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Command::Run { target, main, frozen, args } => {
             let (ws, graph) = load(&start)?;
-            let selected = filter::select(&ws, &graph, std::slice::from_ref(&target), &invocation_dir(&start)?)?;
+            let mut selectors = cli.filter.clone();
+            selectors.push(target.clone());
+            let selected = filter::select(&ws, &graph, &selectors, &invocation_dir(&start)?)?;
+            if selected.is_empty() {
+                return Err(Failure::Usage(format!("`{target}` is excluded by --filter")));
+            }
             let [id] = selected.iter().collect::<Vec<_>>()[..] else {
                 return Err(Failure::Usage(format!(
                     "`{target}` matches {} variants; name one: {}",

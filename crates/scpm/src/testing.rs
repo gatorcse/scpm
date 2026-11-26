@@ -114,7 +114,10 @@ pub fn run_tests(
     std::thread::scope(|s| {
         for _ in 0..parallelism {
             s.spawn(|| {
-                while let Some(v) = queue.lock().expect("queue").pop() {
+                loop {
+                    // Pop in its own statement: the guard must not live through the run.
+                    let next = queue.lock().expect("queue").pop();
+                    let Some(v) = next else { break };
                     if !run_variant_tests(tc, v, runner_cp, opts, reporter) {
                         *all_ok.lock().expect("ok") = false;
                     }
@@ -253,6 +256,13 @@ fn fork_runner(
         Ok(r) if r["status"] == "ok" && exit.is_none() => (
             TaskStatus::Crashed,
             Some("the test JVM did not exit after reporting (non-daemon threads or shutdown hooks?)".into()),
+        ),
+        Ok(r) if r["status"] == "ok" && exit.is_some_and(|s| !s.success()) => (
+            TaskStatus::Crashed,
+            Some(match exit.and_then(|s| s.code()) {
+                Some(code) => format!("the test JVM exited with code {code} after reporting (a shutdown hook?)"),
+                None => "the test JVM was killed by a signal after reporting".into(),
+            }),
         ),
         Ok(r) if r["status"] == "ok" => (TaskStatus::Ok, None),
         Ok(r) if r["status"] == "failed" => (TaskStatus::Failed, None),

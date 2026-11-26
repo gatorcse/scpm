@@ -287,7 +287,9 @@ impl Worker {
     pub fn spawn(spec: Spawn, on_event: impl Fn(Value) + Send + 'static) -> Result<Worker, WorkerError> {
         let java = java()?;
         let sep = if cfg!(windows) { ";" } else { ":" };
-        let cp = spec.classpath.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(sep);
+        // Relative entries (e.g. a relative `SCPM_TEST_RUNNER_JAR`) must name files relative to
+        // where scpm runs, not to the child's `cwd`.
+        let cp = spec.classpath.iter().map(|p| absolute(p).display().to_string()).collect::<Vec<_>>().join(sep);
         let mut cmd = Command::new(&java.path);
         cmd.args(helper_jvm_flags(&java)).args(spec.jvm_options).arg("-cp").arg(cp).arg(spec.main).envs(spec.env);
         if let Some(dir) = spec.cwd {
@@ -490,6 +492,11 @@ impl Worker {
     }
 }
 
+/// `p` resolved against the current directory (unchanged if absolute or if that fails).
+fn absolute(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 fn tail_context(tail: &Mutex<VecDeque<String>>) -> String {
     let t = tail.lock().expect("tail");
     if t.is_empty() { String::new() } else { format!(":\n{}", t.iter().cloned().collect::<Vec<_>>().join("\n")) }
@@ -513,7 +520,7 @@ impl Drop for Worker {
 
 #[cfg(test)]
 mod version_tests {
-    use super::parse_java_version;
+    use super::{absolute, parse_java_version};
 
     #[test]
     fn java_versions_ignore_unrelated_quotes() {
@@ -600,5 +607,13 @@ mod version_tests {
         let env = |v: &str| (v == "JAVA_HOME").then(|| OsString::from(other.path()));
         let home = selected_java_home(env).unwrap();
         assert!(release_identity(&home).unwrap().ends_with("JAVA_VERSION=\"21.0.1\""));
+    }
+
+    #[test]
+    fn relative_classpath_entries_resolve_against_the_current_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(absolute(std::path::Path::new("tools/runner.jar")), cwd.join("tools/runner.jar"));
+        let abs = cwd.join("x.jar");
+        assert_eq!(absolute(&abs), abs);
     }
 }
