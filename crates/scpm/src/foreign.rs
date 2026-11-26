@@ -331,15 +331,29 @@ fn host_of(url: &str) -> String {
 }
 
 /// Only `scheme://host[:port]` of another tool's URL, for display: its files may hold
-/// credentials anywhere in a URL (`https://user:token@nexus/…`, a token with a `/` in it), so
-/// nothing else is shown, and the host is what follows the last `@`. (An `@` in a path makes
-/// the host shown wrong, never a secret visible.)
+/// credentials in a URL (`https://user:token@nexus/…`), so nothing else is shown. The host
+/// follows the last `@` before the first `/`, so an `@` in a path (`/m/@scope/`) is no
+/// userinfo; but a `user:password` before that `/` (a `:` that starts no port) means the
+/// password itself holds a `/`, and the host follows the URL's last `@`.
 fn shown_origin(url: &str) -> String {
     let (scheme, rest) = match url.split_once("://") {
         Some((scheme, rest)) => (format!("{scheme}://"), rest),
         None => (String::new(), url),
     };
-    let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host = match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => {
+            let password_like = !authority.starts_with('[')
+                && authority
+                    .split_once(':')
+                    .is_some_and(|(_, p)| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()));
+            match rest.rsplit_once('@') {
+                Some((_, host)) if password_like => host,
+                _ => authority,
+            }
+        }
+    };
     format!("{scheme}{}", host.split(['/', '?', '#']).next().unwrap_or_default())
 }
 
@@ -443,7 +457,9 @@ mod tests {
             ("https://t0ken@nexus:8081/m", "https://nexus:8081"),
             ("https://user:t0#ken@nexus/m", "https://nexus"),
             ("https://user:t0/ken@nexus/m", "https://nexus"),
-            ("https://t0/ken@nexus/m", "https://nexus"),
+            ("https://nexus/m/@scope/x", "https://nexus"),
+            ("https://nexus:8081/m/@scope/x", "https://nexus:8081"),
+            ("https://user:t0?k/en@nexus/m", "https://nexus"),
             ("https://user:@nexus/m?x", "https://nexus"),
             ("user:t0ken@nexus/m", "nexus"),
             ("https://[::1]:8081/m/x", "https://[::1]:8081"),

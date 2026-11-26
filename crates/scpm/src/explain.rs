@@ -150,31 +150,31 @@ fn build(
         Secret::Literal(value) => SecretInfo::Literal { value: show_literal.then(|| value.clone()) },
     };
     let proxy = machine.proxy.as_ref();
+    let describe = |c: &RepoCredentials, source: String| match c {
+        RepoCredentials::Bearer { token } => {
+            CredentialsInfo { kind: "bearer", source, user: None, secret: secret(token, false), realm: None }
+        }
+        RepoCredentials::Basic { user, password } => CredentialsInfo {
+            kind: "basic",
+            source,
+            user: Some(secret(user, true)),
+            secret: secret(password, false),
+            realm: None,
+        },
+    };
+    // What both download paths send each repository: its origin's readable credentials.
+    let sources = coursier::credential_sources(repos, env, &mut Vec::new()).unwrap_or_else(|_| vec![None; repos.len()]);
     let repositories = repos
         .iter()
-        .map(|repo| {
+        .enumerate()
+        .map(|(i, repo)| {
             let mut notes = Vec::new();
-            let credentials = match &repo.credentials {
-                Some(c) => {
-                    let source = repo.credentials_from.describe().to_string();
-                    Some(match c {
-                        RepoCredentials::Bearer { token } => CredentialsInfo {
-                            kind: "bearer",
-                            source,
-                            user: None,
-                            secret: secret(token, false),
-                            realm: None,
-                        },
-                        RepoCredentials::Basic { user, password } => CredentialsInfo {
-                            kind: "basic",
-                            source,
-                            user: Some(secret(user, true)),
-                            secret: secret(password, false),
-                            realm: None,
-                        },
-                    })
-                }
-                None => {
+            let own_readable = repo.auth_with(env).is_ok_and(|auth| auth.is_some());
+            let shared_from = sources[i].as_ref().filter(|_| !own_readable).map(|(from, _)| &repos[*from]);
+            let credentials = match (shared_from, &repo.credentials) {
+                (Some(from), _) => from.credentials.as_ref().map(|c| describe(c, format!("shared from {}", from.id))),
+                (None, Some(c)) => Some(describe(c, repo.credentials_from.describe().to_string())),
+                (None, None) => {
                     let up_front = coursier_creds.find(repo.fetch_url());
                     let found =
                         up_front.or_else(|| coursier_creds.challenge_candidates(repo.fetch_url()).into_iter().next());
@@ -199,15 +199,10 @@ fn build(
             if let Some(note) = machine.skipped_credential(repo, repos) {
                 notes.push(note);
             }
-            let origin = repo.origin().map(crate::machine::comparable_url);
-            if repo.credentials.is_none()
-                && let Some(other) = repos
-                    .iter()
-                    .find(|o| o.credentials.is_some() && o.origin().map(crate::machine::comparable_url) == origin)
-            {
+            if let Some(from) = shared_from {
                 notes.push(format!(
                     "shares its origin with `{}`, whose credentials both download paths send here too",
-                    other.id
+                    from.id
                 ));
             }
             RepoExplanation {
@@ -392,5 +387,47 @@ mod tests {
         assert!(text.contains("config   ") && text.contains("config.yaml"), "{text}");
         assert_eq!(e.repositories[0].effective_url, "https://nexus.example.com/repository/maven-public/");
         assert_eq!(e.repositories[1].proxy.as_deref(), Some("http://proxy.example.com:3128"));
+    }
+
+    #[test]
+    fn shared_origin_credentials_are_shown_as_such() {
+        let token = |var: &str| Some(RepoCredentials::Bearer { token: Secret::Env(var.into()) });
+        let repos = vec![
+            Repo {
+                id: "acme".into(),
+                url: "https://acme.example/libs/".into(),
+                credentials: token("ACME"),
+                ..Default::default()
+            },
+            Repo {
+                id: "central".into(),
+                url: coursier::CENTRAL_URL.into(),
+                mirror: Some(coursier::Mirror { url: "https://acme.example/remote/".into(), matched: "*".into() }),
+                ..Default::default()
+            },
+            Repo {
+                id: "unset".into(),
+                url: "https://acme.example:443/x/".into(),
+                credentials: token("UNSET"),
+                ..Default::default()
+            },
+        ];
+        // A coursier entry for the host is not what either path sends there.
+        let coursier_creds = CoursierCredentials::from_env_value("acme.example carol:hunter2");
+        let explain = |env: &dyn Fn(&str) -> Option<String>| {
+            build(&repos, &repos, &Machine::none(), &coursier_creds, "credentials.properties", Vec::new(), env, None)
+        };
+        let e = explain(&|var| (var == "ACME").then(|| "t0k".to_string()));
+        assert_eq!(e.repositories[0].credentials.as_ref().unwrap().source, "scpm-workspace.yaml");
+        for r in &e.repositories[1..] {
+            let c = r.credentials.as_ref().unwrap();
+            assert_eq!((c.kind, c.source.as_str()), ("bearer", "shared from acme"), "{}", r.id);
+            assert!(r.notes.iter().any(|n| n.contains("`acme`")), "{:?}", r.notes);
+        }
+        // Nothing readable on the origin: nothing is shared.
+        let e = explain(&|_| None);
+        assert_eq!(e.repositories[1].credentials.as_ref().unwrap().source, "credentials.properties");
+        assert!(e.repositories[1].notes.is_empty(), "{:?}", e.repositories[1].notes);
+        assert_eq!(e.repositories[2].credentials.as_ref().unwrap().source, "scpm-workspace.yaml");
     }
 }

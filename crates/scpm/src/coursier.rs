@@ -212,7 +212,7 @@ impl Repo {
     }
 
     /// [`Self::auth`] with the variables read through `lookup`.
-    fn auth_with(&self, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Option<Auth>, CoursierError> {
+    pub(crate) fn auth_with(&self, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Option<Auth>, CoursierError> {
         Ok(match &self.credentials {
             None => None,
             Some(RepoCredentials::Bearer { token }) => Some(Auth::Bearer(token.read(self, "token", lookup)?)),
@@ -823,6 +823,16 @@ pub fn shared_credentials(
     lookup: &dyn Fn(&str) -> Option<String>,
     missing: &mut Vec<String>,
 ) -> Result<Vec<Option<Auth>>, CoursierError> {
+    Ok(credential_sources(repos, lookup, missing)?.into_iter().map(|s| s.map(|(_, auth)| auth)).collect())
+}
+
+/// [`shared_credentials`], each with the index of the first repository on the origin whose
+/// readable credentials they are.
+pub fn credential_sources(
+    repos: &[Repo],
+    lookup: &dyn Fn(&str) -> Option<String>,
+    missing: &mut Vec<String>,
+) -> Result<Vec<Option<(usize, Auth)>>, CoursierError> {
     let own: Vec<Option<Auth>> = repos
         .iter()
         .map(|repo| {
@@ -860,7 +870,8 @@ pub fn shared_credentials(
         .iter()
         .map(|repo| {
             let origin = origin_of(repo)?;
-            origins.iter().find(|(o, _)| *o == origin).and_then(|(_, first)| own[*first].clone())
+            let first = origins.iter().find(|(o, _)| *o == origin)?.1;
+            own[first].clone().map(|auth| (first, auth))
         })
         .collect())
 }
@@ -899,8 +910,12 @@ fn credential_properties(
         written.push(origin);
         entry(format!("scpm{i}"), origin, auth.user(), auth.password(), &[("auto", "true".into())]);
     }
+    // An origin with scpm's credentials gets no coursier entry besides: the fetcher sends scpm's
+    // there, and `cs` does not take entries in file order (with `cs` 2.1.27, a `coursier0`
+    // entry beat an `scpm0` one wherever it was written), so a second matching entry could win.
     let allowed = coursier.restricted(&insecure_credential_origins(repos));
-    for (i, c) in allowed.entries.iter().enumerate() {
+    let shadowed = |c: &crate::credentials::CoursierCredential| written.iter().any(|o| c.applies_to(&format!("{o}/")));
+    for (i, c) in allowed.entries.iter().enumerate().filter(|(_, c)| !shadowed(c)) {
         let mut extra = vec![("auto", c.auto.to_string()), ("https-only", c.https_only.to_string())];
         if let Some(realm) = &c.realm {
             extra.push(("realm", realm.clone()));
@@ -1103,6 +1118,33 @@ mod tests {
         assert_eq!(parsed.find("https://repo.example:8443/maven/x.jar").unwrap().password, "tok3n");
         assert!(parsed.find("https://repo.example/maven/x.jar").is_none(), "another port");
         assert!(parsed.find("https://repo.example:9443/maven/x.jar").is_none(), "another port");
+    }
+
+    #[test]
+    fn coursier_entries_never_compete_with_an_origins_credentials() {
+        let repos = [
+            Repo {
+                id: "acme".into(),
+                url: "https://acme.example/m/".into(),
+                credentials: Some(RepoCredentials::Bearer { token: Secret::Literal("t0k".into()) }),
+                ..Default::default()
+            },
+            Repo { id: "other".into(), url: "https://other.example/m/".into(), ..Default::default() },
+        ];
+        let coursier = crate::credentials::CoursierCredentials {
+            entries: crate::credentials::parse_properties(
+                "a.host=acme.example\na.username=alice\na.password=pw\n\
+                 b.host=https://acme.example:443\nb.username=bob\nb.password=pw\nb.realm=R\n\
+                 c.host=other.example\nc.username=carol\nc.password=pw\n",
+            ),
+        };
+        let text = credential_properties(&repos, &|_| None, &coursier, &mut Vec::new()).unwrap();
+        // `cs` doesn't take entries in file order, so only one may match acme's origin: scpm's,
+        // which is what the fetcher sends.
+        let parsed = crate::credentials::parse_properties(&text);
+        let mut users: Vec<&str> = parsed.iter().map(|c| c.user.as_str()).collect();
+        users.sort();
+        assert_eq!(users, ["carol", "token"], "{text}");
     }
 
     #[test]

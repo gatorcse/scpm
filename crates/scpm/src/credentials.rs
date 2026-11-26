@@ -55,6 +55,12 @@ impl fmt::Debug for CoursierCredential {
 }
 
 impl CoursierCredential {
+    /// Whether the entry may be sent to `url`, judging from its scheme, host and port (realm
+    /// and `auto` aside).
+    pub fn applies_to(&self, url: &str) -> bool {
+        UrlTarget::parse(url).is_some_and(|t| self.matches(&t))
+    }
+
     /// Whether the entry may be sent to `target`, judging from its scheme, host and port.
     fn matches(&self, target: &UrlTarget) -> bool {
         let scheme_ok = match &self.scheme {
