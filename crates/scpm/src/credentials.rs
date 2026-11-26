@@ -241,7 +241,7 @@ pub fn parse_host(value: &str) -> (Option<String>, String, Option<u16>) {
 }
 
 /// Coursier's config directory (`COURSIER_CONFIG_DIR`, else the platform default).
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("COURSIER_CONFIG_DIR").filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir));
     }
@@ -334,7 +334,7 @@ pub fn parse_properties(text: &str) -> Vec<CoursierCredential> {
 
 /// A small `java.util.Properties` reader: `key=value`, `key: value` or `key value`, `#`/`!`
 /// comments, backslash line continuations and escapes.
-fn java_properties(text: &str) -> BTreeMap<String, String> {
+pub(crate) fn java_properties(text: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut logical = String::new();
     for raw in text.lines() {

@@ -821,20 +821,24 @@ The Rust fetcher gets the same resolved values: the same mirror URL, the same cr
    - `noProxy` entries cover a host and its subdomains (`domain|*.domain` for `cs`), `*` covers everything, and loopback (`localhost`, `127.0.0.1`, `::1`) is always direct, as in the JVM's default. Address ranges (`10.0.0.0/8`) can't be expressed to `cs`, so both paths drop them and `scpm config explain` lists them.
 3. **Compatibility imports**, read by scpm and put through the same policy: coursier's `COURSIER_CREDENTIALS` / `credentials.properties` (§5.7), and the standard `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` variables when the user config sets no proxy. People already have these for sbt and coursier, so they keep working, but scpm reports when it uses them.
 
-**Ignored on purpose:** Maven `settings.xml`, coursier's mirror files and variables, the Scala CLI config, and JVM proxy properties. They belong to other tools, live in places nobody looks (coursier's macOS config directory is `~/Library/Application Support/Coursier`), and reading them live is how the two paths drifted. When one of them configures something for a repository or host the current command uses, scpm prints one notice naming the file and the setting, and how to move it (`scpm config import maven` converts `settings.xml` mirrors, servers and proxies into the user config, once and explicitly). There is no notice for sources that don't touch the repositories in use.
+**Ignored on purpose:** Maven `settings.xml`, coursier's mirror files and variables, the Scala CLI config, and JVM proxy properties. They belong to other tools, live in places nobody looks (coursier's macOS config directory is `~/Library/Application Support/Coursier`), and reading them live is how the two paths drifted. When one of them configures something for a repository or host the current command uses, scpm prints one notice naming the file and the setting, and how to move it (a planned `scpm config import maven` would convert `settings.xml` mirrors, servers and proxies into the user config, once and explicitly). There is no notice for sources that don't touch the repositories in use.
 
 **Seeing it: `scpm config explain`.** Prints, per configured repository, the URL, the effective URL after mirrors, where its credentials come from (the variable or file name, never the value), and the proxy that applies, then every ignored foreign source it found that would have applied. `--json` gives the same for scripts and agents (§9.3).
 
 ```text
 $ scpm config explain
-central  https://repo1.maven.org/maven2
-         via mirror https://nexus.example.com/repository/maven-public  (user config)
+central  https://repo1.maven.org/maven2/
+         via mirror https://nexus.example.com/repository/maven-public/  (user config, mirrorOf central)
          credentials: user alice, password from file ~/.secrets/nexus  (user config)
          proxy: none (nexus.example.com matches noProxy)
-acme     https://acme.jfrog.io/artifactory/maven
-         credentials: bearer token from env ACME_TOKEN  (scpm.yaml) — not set
-ignored  ~/.m2/settings.xml: mirror "corp" for * (run `scpm config import maven` to use it)
+acme     https://acme.jfrog.io/artifactory/maven/
+         credentials: bearer token from env ACME_TOKEN (not set)  (scpm-workspace.yaml)
+         proxy: http://proxy.example.com:3128  (user config)
+config   ~/Library/Application Support/scpm/config.yaml
+ignored  ~/.m2/settings.xml: mirror "corp" for * (https://corp.example/maven) (would apply to central, acme)
 ```
+
+As implemented: credentials name their source (`scpm-workspace.yaml`, `user config`, `COURSIER_CREDENTIALS` or `credentials.properties`) and say when a variable is not set or a file is missing; notes say when a user config credential is held back by the plain-HTTP policy or workspace credentials are not sent to a mirror. `scpm config [targets]` still prints variants; a module named `explain` is selected with `-F explain`. Foreign sources are found by a shallow read: `settings.xml` mirrors (Maven `mirrorOf` rules), servers (by repository or mirror id) and active proxies (assumed to apply to every repository; `nonProxyHosts` is not evaluated); `mirror.properties` (`COURSIER_MIRRORS`, else coursier's config directory) and `COURSIER_EXTRA_MIRRORS` by `from` prefix; the Scala CLI config's `repositories.credentials` (by `host`) and `repositories.mirrors` (by `from`), matching every repository when entries have another shape. JVM proxy properties can't be detected. The notice for a command names the first applying setting and counts the rest; `scpm config import maven` is planned, not implemented.
 
 **Not in scope:** proxy authentication, and per-repository proxies. Both wait for a user who needs them; `cs`'s JVM proxy-auth properties need verifying first **[verify]**.
 

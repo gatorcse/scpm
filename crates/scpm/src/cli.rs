@@ -37,7 +37,10 @@ pub enum Command {
     /// List modules and their variants.
     Ls,
     /// Print the resolved configuration of modules or variants.
+    #[command(args_conflicts_with_subcommands = true)]
     Config {
+        #[command(subcommand)]
+        action: Option<ConfigCommand>,
         /// Module names or variant ids; shorthand for `-F`.
         targets: Vec<String>,
     },
@@ -71,6 +74,13 @@ pub enum Command {
         #[arg(value_enum)]
         file: SchemaFile,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Show where each repository's credentials, mirror and proxy come from (machine-local
+    /// settings), and which settings of other tools are ignored.
+    Explain,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -211,7 +221,19 @@ fn run(cli: Cli) -> Result<(), Failure> {
             }
             Ok(())
         }
-        Command::Config { targets } => {
+        Command::Config { action: Some(ConfigCommand::Explain), .. } => {
+            let (ws, _) = load(&start)?;
+            let explanation = crate::explain::explain(&ws)?;
+            if cli.json {
+                print_json(&explanation)?;
+            } else {
+                let mut out = io::stdout().lock();
+                out.write_all(crate::explain::render(&explanation).as_bytes())?;
+                out.flush()?;
+            }
+            Ok(())
+        }
+        Command::Config { action: None, targets } => {
             let (ws, graph) = load(&start)?;
             let mut selectors = cli.filter.clone();
             selectors.extend(targets);
