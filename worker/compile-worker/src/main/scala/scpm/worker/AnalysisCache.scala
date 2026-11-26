@@ -4,6 +4,7 @@ import sbt.internal.inc.consistent.ConsistentFileAnalysisStore
 import xsbti.compile.AnalysisContents
 import xsbti.compile.analysis.ReadWriteMappers
 
+import java.io.IOException
 import java.nio.file.attribute.{ BasicFileAttributes, FileTime }
 import java.nio.file.{ Files, NoSuchFileException, Path }
 import scala.jdk.OptionConverters.*
@@ -14,8 +15,18 @@ final class AnalysisCache(capacity: Int = 64):
 
   def read(file: Path): Option[AnalysisContents] = cache.read(file)
 
+  /**
+   * Writes `contents` to `file`. If that fails, `file` is deleted: the class files it describes
+   * are already in place, so an older analysis there would not match them. With none, the next
+   * compile starts from an empty classes directory.
+   */
   def write(file: Path, contents: AnalysisContents): Unit =
-    store(file).set(contents)
+    try store(file).set(contents)
+    catch
+      case e: Throwable =>
+        try Files.deleteIfExists(file)
+        catch case d: IOException => e.addSuppressed(d)
+        throw e
     cache.put(file, contents)
 
   private def store(file: Path) =

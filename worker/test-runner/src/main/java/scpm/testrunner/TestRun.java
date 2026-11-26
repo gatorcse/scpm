@@ -2,6 +2,7 @@ package scpm.testrunner;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -59,9 +60,11 @@ final class TestRun {
   /**
    * The frameworks to run: the named ones, or every known one on the classpath.
    *
-   * @throws IllegalArgumentException if a named framework is missing or cannot be created
+   * @throws IllegalArgumentException if a named framework is missing, or a named or detected one
+   *     cannot be created
    */
   static List<Framework> frameworks(List<String> names, ClassLoader loader) {
+    if (names.isEmpty()) return detect(KNOWN_FRAMEWORKS, loader);
     List<Framework> frameworks = new ArrayList<>();
     for (String name : names) {
       try {
@@ -69,18 +72,35 @@ final class TestRun {
       } catch (ClassNotFoundException | NoClassDefFoundError e) {
         throw new IllegalArgumentException("framework " + name + " is not on the classpath");
       } catch (ReflectiveOperationException | LinkageError | ClassCastException e) {
-        throw new IllegalArgumentException("cannot create framework " + name + ": " + e);
-      }
-    }
-    if (!names.isEmpty()) return frameworks;
-    for (String name : KNOWN_FRAMEWORKS) {
-      try {
-        frameworks.add(instantiate(name, loader));
-      } catch (ReflectiveOperationException | LinkageError e) {
-        // not on the test classpath
+        throw cannotCreate(name, e);
       }
     }
     return frameworks;
+  }
+
+  /**
+   * The {@code candidates} whose class is on the classpath. One that is there but cannot be
+   * created (a missing dependency, a failing initializer or constructor) is an error, not skipped:
+   * skipping it could turn a broken test classpath into a run of zero tests.
+   */
+  static List<Framework> detect(List<String> candidates, ClassLoader loader) {
+    List<Framework> frameworks = new ArrayList<>();
+    for (String name : candidates) {
+      try {
+        frameworks.add(instantiate(name, loader));
+      } catch (ClassNotFoundException e) {
+        // not on the test classpath
+      } catch (ReflectiveOperationException | LinkageError | ClassCastException e) {
+        throw cannotCreate(name, e);
+      }
+    }
+    return frameworks;
+  }
+
+  private static IllegalArgumentException cannotCreate(String name, Throwable e) {
+    // A constructor's own exception arrives wrapped; name it rather than the wrapper.
+    Throwable cause = e instanceof InvocationTargetException && e.getCause() != null ? e.getCause() : e;
+    return new IllegalArgumentException("cannot create framework " + name + ": " + cause);
   }
 
   private static Framework instantiate(String name, ClassLoader loader) throws ReflectiveOperationException {

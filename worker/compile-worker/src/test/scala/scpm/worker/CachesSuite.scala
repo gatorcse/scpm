@@ -62,4 +62,15 @@ class CachesSuite extends munit.FunSuite:
     assertEquals(loads, 3)
   }
 
+  dir.test("AnalysisCache deletes the analysis file when writing it fails") { dir =>
+    val file = Files.writeString(dir.resolve("analysis.zip"), "an older analysis")
+    val unwritable = new xsbti.compile.AnalysisContents:
+      def getAnalysis = throw IllegalStateException("cannot serialize")
+      def getMiniSetup = throw IllegalStateException("cannot serialize")
+    val analyses = AnalysisCache()
+    intercept[IllegalStateException](analyses.write(file, unwritable))
+    assert(!Files.exists(file), "the old analysis no longer matches the class files")
+    assertEquals(analyses.read(file), None)
+  }
+
   extension [A](a: A) private def tap(f: A => Unit): A = { f(a); a }

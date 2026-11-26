@@ -84,7 +84,9 @@ resolving `.`, `..` and symbolic links) is a `bad_request` naming the field and 
 
 When `analysisFile` does not exist, `classesDir` is emptied before compiling: without an
 analysis nothing knows which class files are stale. A `failed` or `cancelled` compile leaves
-`classesDir` as it was before the request.
+`classesDir` as it was before the request. A compile whose analysis cannot be written is answered
+`crashed` and deletes `analysisFile`, since its class files are already in place; the next
+compile is a full one.
 
 `result`:
 
@@ -123,7 +125,9 @@ The test runner is started as `java -cp <runner jar + deps + test classpath> scp
 and receives exactly one `run` request, then exits. The CLI keeps the runner's stdin open until
 it has the response, and may close it right after. End of input before the response means the
 CLI went away: the runner kills the processes its tests started, answers `crashed` (message
-`parent went away (stdin closed)`) and exits with status 4. Tests themselves see an empty stdin.
+`parent went away (stdin closed)`) and exits with status 4. If shutdown hooks (the tests' own
+included) have not finished 5 seconds later, it halts with status 4 anyway. Tests themselves see
+an empty stdin.
 
 ### `run`
 
@@ -141,7 +145,9 @@ plus a `message` string when the run was abandoned (`crashed`).
 `failed` counts `failed` and `error` cases; `skipped` counts `skipped`, `ignored`, `canceled`
 and `pending`. The process exits 0 once the response is written and 2 if the request is
 malformed (after an error response). A framework named in `frameworks` that is not on the
-classpath is a `bad_request` ("framework X is not on the classpath"). `filters` that match no
+classpath is a `bad_request` ("framework X is not on the classpath"). So is a framework, named or
+auto-detected, whose class is on the classpath but cannot be created (a missing dependency, or a
+failing initializer or constructor): "cannot create framework X: <error>". `filters` that match no
 suite give an `ok` result with zero counts and a `warn` log event, as do a run that finds no
 framework on the classpath and one that finds no suites in `testClassesDirs`.
 

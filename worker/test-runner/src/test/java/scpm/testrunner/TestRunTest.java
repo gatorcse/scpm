@@ -24,6 +24,25 @@ public class TestRunTest {
         TestRun.frameworks(List.of(), loader).stream().map(f -> f.getClass().getName()).toList());
   }
 
+  /** A framework class that is on the classpath but cannot be created. */
+  public static final class BrokenFramework {
+    public BrokenFramework() {
+      throw new IllegalStateException("missing dependency");
+    }
+  }
+
+  @Test
+  public void autoDetectionReportsAFrameworkThatIsPresentButCannotBeCreated() {
+    String broken = BrokenFramework.class.getName();
+    IllegalArgumentException e =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> TestRun.detect(List.of("no.Such", broken, "com.novocode.junit.JUnitFramework"), loader));
+    assertEquals(
+        "cannot create framework " + broken + ": java.lang.IllegalStateException: missing dependency",
+        e.getMessage());
+  }
+
   @Test
   public void aNamedFrameworkMustBeOnTheClasspath() {
     IllegalArgumentException e =
