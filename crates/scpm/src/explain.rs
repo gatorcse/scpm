@@ -199,6 +199,17 @@ fn build(
             if let Some(note) = machine.skipped_credential(repo, repos) {
                 notes.push(note);
             }
+            let origin = repo.origin().map(crate::machine::comparable_url);
+            if repo.credentials.is_none()
+                && let Some(other) = repos
+                    .iter()
+                    .find(|o| o.credentials.is_some() && o.origin().map(crate::machine::comparable_url) == origin)
+            {
+                notes.push(format!(
+                    "shares its origin with `{}`, whose credentials both download paths send here too",
+                    other.id
+                ));
+            }
             RepoExplanation {
                 id: repo.id.clone(),
                 url: repo.url.clone(),
@@ -288,7 +299,7 @@ pub fn render(e: &Explanation) -> String {
     {
         let _ = writeln!(
             out,
-            "{:width$}  noProxy entries not applied (address ranges, other wildcards): {}",
+            "{:width$}  noProxy entries not applied (address ranges, other wildcards, ports): {}",
             "proxy",
             s.ignored_no_proxy.join(", ")
         );
@@ -374,7 +385,10 @@ mod tests {
         assert_eq!(lines[5], "         credentials: bearer token from env ACME_TOKEN (not set)  (scpm-workspace.yaml)");
         assert_eq!(lines[6], "         proxy: http://proxy.example.com:3128  (user config)");
         assert_eq!(lines[8], "         credentials: user carol, password (literal)  (credentials.properties)");
-        assert!(text.contains("noProxy entries not applied (address ranges, other wildcards): 10.0.0.0/8"), "{text}");
+        assert!(
+            text.contains("noProxy entries not applied (address ranges, other wildcards, ports): 10.0.0.0/8"),
+            "{text}"
+        );
         assert!(text.contains("config   ") && text.contains("config.yaml"), "{text}");
         assert_eq!(e.repositories[0].effective_url, "https://nexus.example.com/repository/maven-public/");
         assert_eq!(e.repositories[1].proxy.as_deref(), Some("http://proxy.example.com:3128"));

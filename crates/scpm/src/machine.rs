@@ -368,9 +368,11 @@ impl ProxySettings {
                 None => e,
             };
             let domain = e.trim_start_matches('.');
+            // A `:` only in an IPv6 address: `host:port` matches nothing on either path.
             let plain = e == "*"
                 || (!domain.is_empty()
-                    && domain.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':')));
+                    && domain.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+                    && (!domain.contains(':') || domain.parse::<std::net::Ipv6Addr>().is_ok()));
             if !plain {
                 ignored_no_proxy.push(e);
             } else if !no_proxy.contains(&e) {
@@ -650,7 +652,7 @@ impl UrlParts {
 
 /// `url` lower-cased and without a default port (`:443` for `https`, `:80` for `http`), so
 /// `mirrorOf` URL prefixes match however the port is written.
-fn comparable_url(url: &str) -> String {
+pub(crate) fn comparable_url(url: &str) -> String {
     let url = url.to_ascii_lowercase();
     let Some((scheme, rest)) = url.split_once("://") else { return url };
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
@@ -994,10 +996,20 @@ mod tests {
 
     #[test]
     fn both_paths_bypass_the_same_real_hosts() {
-        let entries: Vec<String> =
-            ["*.corp.example", ".dot.example", "Internal", "10.1.2.3", "[fd00::1]", "corp.*", "a|b", "10.0.0.0/8", "*"]
-                .map(String::from)
-                .to_vec();
+        let entries: Vec<String> = [
+            "*.corp.example",
+            ".dot.example",
+            "Internal",
+            "10.1.2.3",
+            "[fd00::1]",
+            "corp.*",
+            "a|b",
+            "nexus.corp:8081",
+            "10.0.0.0/8",
+            "*",
+        ]
+        .map(String::from)
+        .to_vec();
         let hosts = [
             "corp.example",
             "a.corp.example",
@@ -1021,6 +1033,7 @@ mod tests {
             "a",
             "b",
             "repo1.maven.org",
+            "nexus.corp",
         ];
         let server = Some(ProxyServer { host: "proxy.example".into(), port: 3128 });
         let p = ProxySettings::new(server.clone(), None, &entries[..entries.len() - 1], "test".into());
@@ -1028,7 +1041,7 @@ mod tests {
             p.no_proxy,
             [".corp.example", ".dot.example", "internal", "10.1.2.3", "fd00::1", "localhost", "127.0.0.1", "::1"]
         );
-        assert_eq!(p.ignored_no_proxy, ["corp.*", "a|b", "10.0.0.0/8"]);
+        assert_eq!(p.ignored_no_proxy, ["corp.*", "a|b", "nexus.corp:8081", "10.0.0.0/8"]);
         let jvm = p.non_proxy_hosts();
         for host in hosts {
             let rust = p.for_url(&format!("https://{host}/m/")).is_none();

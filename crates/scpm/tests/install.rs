@@ -574,6 +574,101 @@ fn user_config_credentials_reach_cs_and_the_fetcher() {
     assert!(err.contains("user-config.yaml") && err.contains("mirrors"), "{err}");
 }
 
+/// `files` with every path's `/maven/` replaced by `/{dir}/`.
+fn moved(files: std::collections::HashMap<String, Vec<u8>>, dir: &str) -> std::collections::HashMap<String, Vec<u8>> {
+    files.into_iter().map(|(p, b)| (p.replace("/maven/", &format!("/{dir}/")), b)).collect()
+}
+
+#[test]
+fn one_origin_shares_its_credentials_on_both_paths() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    // Only the mirror path holds the artifact, behind the same login as the private repository.
+    let server = Server::maven(moved(hello_repo_files(b"hello jar"), "remote"), Some(("alice", "s3cret-pass")));
+    let ws = tempfile::tempdir().unwrap();
+    let private = format!(
+        "  - {{id: private, url: '{}', allowInsecureCredentials: true, credentials: {{user: 'env:A_USER', password: 'env:A_PASS'}}}}\n",
+        server.url("/maven")
+    );
+    let deps = "dependencies:\n  com.example:hello: '1.0'\n";
+    let env = |cmd: &mut Command| {
+        cmd.env("A_USER", "alice").env("A_PASS", "s3cret-pass").env("B_USER", "bob").env("B_PASS", "other-pass");
+    };
+
+    // Different credentials on one origin: a configuration error naming both repositories.
+    let other = format!(
+        "  - {{id: other, url: '{}', allowInsecureCredentials: true, credentials: {{user: 'env:B_USER', password: 'env:B_PASS'}}}}\n",
+        server.url("/other")
+    );
+    java_workspace(ws.path(), &format!("repositories:\n{private}{other}"), deps);
+    let mut cmd = scpm(ws.path(), tempfile::tempdir().unwrap().path());
+    env(&mut cmd);
+    let out = cmd.arg("install").assert().code(2);
+    let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(err.contains(&server.url("/maven/")) && err.contains(&server.url("/other/")), "{err}");
+    assert!(!err.contains("pass"), "{err}");
+
+    // An anonymous mirror on that origin gets the private repository's credentials, from `cs`
+    // when re-locking and from the fetcher when restoring.
+    java_workspace(ws.path(), &format!("repositories:\n{private}  - central\n"), deps);
+    let config = ws.path().join("user-config.yaml");
+    fs::write(&config, format!("mirrors:\n  - {{url: '{}', mirrorOf: [central]}}\n", server.url("/remote"))).unwrap();
+    let with_config = |cache: &Path| {
+        let mut cmd = scpm(ws.path(), cache);
+        env(&mut cmd);
+        cmd.env("SCPM_CONFIG", &config);
+        cmd
+    };
+    with_config(tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "central");
+    let empty = tempfile::tempdir().unwrap();
+    with_config(empty.path()).args(["install", "--frozen"]).assert().success();
+    let jar = empty
+        .path()
+        .join(format!("http/alice%40127.0.0.1%3A{}/remote/com/example/hello/1.0/hello-1.0.jar", server.port));
+    assert_eq!(fs::read(&jar).unwrap(), b"hello jar");
+}
+
+#[test]
+fn relocking_through_a_catch_all_mirror_keeps_repository_ids() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    let world: std::collections::HashMap<String, Vec<u8>> = hello_repo_files(b"world jar")
+        .into_iter()
+        .map(|(p, b)| {
+            (p.replace("hello", "world"), String::from_utf8(b).unwrap().replace("hello", "world").into_bytes())
+        })
+        .collect();
+    let main = Server::maven(Default::default(), None);
+    let acme = Server::maven(hello_repo_files(b"hello jar"), None);
+    let mut mirrored = moved(hello_repo_files(b"hello jar"), "mirror");
+    mirrored.extend(moved(world, "mirror"));
+    let mirror = Server::maven(mirrored, None);
+    let ws = tempfile::tempdir().unwrap();
+    let repos = format!(
+        "repositories:\n  - {{id: main, url: '{}'}}\n  - {{id: acme, url: '{}'}}\n",
+        main.url("/maven"),
+        acme.url("/maven")
+    );
+    java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
+    let cache = tempfile::tempdir().unwrap();
+    scpm(ws.path(), cache.path()).arg("install").assert().success();
+    assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
+
+    // Re-locked through one mirror for both repositories: hello stays acme's, so a restore
+    // without the mirror still finds it; only a new artifact gets the first repository.
+    java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n  com.example:world: '1.0'\n");
+    let config = ws.path().join("user-config.yaml");
+    fs::write(&config, format!("mirrors:\n  - {{url: '{}', mirrorOf: ['*']}}\n", mirror.url("/mirror"))).unwrap();
+    scpm(ws.path(), cache.path()).env("SCPM_CONFIG", &config).arg("install").assert().success();
+    assert!(mirror.count("/mirror/com/example/world/1.0/world-1.0.pom") > 0, "re-locked through the mirror");
+    let locked = lock(ws.path());
+    assert_eq!(locked["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
+    assert_eq!(locked["artifacts"]["com.example:world:1.0"]["repo"], "main");
+}
+
 #[test]
 fn mirrors_serve_both_paths_and_never_reach_the_lock() {
     if !cs_available() || cfg!(windows) {

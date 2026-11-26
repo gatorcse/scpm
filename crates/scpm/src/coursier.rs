@@ -31,6 +31,10 @@ pub enum CoursierError {
     Output(String),
     #[error("{0}")]
     Config(String),
+    /// Repositories on one origin with different credentials, which `cs` can't keep apart
+    /// (design §5.9). A configuration error (exit code 2).
+    #[error("{0}")]
+    CredentialClash(crate::diag::Diagnostic),
     #[error("{0} resolved to no file; check its `type` and `classifier`")]
     NoArtifact(String),
 }
@@ -805,55 +809,72 @@ fn credentials_env_value(path: &Path) -> String {
     url
 }
 
-/// The credentials file for `cs`: each repository's configured credentials, scoped to its
-/// origin, then coursier's own entries restricted to scpm's plain-HTTP policy.
-/// `lookup` reads the environment variables configured credentials name.
+/// The credentials both download paths send to each repository (design §5.9), in `repos`'
+/// order: those of its origin (scheme, host and port, default ports ignored), which are any
+/// repository's there that can be read. `cs` scopes credentials by origin only, so a
+/// repository or mirror without credentials of its own gets its origin's from `cs`, and the
+/// Rust fetcher sends the same. Credentials that can't be read (an unset variable) count as
+/// none and are noted in `missing`, for when a download then fails.
 ///
-/// `cs` matches credentials by scheme, host and port only, so two download URLs on one origin
-/// that need different credentials (or one none) can't be kept apart: that is an error naming
-/// both, never a guess about which credentials to send (design §5.9).
+/// Two repositories on one origin with different readable credentials can't be kept apart by
+/// `cs`: that is an error naming both, never a guess about which to send.
+pub fn shared_credentials(
+    repos: &[Repo],
+    lookup: &dyn Fn(&str) -> Option<String>,
+    missing: &mut Vec<String>,
+) -> Result<Vec<Option<Auth>>, CoursierError> {
+    let own: Vec<Option<Auth>> = repos
+        .iter()
+        .map(|repo| {
+            repo.auth_with(lookup).unwrap_or_else(|e| {
+                missing.push(e.to_string());
+                None
+            })
+        })
+        .collect();
+    let origin_of = |r: &Repo| r.origin().map(crate::machine::comparable_url);
+    // Each origin with credentials, and the first repository that has them.
+    let mut origins: Vec<(String, usize)> = Vec::new();
+    for (i, repo) in repos.iter().enumerate() {
+        let (Some(origin), Some(auth)) = (origin_of(repo), &own[i]) else { continue };
+        match origins.iter().find(|(o, _)| *o == origin) {
+            Some((_, first)) if own[*first].as_ref() != Some(auth) => {
+                let other = &repos[*first];
+                return Err(CoursierError::CredentialClash(
+                    crate::diag::Diagnostic::new(format!(
+                        "repositories `{}` ({}) and `{}` ({}) have different credentials but share the origin {origin}; \
+                         coursier scopes credentials by scheme, host and port only, so scpm won't guess which to send",
+                        other.id,
+                        other.fetch_url(),
+                        repo.id,
+                        repo.fetch_url(),
+                    ))
+                    .with_help("give both the same credentials, or reach one of them through another host or port"),
+                ));
+            }
+            Some(_) => {}
+            None => origins.push((origin, i)),
+        }
+    }
+    Ok(repos
+        .iter()
+        .map(|repo| {
+            let origin = origin_of(repo)?;
+            origins.iter().find(|(o, _)| *o == origin).and_then(|(_, first)| own[*first].clone())
+        })
+        .collect())
+}
+
+/// The credentials file for `cs`: each origin's credentials ([`shared_credentials`]), then
+/// coursier's own entries restricted to scpm's plain-HTTP policy. `lookup` reads the
+/// environment variables configured credentials name.
 fn credential_properties(
     repos: &[Repo],
     lookup: &dyn Fn(&str) -> Option<String>,
     coursier: &CoursierCredentials,
     missing: &mut Vec<String>,
 ) -> Result<String, CoursierError> {
-    // What `cs` would send to each repository: its readable credentials, else nothing.
-    let resolved: Vec<(&Repo, Option<Auth>, bool)> = repos
-        .iter()
-        .map(|repo| match repo.auth_with(lookup) {
-            Ok(auth) => (repo, auth, false),
-            Err(e) => {
-                missing.push(e.to_string());
-                (repo, None, true)
-            }
-        })
-        .collect();
-    for (i, (a, a_auth, a_unreadable)) in resolved.iter().enumerate() {
-        let Some(origin) = a.origin() else { continue };
-        let clash = resolved[..i]
-            .iter()
-            .find(|(b, b_auth, _)| b.origin().is_some_and(|o| o.eq_ignore_ascii_case(origin)) && b_auth != a_auth);
-        if let Some((b, b_auth, b_unreadable)) = clash {
-            let has = |auth: &Option<Auth>, unreadable: bool| match (auth, unreadable) {
-                (Some(_), _) => "credentials",
-                (None, true) => "credentials that can't be read",
-                (None, false) => "no credentials",
-            };
-            let (b_has, a_has) = (has(b_auth, *b_unreadable), has(a_auth, *a_unreadable));
-            return Err(CoursierError::Config(format!(
-                "repositories `{}` ({}, {}) and `{}` ({}, {}) are reached at the same origin {origin} with different credentials; \
-                 coursier scopes credentials by scheme, host and port only, so scpm won't guess which to send\n  \
-                 help: give both the same credentials, or reach one of them through another host or port",
-                b.id,
-                b.fetch_url(),
-                b_has,
-                a.id,
-                a.fetch_url(),
-                a_has,
-            )));
-        }
-    }
+    let shared = shared_credentials(repos, lookup, missing)?;
     let mut properties = String::new();
     let mut entry = |prefix: String, host: &str, user: &str, password: &str, extra: &[(&str, String)]| {
         properties.push_str(&format!(
@@ -867,11 +888,11 @@ fn credential_properties(
         }
     };
     let mut written: Vec<&str> = Vec::new();
-    for (i, (repo, auth, _)) in resolved.iter().enumerate() {
+    for (i, (repo, auth)) in repos.iter().zip(&shared).enumerate() {
         let (Some(origin), Some(auth)) = (repo.origin(), auth) else { continue };
         // `scheme://host[:port]` scopes the credentials to the repository's scheme, host and
-        // port (coursier 2.1.27 ignores `https-only` for a host with a scheme). Every
-        // repository on an origin has the same credentials (checked above): write them once.
+        // port (coursier 2.1.27 ignores `https-only` for a host with a scheme). Once per origin
+        // as written, so `https://h` and `https://h:443` both get them.
         if written.iter().any(|w| w.eq_ignore_ascii_case(origin)) {
             continue;
         }
@@ -1085,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn one_origin_with_different_credentials_is_an_error() {
+    fn one_origin_shares_one_set_of_credentials() {
         let token = |var: &str| Some(RepoCredentials::Bearer { token: Secret::Env(var.into()) });
         let repo = |id: &str, url: &str, credentials: Option<RepoCredentials>| Repo {
             id: id.into(),
@@ -1101,40 +1122,51 @@ mod tests {
         };
         let props =
             |repos: &[Repo]| credential_properties(repos, &lookup, &CoursierCredentials::default(), &mut Vec::new());
+        let parsed = |text: &str| crate::credentials::CoursierCredentials {
+            entries: crate::credentials::parse_properties(text),
+        };
 
-        // GitHub Packages: two path-scoped tokens on one origin.
-        let err = props(&[
-            repo("orgA", "https://maven.pkg.github.com/orgA/", token("TOKEN_A")),
-            repo("orgB", "https://maven.pkg.github.com/orgB/", token("TOKEN_B")),
-        ])
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("https://maven.pkg.github.com/orgA/") && err.contains("https://maven.pkg.github.com/orgB/"),
-            "{err}"
-        );
-        assert!(err.contains("same origin https://maven.pkg.github.com"), "{err}");
-        assert!(!err.contains("secret-"), "{err}");
+        // GitHub Packages: two path-scoped tokens on one origin; also with the port written out.
+        for b in ["https://maven.pkg.github.com/orgB/", "https://maven.pkg.github.com:443/orgB/"] {
+            let err = props(&[
+                repo("orgA", "https://maven.pkg.github.com/orgA/", token("TOKEN_A")),
+                repo("orgB", b, token("TOKEN_B")),
+            ])
+            .unwrap_err();
+            assert!(matches!(err, CoursierError::CredentialClash(_)), "{err}");
+            let err = err.to_string();
+            assert!(err.contains("https://maven.pkg.github.com/orgA/") && err.contains(b), "{err}");
+            assert!(err.contains("share the origin https://maven.pkg.github.com;"), "{err}");
+            assert!(!err.contains("secret-"), "{err}");
+        }
 
-        // A repository's credentials must not reach another repository's mirror on its origin.
+        // A mirror without credentials on a private repository's origin gets the origin's,
+        // from `cs` and from the fetcher alike.
         let mirrored = Repo {
-            mirror: Some(Mirror { url: "https://acme.example/mirror/".into(), matched: "*".into() }),
+            mirror: Some(Mirror { url: "https://acme.jfrog.io/artifactory/maven-remote/".into(), matched: "*".into() }),
             ..repo("central", CENTRAL_URL, None)
         };
-        let err =
-            props(&[repo("acme", "https://acme.example/maven/", token("TOKEN_A")), mirrored]).unwrap_err().to_string();
-        assert!(err.contains("https://acme.example/mirror/") && err.contains("no credentials"), "{err}");
+        let repos = [repo("acme", "https://acme.jfrog.io/artifactory/libs-release/", token("TOKEN_A")), mirrored];
+        let text = props(&repos).unwrap();
+        let found = parsed(&text);
+        assert_eq!(found.find("https://acme.jfrog.io/artifactory/maven-remote/x.jar").unwrap().password, "secret-a");
+        let shared = shared_credentials(&repos, &lookup, &mut Vec::new()).unwrap();
+        assert_eq!(shared, [Some(Auth::Bearer("secret-a".into())), Some(Auth::Bearer("secret-a".into()))]);
 
-        // Credentials that can't be read count as none being sent, but say so.
-        let err = props(&[
+        // Unreadable credentials (an unset variable) count as none: noted, never an early error.
+        let mut missing = Vec::new();
+        let repos = [
             repo("a", "https://h.example/a/", token("UNSET")),
-            repo("b", "https://h.example/b/", token("TOKEN_B")),
-        ])
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("credentials that can't be read"), "{err}");
+            repo("b", "https://h.example:443/b/", token("TOKEN_B")),
+        ];
+        let shared = shared_credentials(&repos, &lookup, &mut missing).unwrap();
+        assert_eq!(shared, [Some(Auth::Bearer("secret-b".into())), Some(Auth::Bearer("secret-b".into()))]);
+        assert!(missing[0].contains("UNSET"), "{missing:?}");
+        let text = props(&repos).unwrap();
+        assert_eq!(text.matches(".host=").count(), 2, "both spellings of the origin: {text}");
+        assert!(props(&[repo("a", "https://h.example/a/", token("UNSET"))]).unwrap().is_empty());
 
-        // Unambiguous: the same credentials on one origin (written once), or other ports.
+        // The same credentials on one origin are written once; other ports are other origins.
         let text = props(&[
             repo("orgA", "https://maven.pkg.github.com/orgA/", token("TOKEN_A")),
             repo("orgB", "https://maven.pkg.github.com/orgB/", token("SAME_AS_A")),

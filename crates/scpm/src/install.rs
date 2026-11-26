@@ -728,6 +728,10 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
 /// Adds the notice about ignored settings of other tools to an error from contacting the
 /// repositories: one of them may be why it failed (design §5.9).
 pub(crate) fn with_notice(e: InstallError, repos: &[Repo]) -> InstallError {
+    // A configuration error was found before any repository was contacted.
+    if matches!(e, InstallError::Coursier(coursier::CoursierError::CredentialClash(_))) {
+        return e;
+    }
     match crate::foreign::take_notice(repos) {
         Some(notice) => InstallError::WithNotice { error: Box::new(e), notice },
         None => e,
@@ -905,7 +909,13 @@ enum CacheUser {
     Unknown,
 }
 
-fn repo_access(repo: &Repo, creds: &CoursierCredentials) -> RepoAccess {
+/// `shared` is what `cs` would send too ([`coursier::shared_credentials`]): the repository's
+/// own credentials, or another repository's on its origin.
+fn repo_access(repo: &Repo, shared: Option<Auth>, creds: &CoursierCredentials) -> RepoAccess {
+    if let Some(auth) = shared {
+        let cache_user = CacheUser::Known(auth.user().to_string());
+        return RepoAccess { auth: Ok(Some(auth)), challenge: Vec::new(), cache_user };
+    }
     if repo.credentials.is_some() {
         let cache_user = match repo.configured_user() {
             Some(user) => CacheUser::Known(user),
@@ -934,7 +944,11 @@ pub fn fetch_items(
 ) -> Result<Vec<FetchItem>, InstallError> {
     // Coursier's own credentials go over plain HTTP only to repositories that opt in.
     let creds = creds.restricted(&coursier::insecure_credential_origins(repos));
-    let access: HashMap<&str, RepoAccess> = repos.iter().map(|r| (r.id.as_str(), repo_access(r, &creds))).collect();
+    // Origins with different credentials only stop `cs`; here each repository keeps its own.
+    let shared = coursier::shared_credentials(repos, &|var| std::env::var(var).ok(), &mut Vec::new())
+        .unwrap_or_else(|_| vec![None; repos.len()]);
+    let access: HashMap<&str, RepoAccess> =
+        repos.iter().zip(shared).map(|(r, s)| (r.id.as_str(), repo_access(r, s, &creds))).collect();
     let mut items = Vec::new();
     for key in lock.referenced_artifacts() {
         let art = lock.artifacts.get(key).ok_or_else(|| {
@@ -1231,6 +1245,35 @@ mod tests {
         let items = fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c")).unwrap();
         assert_eq!(items[0].url, "https://m/all/own/g/a/1/a-1.jar");
         assert_eq!(items[0].dest, Path::new("/c/https/m/all/own/g/a/1/a-1.jar"));
+    }
+
+    #[test]
+    fn the_fetcher_sends_an_origins_credentials_like_cs() {
+        let token = coursier::RepoCredentials::Bearer { token: coursier::Secret::Literal("t0k".into()) };
+        let repos = vec![
+            Repo {
+                id: "acme".into(),
+                url: "https://acme.example/libs/".into(),
+                credentials: Some(token),
+                ..Default::default()
+            },
+            Repo {
+                id: "central".into(),
+                url: coursier::CENTRAL_URL.into(),
+                mirror: Some(coursier::Mirror { url: "https://acme.example:443/remote/".into(), matched: "*".into() }),
+                ..Default::default()
+            },
+        ];
+        let mut lock = Lockfile::default();
+        lock.artifacts.insert("g:a:1".into(), ArtifactLock { repo: "central".into(), sha256: "0".into(), size: 1 });
+        lock.boot.insert("b".into(), vec!["g:a:1".into()]);
+        let items = fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c")).unwrap();
+        assert_eq!(items[0].auth, Ok(Some(Auth::Bearer("t0k".into()))));
+        assert!(
+            items[0].dest.starts_with("/c/https/token%40acme.example%3A443/remote/"),
+            "{}",
+            items[0].dest.display()
+        );
     }
 
     #[test]

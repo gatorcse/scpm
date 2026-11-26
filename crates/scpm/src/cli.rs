@@ -161,6 +161,9 @@ impl From<install::InstallError> for Failure {
     fn from(e: install::InstallError) -> Self {
         match e {
             install::InstallError::MachineConfig(diags) => Failure::Config(diags),
+            install::InstallError::Coursier(crate::coursier::CoursierError::CredentialClash(d)) => {
+                Failure::Config(d.into())
+            }
             other => Failure::Command(other.to_string()),
         }
     }
