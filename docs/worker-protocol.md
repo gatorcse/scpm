@@ -86,7 +86,9 @@ When `analysisFile` does not exist, `classesDir` is emptied before compiling: wi
 analysis nothing knows which class files are stale. A `failed` or `cancelled` compile leaves
 `classesDir` as it was before the request. A compile whose analysis cannot be written is answered
 `crashed` and deletes `analysisFile`, since its class files are already in place; the next
-compile is a full one.
+compile is a full one. If `analysisFile` cannot be deleted, the worker ignores it until an
+analysis is written there again, and leaves `<analysisFile>.invalid` next to it (best effort) so
+a restarted worker ignores it too.
 
 `result`:
 

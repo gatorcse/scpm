@@ -7,30 +7,56 @@ import xsbti.compile.analysis.ReadWriteMappers
 import java.io.IOException
 import java.nio.file.attribute.{ BasicFileAttributes, FileTime }
 import java.nio.file.{ Files, NoSuchFileException, Path }
+import java.util.concurrent.ConcurrentHashMap
 import scala.jdk.OptionConverters.*
 
-/** Zinc analysis files, read through a [[FileCache]] so a warm worker does not deserialize them again. */
-final class AnalysisCache(capacity: Int = 64):
+/**
+ * Zinc analysis files, read through a [[FileCache]] so a warm worker does not deserialize them again.
+ * `delete` is replaceable for tests.
+ */
+final class AnalysisCache(capacity: Int = 64, delete: Path => Unit = Files.deleteIfExists(_)):
   private val cache = FileCache[AnalysisContents](capacity, file => store(file).get.toScala)
+  // Files whose last write failed, until a write succeeds; whatever is still there is stale.
+  private val invalid = ConcurrentHashMap.newKeySet[Path]()
 
-  def read(file: Path): Option[AnalysisContents] = cache.read(file)
+  /** The analysis in `file`; none while its last write failed, or while its invalid marker exists. */
+  def read(file: Path): Option[AnalysisContents] =
+    if invalid.contains(key(file)) || Files.exists(AnalysisCache.marker(file)) then None
+    else cache.read(file)
 
   /**
-   * Writes `contents` to `file`. If that fails, `file` is deleted: the class files it describes
-   * are already in place, so an older analysis there would not match them. With none, the next
-   * compile starts from an empty classes directory.
+   * Writes `contents` to `file`. If that fails, the class files are already in place, so an older
+   * analysis in `file` would not match them: [[read]] returns none for `file` until a write
+   * succeeds. `file` is deleted, or, if it cannot be, an invalid marker is left next to it, so
+   * a restarted worker does not read it either. The next compile starts from an empty classes
+   * directory.
    */
   def write(file: Path, contents: AnalysisContents): Unit =
     try store(file).set(contents)
     catch
       case e: Throwable =>
-        try Files.deleteIfExists(file)
-        catch case d: IOException => e.addSuppressed(d)
+        invalid.add(key(file))
+        try delete(file)
+        catch
+          case d: IOException =>
+            e.addSuppressed(d)
+            try Files.write(AnalysisCache.marker(file), Array.emptyByteArray)
+            catch case m: IOException => e.addSuppressed(m)
         throw e
+    // If the marker cannot go, reads keep returning none: the next compile is a full one.
+    try Files.deleteIfExists(AnalysisCache.marker(file))
+    catch case _: IOException => ()
+    invalid.remove(key(file))
     cache.put(file, contents)
+
+  private def key(file: Path) = Validation.canonical(file)
 
   private def store(file: Path) =
     ConsistentFileAnalysisStore.binary(file.toFile, ReadWriteMappers.getEmptyMappers)
+
+object AnalysisCache:
+  /** Marks `file` as stale when it could not be deleted after a failed write. */
+  private[worker] def marker(file: Path): Path = file.resolveSibling(s"${file.getFileName}.invalid")
 
 /**
  * The parsed contents of up to `maxEntries` files, least recently used first out. An entry is

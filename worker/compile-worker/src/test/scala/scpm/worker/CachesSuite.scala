@@ -62,15 +62,58 @@ class CachesSuite extends munit.FunSuite:
     assertEquals(loads, 3)
   }
 
+  private val unwritable = new xsbti.compile.AnalysisContents:
+    def getAnalysis = throw IllegalStateException("cannot serialize")
+    def getMiniSetup = throw IllegalStateException("cannot serialize")
+
+  private def emptyAnalysis(dir: Path) =
+    import xsbti.compile.{ AnalysisContents, CompileOrder, MiniOptions, MiniSetup }
+    val options = MiniOptions.of(Array(), Array(), Array())
+    val setup = MiniSetup.of(sbt.internal.inc.CompileOutput(dir), options, "3.9.0", CompileOrder.Mixed, true, Array())
+    AnalysisContents.create(sbt.internal.inc.Analysis.empty, setup)
+
   dir.test("AnalysisCache deletes the analysis file when writing it fails") { dir =>
     val file = Files.writeString(dir.resolve("analysis.zip"), "an older analysis")
-    val unwritable = new xsbti.compile.AnalysisContents:
-      def getAnalysis = throw IllegalStateException("cannot serialize")
-      def getMiniSetup = throw IllegalStateException("cannot serialize")
     val analyses = AnalysisCache()
     intercept[IllegalStateException](analyses.write(file, unwritable))
     assert(!Files.exists(file), "the old analysis no longer matches the class files")
     assertEquals(analyses.read(file), None)
+  }
+
+  dir.test("AnalysisCache never returns an analysis whose rewrite failed, even if it cannot be deleted") { dir =>
+    val file = dir.resolve("analysis.zip")
+    val first = AnalysisCache(delete = _ => ())
+    first.write(file, emptyAnalysis(dir))
+    assert(first.read(file).isDefined)
+
+    val undeletable = AnalysisCache(delete = _ => throw java.io.IOException("cannot delete"))
+    assert(undeletable.read(file).isDefined) // now cached
+    val e = intercept[IllegalStateException](undeletable.write(file, unwritable))
+    assert(e.getSuppressed.exists(_.getMessage == "cannot delete"), e.getSuppressed.toList)
+    assert(Files.exists(file), "the stale analysis is still there")
+    assertEquals(undeletable.read(file), None)
+    assertEquals(undeletable.read(dir.resolve(".").resolve("analysis.zip")), None)
+    assertEquals(AnalysisCache().read(file), None, "a restarted worker must not read it either")
+
+    undeletable.write(file, emptyAnalysis(dir))
+    assert(undeletable.read(file).isDefined, "a successful write makes it readable again")
+    assert(!Files.exists(AnalysisCache.marker(file)))
+    assert(AnalysisCache().read(file).isDefined)
+  }
+
+  dir.test("AnalysisCache forgets an analysis whose rewrite failed in a read-only directory") { dir =>
+    import java.nio.file.attribute.PosixFilePermissions.fromString
+    val sub = Files.createDirectory(dir.resolve("ro"))
+    val file = sub.resolve("analysis.zip")
+    val analyses = AnalysisCache()
+    analyses.write(file, emptyAnalysis(dir))
+    assert(analyses.read(file).isDefined)
+    Files.setPosixFilePermissions(sub, fromString("r-xr-xr-x"))
+    try
+      intercept[IllegalStateException](analyses.write(file, unwritable))
+      assert(Files.exists(file) && !Files.exists(AnalysisCache.marker(file)), "neither deleted nor marked")
+      assertEquals(analyses.read(file), None)
+    finally Files.setPosixFilePermissions(sub, fromString("rwxr-xr-x"))
   }
 
   extension [A](a: A) private def tap(f: A => Unit): A = { f(a); a }
