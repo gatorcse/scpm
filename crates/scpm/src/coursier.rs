@@ -732,9 +732,12 @@ fn add_common_args(
     proxy: &ProxyChoice,
     cache: &Path,
 ) -> Result<CommonArgs, CoursierError> {
-    let proxy = proxy.as_ref().map_err(|e| CoursierError::Config(e.clone()))?;
     cmd.arg("--cache").arg(cache).arg("--no-default").arg("--user-agent").arg(user_agent());
     if let Some(p) = proxy {
+        // An unusable environment proxy fails only if a repository needs that scheme's proxy.
+        for repo in repos {
+            p.route(repo.fetch_url()).map_err(CoursierError::Config)?;
+        }
         cmd.args(p.jvm_args());
     }
     // Mirrors already applied, so `cs` asks the mirror directly; once per URL.
@@ -1229,7 +1232,7 @@ mod tests {
             allow_insecure_credentials: false,
             ..Default::default()
         }];
-        let common = add_common_args(&mut cmd, &repos, &Ok(None), Path::new("/c")).unwrap();
+        let common = add_common_args(&mut cmd, &repos, &None, Path::new("/c")).unwrap();
         let file = common._credential_file.as_ref().unwrap();
         assert!(!fs::read_to_string(file.path()).unwrap().contains("scpm0"));
         let env = |name: &str| cmd.get_envs().find(|(k, _)| *k == name).and_then(|(_, v)| v);
@@ -1255,7 +1258,7 @@ mod tests {
             allow_insecure_credentials: false,
             ..Default::default()
         }];
-        let common = add_common_args(&mut cmd, &repos, &Ok(None), Path::new("/c")).unwrap();
+        let common = add_common_args(&mut cmd, &repos, &None, Path::new("/c")).unwrap();
         let sealed = common._sealed_dir.as_ref().unwrap().path();
         let envs: BTreeMap<String, Option<String>> = cmd
             .get_envs()
@@ -1283,10 +1286,11 @@ mod tests {
             http: None,
             no_proxy: vec!["localhost".into()],
             ignored_no_proxy: Vec::new(),
+            errors: BTreeMap::new(),
             source: "test".into(),
         };
         let mut cmd = Command::new("cs");
-        add_common_args(&mut cmd, &repos, &Ok(Some(proxy)), Path::new("/c")).unwrap();
+        add_common_args(&mut cmd, &repos, &Some(proxy.clone()), Path::new("/c")).unwrap();
         let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         for expected in [
             "-J-Dhttps.proxyHost=proxy.example",
@@ -1295,10 +1299,13 @@ mod tests {
         ] {
             assert!(args.iter().any(|a| a == expected), "{expected} in {args:?}");
         }
-        let err = add_common_args(&mut Command::new("cs"), &repos, &Err("HTTPS_PROXY: bad".into()), Path::new("/c"))
-            .err()
-            .unwrap()
-            .to_string();
+        // An unusable proxy for the other scheme doesn't matter; one for this scheme does.
+        let mut broken = proxy;
+        broken.errors.insert("http".into(), "HTTP_PROXY: bad".into());
+        add_common_args(&mut Command::new("cs"), &repos, &Some(broken.clone()), Path::new("/c")).unwrap();
+        broken.errors.insert("https".into(), "HTTPS_PROXY: bad".into());
+        let err =
+            add_common_args(&mut Command::new("cs"), &repos, &Some(broken), Path::new("/c")).err().unwrap().to_string();
         assert_eq!(err, "HTTPS_PROXY: bad");
     }
 

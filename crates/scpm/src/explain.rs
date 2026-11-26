@@ -34,10 +34,8 @@ pub struct UserConfigInfo {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyInfo {
+    /// With `errors`, per scheme, for an environment proxy that can't be used.
     pub settings: Option<ProxySettings>,
-    /// Why the proxy can't be used (downloads fail until it is fixed).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -51,6 +49,10 @@ pub struct RepoExplanation {
     pub credentials: Option<CredentialsInfo>,
     /// The proxy requests to `effectiveUrl` go through.
     pub proxy: Option<String>,
+    /// Why requests to `effectiveUrl` can't go out: the environment's proxy for its scheme is
+    /// unusable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_error: Option<String>,
     pub notes: Vec<String>,
 }
 
@@ -147,7 +149,7 @@ fn build(
         Secret::File(path) => SecretInfo::File { path: shown(path), exists: path.is_file() },
         Secret::Literal(value) => SecretInfo::Literal { value: show_literal.then(|| value.clone()) },
     };
-    let proxy = machine.proxy.as_ref().ok().and_then(Option::as_ref);
+    let proxy = machine.proxy.as_ref();
     let repositories = repos
         .iter()
         .map(|repo| {
@@ -208,13 +210,14 @@ fn build(
                 }),
                 credentials,
                 proxy: proxy.and_then(|p| p.for_url(repo.fetch_url())).map(|s| s.url()),
+                proxy_error: proxy.and_then(|p| p.route(repo.fetch_url()).err()),
                 notes,
             }
         })
         .collect();
     Explanation {
         user_config: UserConfigInfo { path: machine.path.as_deref().map(shown), exists: machine.exists },
-        proxy: ProxyInfo { settings: proxy.cloned(), error: machine.proxy.as_ref().err().cloned() },
+        proxy: ProxyInfo { settings: proxy.cloned() },
         repositories,
         ignored: ignored
             .into_iter()
@@ -262,7 +265,7 @@ pub fn render(e: &Explanation) -> String {
                 let _ = writeln!(out, "{pad}credentials: none");
             }
         }
-        let proxy = match (&r.proxy, &e.proxy.settings, &e.proxy.error) {
+        let proxy = match (&r.proxy, &e.proxy.settings, &r.proxy_error) {
             (_, _, Some(err)) => format!("error: {err}"),
             (Some(p), Some(s), _) => format!("{p}  ({})", s.source),
             (None, Some(s), _) => {
@@ -285,7 +288,7 @@ pub fn render(e: &Explanation) -> String {
     {
         let _ = writeln!(
             out,
-            "{:width$}  noProxy entries not applied (address ranges): {}",
+            "{:width$}  noProxy entries not applied (address ranges, other wildcards): {}",
             "proxy",
             s.ignored_no_proxy.join(", ")
         );
@@ -371,7 +374,7 @@ mod tests {
         assert_eq!(lines[5], "         credentials: bearer token from env ACME_TOKEN (not set)  (scpm-workspace.yaml)");
         assert_eq!(lines[6], "         proxy: http://proxy.example.com:3128  (user config)");
         assert_eq!(lines[8], "         credentials: user carol, password (literal)  (credentials.properties)");
-        assert!(text.contains("noProxy entries not applied (address ranges): 10.0.0.0/8"), "{text}");
+        assert!(text.contains("noProxy entries not applied (address ranges, other wildcards): 10.0.0.0/8"), "{text}");
         assert!(text.contains("config   ") && text.contains("config.yaml"), "{text}");
         assert_eq!(e.repositories[0].effective_url, "https://nexus.example.com/repository/maven-public/");
         assert_eq!(e.repositories[1].proxy.as_deref(), Some("http://proxy.example.com:3128"));

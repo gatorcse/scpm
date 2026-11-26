@@ -3,6 +3,7 @@
 //! (`<config dir>/scpm/config.yaml`, or the file `SCPM_CONFIG` names) and the standard proxy
 //! variables, and both download paths (`cs` and the Rust fetcher) get the same resolved values.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -97,7 +98,7 @@ pub struct Machine {
     pub credentials: Vec<UserCredential>,
     pub mirrors: Vec<UserMirror>,
     /// The proxy both download paths use. A problem with one from the environment is only an
-    /// error once something must be downloaded.
+    /// error once something must be downloaded with that scheme.
     pub proxy: ProxyChoice,
     /// Problems worth a warning (e.g. a user config with secrets that others can read).
     pub warnings: Vec<String>,
@@ -111,7 +112,7 @@ impl Machine {
             exists: false,
             credentials: Vec::new(),
             mirrors: Vec::new(),
-            proxy: Ok(None),
+            proxy: None,
             warnings: Vec::new(),
         }
     }
@@ -200,12 +201,12 @@ impl Machine {
         }
         let proxy = match &config.proxy {
             Some(entry) => match proxy_from_config(entry) {
-                Ok(p) => Ok(p),
+                Ok(p) => p,
                 Err(errors) => {
                     for (key, message) in errors {
                         err(format!("proxy.{key}"), message);
                     }
-                    Ok(None)
+                    None
                 }
             },
             None => proxy_from_env(&|var| std::env::var(var).ok()),
@@ -303,8 +304,9 @@ impl Machine {
     }
 }
 
-/// The resolved proxy, or why it can't be used.
-pub type ProxyChoice = Result<Option<ProxySettings>, String>;
+/// The resolved proxy, if any. Problems with a proxy from the environment are kept per scheme in
+/// [`ProxySettings::errors`].
+pub type ProxyChoice = Option<ProxySettings>;
 
 /// A proxy server, reached over plain HTTP (`http://host:port`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -333,9 +335,14 @@ pub struct ProxySettings {
     pub http: Option<ProxyServer>,
     /// Hosts reached directly, with their subdomains; `*` is every host. Loopback is always here.
     pub no_proxy: Vec<String>,
-    /// `noProxy` entries that `cs` can't apply (address ranges), dropped from both paths.
+    /// `noProxy` entries that the two paths can't apply alike (address ranges, wildcards other
+    /// than a leading `*.`), dropped from both.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ignored_no_proxy: Vec<String>,
+    /// Why the environment's proxy for a scheme (`https`, `http`) can't be used. Only requests of
+    /// that scheme, to hosts `noProxy` doesn't cover, fail.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub errors: BTreeMap<String, String>,
     /// `user config`, or the environment variables it was read from.
     pub source: String,
 }
@@ -349,7 +356,21 @@ impl ProxySettings {
         let mut no_proxy: Vec<String> = Vec::new();
         let mut ignored_no_proxy = Vec::new();
         for e in entries.iter().map(|e| e.trim().to_ascii_lowercase()).filter(|e| !e.is_empty()) {
-            if e.contains('/') {
+            // `*.corp.com` means what `.corp.com` does, to both paths: the domain and its
+            // subdomains (reqwest-style matching knows no other wildcard).
+            let e = match e.strip_prefix("*.") {
+                Some(rest) => format!(".{rest}"),
+                None => e,
+            };
+            let e = match e.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+                Some(v6) => v6.to_string(),
+                None => e,
+            };
+            let domain = e.trim_start_matches('.');
+            let plain = e == "*"
+                || (!domain.is_empty()
+                    && domain.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':')));
+            if !plain {
                 ignored_no_proxy.push(e);
             } else if !no_proxy.contains(&e) {
                 no_proxy.push(e);
@@ -360,7 +381,7 @@ impl ProxySettings {
                 no_proxy.push(l.to_string());
             }
         }
-        ProxySettings { https, http, no_proxy, ignored_no_proxy, source }
+        ProxySettings { https, http, no_proxy, ignored_no_proxy, errors: BTreeMap::new(), source }
     }
 
     /// Whether `host` is reached directly.
@@ -372,15 +393,24 @@ impl ProxySettings {
         })
     }
 
-    /// The proxy a request to `url` goes through, if any.
+    /// How a request to `url` goes out: through a proxy, directly (`None`), or not at all
+    /// because the environment's proxy for its scheme is unusable. Both download paths and
+    /// `scpm config explain` decide with this.
+    pub fn route(&self, url: &str) -> Result<Option<&ProxyServer>, String> {
+        let Some(parts) = UrlParts::parse(url) else { return Ok(None) };
+        if !matches!(parts.scheme.as_str(), "https" | "http") || self.bypasses(&parts.host) {
+            return Ok(None);
+        }
+        if let Some(e) = self.errors.get(&parts.scheme) {
+            return Err(e.clone());
+        }
+        Ok(if parts.scheme == "https" { self.https.as_ref() } else { self.http.as_ref() })
+    }
+
+    /// The proxy a request to `url` goes through, if any (direct when its scheme's proxy is
+    /// unusable; callers check [`Self::route`] first).
     pub fn for_url(&self, url: &str) -> Option<&ProxyServer> {
-        let parts = UrlParts::parse(url)?;
-        let server = match parts.scheme.as_str() {
-            "https" => self.https.as_ref(),
-            "http" => self.http.as_ref(),
-            _ => None,
-        }?;
-        (!self.bypasses(&parts.host)).then_some(server)
+        self.route(url).ok().flatten()
     }
 
     /// The settings as `cs` JVM options. `http.nonProxyHosts` covers both schemes; a
@@ -394,42 +424,54 @@ impl ProxySettings {
             }
         }
         if !args.is_empty() {
-            let mut hosts: Vec<String> = Vec::new();
-            for e in &self.no_proxy {
-                let domain = e.trim_start_matches('.');
-                if e == "*" || domain.parse::<std::net::IpAddr>().is_ok() {
-                    hosts.push(domain.to_string());
-                    if domain.contains(':') {
-                        hosts.push(format!("[{domain}]"));
-                    }
-                } else {
-                    hosts.push(domain.to_string());
-                    hosts.push(format!("*.{domain}"));
-                }
-            }
-            args.push(format!("-J-Dhttp.nonProxyHosts={}", hosts.join("|")));
+            args.push(format!("-J-Dhttp.nonProxyHosts={}", self.non_proxy_hosts()));
         }
         args
+    }
+
+    /// `noProxy` in the JVM's `http.nonProxyHosts` form.
+    fn non_proxy_hosts(&self) -> String {
+        let mut hosts: Vec<String> = Vec::new();
+        for e in &self.no_proxy {
+            let domain = e.trim_start_matches('.');
+            if e == "*" || domain.parse::<std::net::IpAddr>().is_ok() {
+                hosts.push(domain.to_string());
+                if domain.contains(':') {
+                    hosts.push(format!("[{domain}]"));
+                }
+            } else {
+                hosts.push(domain.to_string());
+                hosts.push(format!("*.{domain}"));
+            }
+        }
+        hosts.join("|")
     }
 }
 
 /// `http://host[:port]` (or `host[:port]`); the port defaults to 80. Proxy authentication is not
-/// supported (design §5.9), so a URL with a user is an error, which never repeats the URL.
+/// supported (design §5.9), so a URL with a user is an error. No error repeats the value, which
+/// may hold a password that didn't parse as one (`http://alice:pa#ss@proxy:3128`).
 fn parse_proxy_url(value: &str) -> Result<ProxyServer, String> {
     let value = value.trim();
     let (scheme, rest) = value.split_once("://").unwrap_or(("http", value));
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.contains('@') {
+    // Anywhere, not just before the first `/`, `?` or `#`: a password may contain those.
+    if rest.contains('@') {
         return Err("proxy authentication is not supported yet; remove the user and password from the proxy URL".into());
     }
     if !scheme.eq_ignore_ascii_case("http") {
+        let safe =
+            scheme.len() <= 16 && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        let what = if safe { format!("`{scheme}://` proxies are") } else { "proxies other than `http://` are".into() };
         return Err(format!(
-            "`{scheme}://` proxies are not supported; both download paths reach the proxy over plain HTTP (`http://host:port`)"
+            "{what} not supported; both download paths reach the proxy over plain HTTP (`http://host:port`)"
         ));
     }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let valid_host =
+        |h: &str| !h.is_empty() && h.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'));
     let parts = UrlParts::parse(&format!("http://{authority}"))
-        .filter(|p| !p.host.is_empty())
-        .ok_or_else(|| format!("`{value}` is not a proxy URL (`http://host:port`)"))?;
+        .filter(|p| valid_host(&p.host))
+        .ok_or("the value is not a proxy URL; write `http://host:port`")?;
     Ok(ProxyServer { host: parts.host, port: parts.port.unwrap_or(80) })
 }
 
@@ -453,28 +495,39 @@ fn proxy_from_config(entry: &ProxyEntry) -> Result<Option<ProxySettings>, Vec<(S
         .then(|| ProxySettings::new(https, http, &entry.no_proxy, "user config".into())))
 }
 
-/// `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` (upper case first, then lower case).
+/// `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` (upper case first, then lower case). A bad value
+/// only makes its own scheme unusable.
 fn proxy_from_env(env: &dyn Fn(&str) -> Option<String>) -> ProxyChoice {
     let mut used = Vec::new();
     let mut read = |name: &str| {
         [name.to_string(), name.to_ascii_lowercase()].into_iter().find_map(|var| {
             let value = env(&var).filter(|v| !v.trim().is_empty())?;
-            used.push(var);
-            Some(value)
+            used.push(var.clone());
+            Some((var, value))
         })
     };
     let (https, http, no_proxy) = (read("HTTPS_PROXY"), read("HTTP_PROXY"), read("NO_PROXY"));
     if https.is_none() && http.is_none() {
-        return Ok(None);
+        return None;
     }
     let source = format!("environment ({})", used.join(", "));
-    let parse = |value: Option<String>, var: &str| -> Result<Option<ProxyServer>, String> {
-        value.map(|v| parse_proxy_url(&v).map_err(|m| format!("{var}: {m}"))).transpose()
+    let mut errors = BTreeMap::new();
+    let mut parse = |value: Option<(String, String)>, scheme: &str| match value {
+        Some((var, v)) => match parse_proxy_url(&v) {
+            Ok(s) => Some(s),
+            Err(m) => {
+                errors.insert(scheme.to_string(), format!("{var}: {m}"));
+                None
+            }
+        },
+        None => None,
     };
-    let https = parse(https, "HTTPS_PROXY")?;
-    let http = parse(http, "HTTP_PROXY")?;
-    let entries: Vec<String> = no_proxy.unwrap_or_default().split(',').map(str::to_string).collect();
-    Ok(Some(ProxySettings::new(https, http, &entries, source)))
+    let https = parse(https, "https");
+    let http = parse(http, "http");
+    let entries: Vec<String> = no_proxy.map(|(_, v)| v).unwrap_or_default().split(',').map(str::to_string).collect();
+    let mut settings = ProxySettings::new(https, http, &entries, source);
+    settings.errors = errors;
+    Some(settings)
 }
 
 /// The user config path: `SCPM_CONFIG`, else `<config dir>/scpm/config.yaml`.
@@ -585,21 +638,24 @@ impl UrlParts {
     }
 }
 
-/// An `http(s)://host[:port][/path]` URL without credentials in it.
+/// An `http(s)://host[:port][/path]` URL without credentials in it. No error repeats the URL:
+/// a password that doesn't parse as one (`https://alice:pa#ss@host`) would be shown.
 fn check_url(url: &str) -> Result<UrlParts, String> {
     let Some((scheme, rest)) = url.split_once("://") else {
-        return Err(format!("`{url}` is not a URL; write `https://host/…`"));
+        return Err("not a URL; write `https://host/…`".into());
     };
-    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
-        return Err(format!("only http:// and https:// URLs are supported, not `{scheme}://`"));
+    // Anywhere, not just before the first `/`, `?` or `#`: a password may contain those.
+    if rest.contains('@') {
+        return Err(
+            "the URL must not contain credentials or any other `@`; use `user` and `password`, or `token`".into()
+        );
     }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.contains('@') {
-        return Err("the URL must not contain credentials (`user@`); use `user` and `password`".into());
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return Err("only http:// and https:// URLs are supported".into());
     }
     match UrlParts::parse(url) {
         Some(parts) if !parts.host.is_empty() => Ok(parts),
-        _ => Err(format!("`{url}` has no valid host and port")),
+        _ => Err("the URL has no valid host and port".into()),
     }
 }
 
@@ -763,40 +819,173 @@ mod tests {
 
     #[test]
     fn proxies_come_from_the_environment() {
-        assert_eq!(proxy_from_env(&env(&[])), Ok(None));
-        assert_eq!(proxy_from_env(&env(&[("NO_PROXY", "x"), ("HTTPS_PROXY", " ")])), Ok(None), "blank is unset");
+        assert_eq!(proxy_from_env(&env(&[])), None);
+        assert_eq!(proxy_from_env(&env(&[("NO_PROXY", "x"), ("HTTPS_PROXY", " ")])), None, "blank is unset");
         let p = proxy_from_env(&env(&[
             ("HTTPS_PROXY", "http://proxy.example:3128"),
             ("https_proxy", "http://ignored.example:1"),
             ("http_proxy", "proxy.example"),
             ("no_proxy", " .corp.example, 10.0.0.0/8,internal ,"),
         ]))
-        .unwrap()
         .unwrap();
         assert_eq!(p.https, Some(ProxyServer { host: "proxy.example".into(), port: 3128 }));
         assert_eq!(p.http, Some(ProxyServer { host: "proxy.example".into(), port: 80 }));
         assert_eq!(p.no_proxy, [".corp.example", "internal", "localhost", "127.0.0.1", "::1"]);
         assert_eq!(p.ignored_no_proxy, ["10.0.0.0/8"]);
         assert_eq!(p.source, "environment (HTTPS_PROXY, http_proxy, no_proxy)");
+        assert!(p.errors.is_empty());
 
-        let err = proxy_from_env(&env(&[("HTTPS_PROXY", "http://alice:s3cret@proxy.example:3128")])).unwrap_err();
+        let p = proxy_from_env(&env(&[("HTTPS_PROXY", "http://alice:s3cret@proxy.example:3128")])).unwrap();
+        let err = p.route("https://repo.example/m/").unwrap_err();
         assert!(err.contains("HTTPS_PROXY") && err.contains("authentication is not supported"), "{err}");
         assert!(!err.contains("s3cret"), "{err}");
-        let err = proxy_from_env(&env(&[("HTTP_PROXY", "socks5://proxy.example:1080")])).unwrap_err();
-        assert!(err.contains("`socks5://` proxies are not supported"), "{err}");
+        let p = proxy_from_env(&env(&[("http_proxy", "socks5://proxy.example:1080")])).unwrap();
+        let err = p.route("http://repo.example/m/").unwrap_err();
+        assert!(err.starts_with("http_proxy: ") && err.contains("`socks5://` proxies are not supported"), "{err}");
+    }
+
+    #[test]
+    fn a_bad_environment_proxy_only_blocks_its_own_scheme() {
+        let p = proxy_from_env(&env(&[
+            ("HTTPS_PROXY", "http://proxy.example:3128"),
+            ("HTTP_PROXY", "socks5://proxy.example:1080"),
+            ("NO_PROXY", "plain.example"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.route("https://repo.example/m/").unwrap().map(ProxyServer::url).as_deref(),
+            Some("http://proxy.example:3128")
+        );
+        assert!(p.route("http://repo.example/m/").unwrap_err().contains("HTTP_PROXY"));
+        assert_eq!(p.route("http://plain.example/m/"), Ok(None), "noProxy hosts need no proxy");
+        assert_eq!(p.jvm_args()[..2], ["-J-Dhttps.proxyHost=proxy.example", "-J-Dhttps.proxyPort=3128"]);
+        assert!(!p.jvm_args().iter().any(|a| a.contains("http.proxyHost")));
+        // Both unusable: still nothing fails until a URL of either scheme is asked for.
+        let p = proxy_from_env(&env(&[("HTTPS_PROXY", "socks5://p:1"), ("HTTP_PROXY", "socks5://p:1")])).unwrap();
+        assert_eq!(p.errors.len(), 2);
+        assert!(p.jvm_args().is_empty());
+    }
+
+    #[test]
+    fn proxy_and_url_errors_never_repeat_the_value() {
+        // A `#`, `?` or `/` in a password ends the authority early, so the `@` comes "later".
+        for (value, secret) in [
+            ("http://alice:pa#ss@proxy:3128", "pa#ss"),
+            ("http://alice:pa?ss@proxy:3128", "pa?ss"),
+            ("alice:pa/ss@proxy:3128", "pa/ss"),
+        ] {
+            let err = parse_proxy_url(value).unwrap_err();
+            assert!(err.contains("authentication is not supported") && !err.contains(secret), "{value}: {err}");
+            assert!(!err.contains("alice"), "{value}: {err}");
+        }
+        for value in ["http://pro xy:3128", "http://proxy:31x8", "http://:3128"] {
+            let err = parse_proxy_url(value).unwrap_err();
+            assert!(!err.contains("proxy:") && !err.contains("3128"), "{value}: {err}");
+        }
+        let err = parse_proxy_url("hunter2://proxy:1").unwrap_err();
+        assert!(err.contains("`hunter2://` proxies"), "a plain scheme may be named: {err}");
+        let err = parse_proxy_url("se cret://proxy:1").unwrap_err();
+        assert!(!err.contains("cret"), "{err}");
+        for (url, secret) in [
+            ("https://alice:pa#ss@nexus.example/m/", "pa#ss"),
+            ("https://alice:pa?ss@nexus.example/m/", "pa?ss"),
+            ("https://tok/en@nexus.example/m/", "tok/en"),
+            ("nexus.example:s3cret", "s3cret"),
+            ("https://nexus.example:s3cret/m/", "s3cret"),
+        ] {
+            let err = check_url(url).unwrap_err();
+            assert!(!err.contains(secret) && !err.contains("nexus"), "{url}: {err}");
+        }
+        let err = machine("credentials:\n  - {url: 'https://alice:pa#ss@h.example', token: 'env:X'}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("credentials[0].url") && !err.contains("pa#ss"), "{err}");
+        let err =
+            machine("mirrors:\n  - {url: 'https://u:pa#ss@m.example', mirrorOf: ['*']}\n").unwrap_err().to_string();
+        assert!(err.contains("mirrors[0].url") && !err.contains("pa#ss"), "{err}");
     }
 
     #[test]
     fn the_user_config_proxy_replaces_the_environment() {
         let m = machine("proxy:\n  https: 'http://proxy.example:3128'\n  noProxy: [.example.com]\n").unwrap();
-        let p = m.proxy.unwrap().unwrap();
+        let p = m.proxy.unwrap();
         assert_eq!(p.source, "user config");
         assert_eq!(p.http, None);
         // Set but without a server: no proxy at all, whatever the environment says.
-        assert_eq!(machine("proxy: {noProxy: [x]}\n").unwrap().proxy, Ok(None));
+        assert_eq!(machine("proxy: {noProxy: [x]}\n").unwrap().proxy, None);
         // In the user config, a bad proxy is a configuration error.
         let err = machine("proxy:\n  https: 'http://u:p@proxy.example:3128'\n").unwrap_err().to_string();
         assert!(err.contains("proxy.https") && err.contains("authentication"), "{err}");
+    }
+
+    /// The JVM's `http.nonProxyHosts` matching: `|`-separated, case-insensitive, `*` only at the
+    /// start or the end (`sun.net.spi.DefaultProxySelector`). `host` as `URI.getHost` gives it.
+    fn jvm_bypasses(non_proxy_hosts: &str, host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        non_proxy_hosts.split('|').map(|d| d.trim().to_ascii_lowercase()).filter(|d| !d.is_empty()).any(|d| {
+            if let Some(suffix) = d.strip_prefix('*') {
+                host.ends_with(suffix)
+            } else if let Some(prefix) = d.strip_suffix('*') {
+                host.starts_with(prefix)
+            } else {
+                host == d
+            }
+        })
+    }
+
+    #[test]
+    fn both_paths_bypass_the_same_real_hosts() {
+        let entries: Vec<String> =
+            ["*.corp.example", ".dot.example", "Internal", "10.1.2.3", "[fd00::1]", "corp.*", "a|b", "10.0.0.0/8", "*"]
+                .map(String::from)
+                .to_vec();
+        let hosts = [
+            "corp.example",
+            "a.corp.example",
+            "a.b.corp.example",
+            "notcorp.example",
+            "corp.example.evil",
+            "corp.com",
+            "dot.example",
+            "x.dot.example",
+            "internal",
+            "a.internal",
+            "internal.com",
+            "10.1.2.3",
+            "10.1.2.30",
+            "10.0.0.1",
+            "localhost",
+            "[::1]",
+            "[fd00::1]",
+            "[fd00::2]",
+            "127.0.0.1",
+            "a",
+            "b",
+            "repo1.maven.org",
+        ];
+        let server = Some(ProxyServer { host: "proxy.example".into(), port: 3128 });
+        let p = ProxySettings::new(server.clone(), None, &entries[..entries.len() - 1], "test".into());
+        assert_eq!(
+            p.no_proxy,
+            [".corp.example", ".dot.example", "internal", "10.1.2.3", "fd00::1", "localhost", "127.0.0.1", "::1"]
+        );
+        assert_eq!(p.ignored_no_proxy, ["corp.*", "a|b", "10.0.0.0/8"]);
+        let jvm = p.non_proxy_hosts();
+        for host in hosts {
+            let rust = p.for_url(&format!("https://{host}/m/")).is_none();
+            assert_eq!(rust, p.bypasses(host), "{host}");
+            assert_eq!(rust, jvm_bypasses(&jvm, host), "{host}: the fetcher and cs disagree ({jvm})");
+        }
+        for (host, direct) in
+            [("a.corp.example", true), ("corp.example", true), ("notcorp.example", false), ("corp.com", false)]
+        {
+            assert_eq!(p.bypasses(host), direct, "{host}");
+        }
+        // `*` is every host, on both paths.
+        let all = ProxySettings::new(server, None, &entries, "test".into());
+        for host in hosts {
+            assert!(all.for_url(&format!("https://{host}/")).is_none() && jvm_bypasses(&all.non_proxy_hosts(), host));
+        }
     }
 
     #[test]

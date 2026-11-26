@@ -665,6 +665,24 @@ fn both_paths_use_exactly_the_resolved_proxy() {
     assert!(err.contains("HTTP_PROXY") && err.contains("proxy authentication is not supported"), "{err}");
     assert!(!err.contains("s3cret"), "{err}");
     scpm(ws.path(), empty.path()).env("HTTP_PROXY", &with_user).args(["install", "--frozen"]).assert().success();
+    // A `#` in the password used to end the authority early and land the value in the error.
+    let hashed = format!("http://alice:pa#ss@127.0.0.1:{}", proxy.port);
+    let err = stderr_of(
+        scpm(ws.path(), tempfile::tempdir().unwrap().path()).env("HTTP_PROXY", &hashed).args(["install", "--frozen"]),
+    );
+    assert!(err.contains("proxy authentication is not supported") && !err.contains("pa#ss"), "{err}");
+
+    // An unusable proxy for a scheme no repository uses blocks nothing, on either path.
+    fs::remove_file(ws.path().join("scpm-lock.yaml")).unwrap();
+    let with_socks = |cache: &Path| {
+        let mut cmd = scpm(ws.path(), cache);
+        cmd.env("HTTPS_PROXY", "socks5://127.0.0.1:1080").env("HTTP_PROXY", &proxy_url);
+        cmd
+    };
+    with_socks(tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    let empty = tempfile::tempdir().unwrap();
+    with_socks(empty.path()).args(["install", "--frozen"]).assert().success();
+    assert_eq!(fs::read(jar(empty.path())).unwrap(), b"hello jar");
 }
 
 #[test]

@@ -44,20 +44,14 @@ pub struct FetchItem {
     pub verify_cached: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FetchOptions {
     /// Re-hash files already in the cache against the lock (`scpm install --verify`) and
     /// re-download those that don't match.
     pub verify: bool,
-    /// The proxy (design §5.9); reqwest's own environment lookup is off. An error is only
-    /// reported if something must be downloaded.
+    /// The proxy (design §5.9); reqwest's own environment lookup is off. An unusable proxy for
+    /// a scheme is only reported if something must be downloaded with that scheme.
     pub proxy: ProxyChoice,
-}
-
-impl Default for FetchOptions {
-    fn default() -> Self {
-        FetchOptions { verify: false, proxy: Ok(None) }
-    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -192,24 +186,26 @@ pub fn fetch_all(items: Vec<FetchItem>, opts: FetchOptions) -> Result<FetchRepor
     }
     let mut attempted: BTreeMap<String, usize> = BTreeMap::new();
     let mut errors = Vec::new();
+    let mut proxy_errors: Vec<String> = Vec::new();
     let mut downloads = Vec::new();
+    let proxy = opts.proxy.as_ref();
     for (item, repair) in missing {
-        match &item.auth {
-            Err(message) => errors.push(FetchError::Credentials { key: item.key.clone(), message: message.clone() }),
-            Ok(_) => {
-                *attempted.entry(host_of(&item.url)).or_default() += 1;
-                downloads.push((item, repair));
+        if let Err(message) = &item.auth {
+            errors.push(FetchError::Credentials { key: item.key.clone(), message: message.clone() });
+        } else if let Some(Err(message)) = proxy.map(|p| p.route(&item.url)) {
+            // The environment's proxy for this URL's scheme is unusable; other schemes go on.
+            if !proxy_errors.contains(&message) {
+                proxy_errors.push(message);
             }
+        } else {
+            *attempted.entry(host_of(&item.url)).or_default() += 1;
+            downloads.push((item, repair));
         }
     }
-    let proxy = match &opts.proxy {
-        Ok(proxy) => proxy.as_ref(),
-        Err(message) if !downloads.is_empty() => {
-            errors.push(FetchError::Proxy(message.clone()));
-            return Err(FetchFailure { errors, attempted: BTreeMap::new() });
-        }
-        Err(_) => None,
-    };
+    errors.extend(proxy_errors.into_iter().map(FetchError::Proxy));
+    if downloads.is_empty() {
+        return if errors.is_empty() { Ok(report) } else { Err(FetchFailure { errors, attempted }) };
+    }
     let client = match client(proxy) {
         Ok(client) => client,
         Err(e) => {
@@ -256,22 +252,44 @@ fn hash_files(paths: Vec<&Path>) -> Vec<io::Result<String>> {
 }
 
 /// The HTTP client: exactly the resolved proxy, never reqwest's own environment lookup.
+/// Which requests use it is decided by [`ProxySettings::route`], the same matcher `scpm config
+/// explain` uses and `cs`'s `http.nonProxyHosts` is built to agree with. Redirects never go
+/// from HTTPS to plain HTTP, as in coursier.
 fn client(proxy: Option<&ProxySettings>) -> reqwest::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent(user_agent())
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            match redirect_refusal(attempt.previous(), attempt.url()) {
+                Some(reason) => attempt.error(reason),
+                None => attempt.follow(),
+            }
+        }))
         .no_proxy();
     if let Some(p) = proxy {
-        let no_proxy = p.no_proxy.join(",");
-        if let Some(s) = &p.https {
-            builder = builder.proxy(reqwest::Proxy::https(s.url())?.no_proxy(reqwest::NoProxy::from_string(&no_proxy)));
+        // A proxy URL reqwest can't parse would silently mean "direct" inside the closure.
+        for s in p.https.iter().chain(&p.http) {
+            reqwest::Proxy::all(s.url())?;
         }
-        if let Some(s) = &p.http {
-            builder = builder.proxy(reqwest::Proxy::http(s.url())?.no_proxy(reqwest::NoProxy::from_string(&no_proxy)));
-        }
+        let p = p.clone();
+        builder = builder.proxy(reqwest::Proxy::custom(move |url| p.for_url(url.as_str()).map(|s| s.url())));
     }
     builder.build()
+}
+
+/// Up to 10 redirects, never from HTTPS to plain HTTP: the bytes are checked against the lock
+/// either way, but coursier refuses such a downgrade and the fetcher must not differ. (reqwest
+/// already drops `Authorization` when a redirect changes the scheme, host or port.)
+fn redirect_refusal(previous: &[reqwest::Url], next: &reqwest::Url) -> Option<String> {
+    if previous.len() >= 10 {
+        return Some("too many redirects".into());
+    }
+    let from_https = previous.iter().any(|u| u.scheme() == "https");
+    (from_https && next.scheme() == "http").then(|| {
+        let origin = next.host_str().map(|h| format!(" ({h})")).unwrap_or_default();
+        format!("refused a redirect from HTTPS to plain HTTP{origin}")
+    })
 }
 
 async fn download_all(
@@ -755,6 +773,20 @@ mod tests {
         );
         assert_eq!(parse_basic_realms("Basic realm=\"a\", realm=\"b\""), ["a"]);
         assert_eq!(parse_basic_realms("Basic realm=\"a\", Basic realm=\"unterminated"), ["a"]);
+    }
+
+    #[test]
+    fn redirects_never_downgrade_to_plain_http() {
+        let url = |u: &str| reqwest::Url::parse(u).unwrap();
+        let https = url("https://repo.example/a.jar");
+        let http = url("http://repo.example:8080/a.jar");
+        assert!(redirect_refusal(std::slice::from_ref(&https), &http).unwrap().contains("HTTPS to plain HTTP"));
+        let chain = [https.clone(), url("https://cdn.example/a.jar")];
+        assert!(redirect_refusal(&chain, &http).is_some(), "not even later in the chain");
+        assert_eq!(redirect_refusal(std::slice::from_ref(&http), &https), None, "upgrades are fine");
+        assert_eq!(redirect_refusal(std::slice::from_ref(&https), &url("https://cdn.example/a.jar")), None);
+        assert_eq!(redirect_refusal(std::slice::from_ref(&http), &http), None);
+        assert!(redirect_refusal(&vec![http.clone(); 10], &http).unwrap().contains("too many"));
     }
 
     #[test]
