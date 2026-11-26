@@ -160,7 +160,12 @@ impl MavenVersion {
                 }
                 c if c.is_ascii_digit() => {
                     if !is_digit && i > start {
-                        list.push(Item::string(&version[start..i], true));
+                        // A qualifier after `.` is nested like one after `-` (Maven 3.9:
+                        // `1.0.rc1` == `1.0-rc1`); after `-` the list is still empty.
+                        if !list.is_empty() {
+                            stack.push(Vec::new());
+                        }
+                        stack.last_mut().expect("the root list").push(Item::string(&version[start..i], true));
                         start = i;
                         stack.push(Vec::new());
                     }
@@ -508,6 +513,10 @@ mod tests {
             "1.0.jre7",
             "1.0.sp",
             "1.0.foo",
+            "1.0.rc1",
+            "1.0.sp2",
+            "1.0.foo3",
+            "2.0.M1",
             "1.2.3+4-abc",
         ];
         let vs: Vec<MavenVersion> = corpus.iter().map(|s| v(s)).collect();
@@ -541,6 +550,11 @@ mod tests {
         assert_eq!(v("1.0.sp"), v("1.0-sp"));
         assert_eq!(v("1.0.0.foo"), v("1.0-foo"));
         assert_eq!(Range::parse("=1.0.sp").unwrap().select(["1.0", "1.0-sp", "1.1"]), Some("1.0-sp"));
+        // So is a dotted qualifier followed by digits.
+        assert_eq!(v("1.0.rc1"), v("1.0-rc1"));
+        assert_eq!(v("1.0.jre7"), v("1.0-jre7"));
+        assert!(v("1.0.rc1") < v("1.0"));
+        assert_eq!(Range::parse("=1.0.rc1").unwrap().select(["1.0-rc1", "1.0", "1.0-rc2"]), Some("1.0-rc1"));
     }
 
     #[test]

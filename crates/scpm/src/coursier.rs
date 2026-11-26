@@ -182,9 +182,12 @@ pub fn repositories(config: &[Repository]) -> Result<Vec<Repo>, CoursierError> {
                     )));
                 }
                 if credentials.is_some() && is_plain_http(&def.url) && !def.allow_insecure_credentials {
+                    // Only the origin: a path or query may carry a token.
+                    let (scheme, rest) = def.url.split_once("://").unwrap_or(("http", ""));
+                    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
                     return Err(CoursierError::Config(format!(
-                        "repository `{}`: credentials would be sent over plain HTTP to {}; use an https:// URL, or set `allowInsecureCredentials: true` to send them to exactly this scheme, host and port",
-                        def.id, def.url
+                        "repository `{}`: credentials would be sent over plain HTTP to {scheme}://{authority}; use an https:// URL, or set `allowInsecureCredentials: true` to send them to exactly this scheme, host and port",
+                        def.id
                     )));
                 }
                 let url = if def.url.ends_with('/') { def.url.clone() } else { format!("{}/", def.url) };
@@ -241,7 +244,10 @@ pub fn cache_path(cache: &Path, url: &str, user: Option<&str>) -> Option<PathBuf
     let (protocol, rest) = url.split_once("://")?;
     let user_part = user.map(|u| format!("{u}@")).unwrap_or_default();
     let rel = escape(&format!("{protocol}/{user_part}{rest}"));
-    let contained = rel.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains('\\'))
+    // A `\\` (the high escape character of U+0250..U+025F) is a separator only on Windows.
+    let contained = rel
+        .split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !(cfg!(windows) && seg.contains('\\')))
         && Path::new(&rel).is_relative();
     contained.then(|| cache.join(rel))
 }
@@ -282,7 +288,8 @@ fn escape(input: &str) -> String {
 /// The URL a cached file was downloaded from (inverse of [`cache_path`]).
 pub fn url_from_cache_path(cache: &Path, file: &Path) -> Option<String> {
     let rel = file.strip_prefix(cache).ok()?;
-    let rel = rel.to_str()?.replace('\\', "/");
+    let rel = rel.to_str()?;
+    let rel = if cfg!(windows) { rel.replace('\\', "/") } else { rel.to_string() };
     let (protocol, rest) = rel.split_once('/')?;
     let rest = unescape(rest);
     // Drop a `user@` prefix on the host.
@@ -586,6 +593,8 @@ fn add_request_args(cmd: &mut Command, req: &ResolveRequest) {
 /// credentials that could not be read (reported only if coursier then fails).
 struct CommonArgs {
     _credential_file: Option<tempfile::NamedTempFile>,
+    /// Holds the (absent) Scala CLI config `cs` is pointed at.
+    _scala_cli_config: Option<tempfile::TempDir>,
     missing_credentials: Vec<String>,
 }
 
@@ -602,6 +611,9 @@ impl CommonArgs {
 /// Cache, repositories and credentials. Secrets never go on the command line: every credential
 /// `cs` may use is written to a private (0600) temporary file that `COURSIER_CREDENTIALS` names
 /// for the child, which also stops `cs` from reading coursier's own sources unfiltered.
+/// `SCALA_CLI_CONFIG` names a file that doesn't exist, so `cs` skips the Scala CLI config's
+/// credentials too (coursier reads those even with `COURSIER_CREDENTIALS` set, and scpm's
+/// fetcher doesn't read them at all).
 fn add_common_args(cmd: &mut Command, repos: &[Repo], cache: &Path) -> Result<CommonArgs, CoursierError> {
     cmd.arg("--cache").arg(cache).arg("--no-default").arg("--user-agent").arg(user_agent());
     for repo in repos {
@@ -620,13 +632,30 @@ fn add_common_args(cmd: &mut Command, repos: &[Repo], cache: &Path) -> Result<Co
         .and_then(|()| file.flush())
         .map_err(|e| CoursierError::Config(format!("cannot write a credentials file: {e}")))?;
     cmd.env("COURSIER_CREDENTIALS", credentials_env_value(file.path()));
-    Ok(CommonArgs { _credential_file: Some(file), missing_credentials })
+    let scala_cli = tempfile::Builder::new()
+        .prefix("scpm-scala-cli-")
+        .tempdir()
+        .map_err(|e| CoursierError::Config(format!("cannot create a temporary directory: {e}")))?;
+    cmd.env("SCALA_CLI_CONFIG", scala_cli.path().join("config.json"));
+    Ok(CommonArgs { _credential_file: Some(file), _scala_cli_config: Some(scala_cli), missing_credentials })
 }
 
-/// `COURSIER_CREDENTIALS` naming a file: an absolute path, or a `file:` URL on Windows.
+/// `COURSIER_CREDENTIALS` naming a file: an absolute path, or (on Windows) a `file:` URL, which
+/// coursier reads with `new URI`, so characters a URI path can't hold are percent-encoded.
 fn credentials_env_value(path: &Path) -> String {
     let text = path.display().to_string();
-    if text.starts_with('/') { text } else { format!("file:///{}", text.replace('\\', "/")) }
+    if text.starts_with('/') {
+        return text;
+    }
+    let mut url = String::from("file:///");
+    for b in text.replace('\\', "/").bytes() {
+        if b.is_ascii_alphanumeric() || b"/:-._~!$&'()*+,;=@".contains(&b) {
+            url.push(b as char);
+        } else {
+            url.push_str(&format!("%{b:02X}"));
+        }
+    }
+    url
 }
 
 /// The credentials file for `cs`: each repository's configured credentials, scoped to its
@@ -825,6 +854,13 @@ mod tests {
         let path = cache_path(cache, url, None).unwrap();
         assert!(path.starts_with("/c/https/h.example/%G0/"), "{}", path.display());
         assert_eq!(url_from_cache_path(cache, &path).unwrap(), url);
+        // U+0250's high escape character is `\`, an ordinary filename character on Unix.
+        if cfg!(unix) {
+            let url = "https://h.example/\u{250}/a-1.jar";
+            let path = cache_path(cache, url, None).unwrap();
+            assert_eq!(path, Path::new("/c/https/h.example/%\\0/a-1.jar"));
+            assert_eq!(url_from_cache_path(cache, &path).unwrap(), url);
+        }
     }
 
     #[test]
@@ -879,8 +915,9 @@ mod tests {
                 allow_insecure_credentials: allow,
             })])
         };
-        let err = def("http://nexus.local:8081/repo", false).unwrap_err().to_string();
+        let err = def("http://nexus.local:8081/repo?token=s3cret", false).unwrap_err().to_string();
         assert!(err.contains("repository `nexus`") && err.contains("plain HTTP"), "{err}");
+        assert!(err.contains("http://nexus.local:8081;") && !err.contains("s3cret"), "only the origin: {err}");
         assert!(err.contains("https://") && err.contains("allowInsecureCredentials: true"), "{err}");
         assert!(def("HTTP://nexus.local:8081/repo", false).is_err());
         assert!(def("https://nexus.local/repo", false).is_ok());
@@ -956,8 +993,27 @@ mod tests {
         let common = add_common_args(&mut cmd, &repos, Path::new("/c")).unwrap();
         let file = common._credential_file.as_ref().unwrap();
         assert!(!fs::read_to_string(file.path()).unwrap().contains("scpm0"));
-        assert!(cmd.get_envs().any(|(k, v)| k == "COURSIER_CREDENTIALS" && v.is_some_and(|v| v == file.path())));
+        let env = |name: &str| cmd.get_envs().find(|(k, _)| *k == name).and_then(|(_, v)| v);
+        let value = env("COURSIER_CREDENTIALS").unwrap();
+        assert_eq!(value, credentials_env_value(file.path()).as_str());
+        if cfg!(unix) {
+            assert_eq!(value, file.path());
+        }
         assert!(!cmd.get_args().any(|a| a == "--credential-file" || a == "--credentials"));
+        // The Scala CLI config (whose credentials skip scpm's policy) points at nothing.
+        let scala_cli = Path::new(env("SCALA_CLI_CONFIG").unwrap());
+        assert!(scala_cli.starts_with(common._scala_cli_config.as_ref().unwrap().path()));
+        assert!(!scala_cli.exists());
+    }
+
+    #[test]
+    fn windows_credential_paths_become_valid_file_urls() {
+        assert_eq!(
+            credentials_env_value(Path::new(r"C:\Users\Ann Lee\AppData\Local\Temp\scpm-credentials-x.properties")),
+            "file:///C:/Users/Ann%20Lee/AppData/Local/Temp/scpm-credentials-x.properties"
+        );
+        assert_eq!(credentials_env_value(Path::new(r"C:\T\é#%.p")), "file:///C:/T/%C3%A9%23%25.p");
+        assert_eq!(credentials_env_value(Path::new("/tmp/a b")), "/tmp/a b");
     }
 
     #[test]

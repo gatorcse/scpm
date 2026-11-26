@@ -282,13 +282,15 @@ async fn fetch_one(
         let lock_path = lock_path.clone();
         tokio::task::spawn_blocking(move || acquire(&lock_path, &key)).await.expect("lock task")?
     };
+    // Under the lock, look again: another process may have written (or repaired) the file.
     let mut rehashed = false;
-    if !replace && fs::metadata(&item.dest).is_ok_and(|m| m.len() == item.size) {
-        if !(verify || item.verify_cached) {
+    if fs::metadata(&item.dest).is_ok_and(|m| m.len() == item.size) {
+        if !(replace || verify || item.verify_cached) {
             release(lock, &lock_path);
             return Ok(Fetched { downloaded: None, rehashed });
         }
-        rehashed = true;
+        // A queued repair was already counted as verified; a new file wasn't.
+        rehashed = !replace;
         let dest = item.dest.clone();
         let hash = tokio::task::spawn_blocking(move || sha256_file(&dest)).await.expect("hash task");
         if hash.is_ok_and(|h| h == item.sha256) {
@@ -356,21 +358,27 @@ fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
-/// The realm of a `WWW-Authenticate: Basic realm="…"` challenge.
-fn basic_realm(resp: &reqwest::Response) -> Option<String> {
-    resp.headers().get_all(reqwest::header::WWW_AUTHENTICATE).iter().find_map(|v| parse_basic_realm(v.to_str().ok()?))
+/// The realms of every `WWW-Authenticate: Basic realm="…"` challenge, in order.
+fn basic_realms(resp: &reqwest::Response) -> Vec<String> {
+    resp.headers()
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(parse_basic_realms)
+        .collect()
 }
 
-/// The realm of the first Basic challenge in a `WWW-Authenticate` value, which may list several
+/// The realms of the Basic challenges in a `WWW-Authenticate` value, which may list several
 /// challenges (`Bearer realm="api", Basic realm="packages"`, RFC 9110 §11.6.1).
-fn parse_basic_realm(header: &str) -> Option<String> {
+fn parse_basic_realms(header: &str) -> Vec<String> {
     let token_end = |s: &str| s.find(|c: char| c == '=' || c == ',' || c.is_ascii_whitespace()).unwrap_or(s.len());
+    let mut realms = Vec::new();
     let mut in_basic = false;
     let mut rest = header;
     loop {
         rest = rest.trim_start_matches([' ', '\t', ',']);
         if rest.is_empty() {
-            return None;
+            return realms;
         }
         let end = token_end(rest);
         if end == 0 {
@@ -404,7 +412,8 @@ fn parse_basic_realm(header: &str) -> Option<String> {
                         c => out.push(c),
                     }
                 }
-                (out, &quoted[close? + 1..])
+                let Some(close) = close else { return realms };
+                (out, &quoted[close + 1..])
             }
             None => {
                 let end = value.find(|c: char| c == ',' || c.is_ascii_whitespace()).unwrap_or(value.len());
@@ -412,7 +421,9 @@ fn parse_basic_realm(header: &str) -> Option<String> {
             }
         };
         if in_basic && token.eq_ignore_ascii_case("realm") {
-            return Some(parsed);
+            realms.push(parsed);
+            // One realm per challenge.
+            in_basic = false;
         }
         rest = tail;
     }
@@ -443,8 +454,9 @@ async fn download(
     // Like coursier, credentials scoped to a realm go out only once the server asks for them.
     if resp.status().as_u16() == 401
         && auth.is_none()
-        && let Some(realm) = basic_realm(&resp)
-        && let Some((_, challenge_auth)) = item.challenge.iter().find(|(r, _)| r.as_deref().is_none_or(|r| r == realm))
+        && let Some(challenge_auth) = basic_realms(&resp).iter().find_map(|realm| {
+            item.challenge.iter().find(|(r, _)| r.as_deref().is_none_or(|r| r == realm)).map(|(_, a)| a)
+        })
     {
         resp = send(Some(challenge_auth)).await.map_err(transport)?;
     }
@@ -678,7 +690,7 @@ mod tests {
 
     #[test]
     fn basic_realms() {
-        let realm = |h: &str| parse_basic_realm(h);
+        let realm = |h: &str| parse_basic_realms(h).into_iter().next();
         assert_eq!(realm("Basic realm=\"Sonatype Nexus\"").as_deref(), Some("Sonatype Nexus"));
         assert_eq!(realm("BASIC charset=\"UTF-8\", realm=\"R\"").as_deref(), Some("R"));
         assert_eq!(realm("Basic realm=\"R\", charset=\"UTF-8\"").as_deref(), Some("R"));
@@ -690,6 +702,15 @@ mod tests {
         assert_eq!(realm("Bearer error=\"a, Basic realm=x\", Basic realm=\"p\"").as_deref(), Some("p"));
         assert_eq!(realm("Negotiate abc==, Basic realm = \"a \\\"b\\\"\"").as_deref(), Some("a \"b\""));
         assert_eq!(realm("Basic, Bearer realm=\"R\""), None);
+        // Every Basic realm, in order, so the caller can pick one it has credentials for.
+        assert_eq!(
+            parse_basic_realms(
+                "Basic realm=\"legacy\", Bearer realm=\"x\", Basic realm=\"packages\", charset=\"UTF-8\""
+            ),
+            ["legacy", "packages"]
+        );
+        assert_eq!(parse_basic_realms("Basic realm=\"a\", realm=\"b\""), ["a"]);
+        assert_eq!(parse_basic_realms("Basic realm=\"a\", Basic realm=\"unterminated"), ["a"]);
     }
 
     #[test]
