@@ -1186,6 +1186,8 @@ fn build_variant(
     let mut diags = Diagnostics::default();
     let mut dependencies = Vec::new();
     let mut workspace_dependencies = Vec::new();
+    // Each external coordinate's first declaration (key path) and its effective version.
+    let mut declared: std::collections::HashMap<String, (String, VersionSpec)> = std::collections::HashMap::new();
     let scoped = [
         (Scope::Compile, &cfg.dependencies),
         (Scope::Provided, &cfg.provided_dependencies),
@@ -1236,7 +1238,28 @@ fn build_variant(
                 continue;
             }
             match external_dependency(ctx, scope, key, spec, scala.is_some()) {
-                Ok(d) => dependencies.push(d),
+                Ok(d) => {
+                    // One version per coordinate: a variant selects and locks each once.
+                    let coord = d.coord.to_string();
+                    match declared.get(&coord) {
+                        Some((first_at, first)) if *first != d.version => diags.push(
+                            Diagnostic::new(format!(
+                                "`{coord}` is declared with different versions: `{first}` at `{first_at}` and `{}` at `{at}`",
+                                d.version
+                            ))
+                            .in_file(file)
+                            .at_key(at)
+                            .with_help(
+                                "use one version in every scope, e.g. put it in the catalog and write `catalog` in each",
+                            ),
+                        ),
+                        Some(_) => {}
+                        None => {
+                            declared.insert(coord, (at, d.version.clone()));
+                        }
+                    }
+                    dependencies.push(d);
+                }
                 Err(d) => diags.push(d.in_file(file).at_key(at)),
             }
         }

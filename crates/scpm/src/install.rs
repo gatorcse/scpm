@@ -871,7 +871,9 @@ pub fn fetch_items(
     creds: &CoursierCredentials,
     cache: &Path,
 ) -> Result<Vec<FetchItem>, InstallError> {
-    let access: HashMap<&str, RepoAccess> = repos.iter().map(|r| (r.id.as_str(), repo_access(r, creds))).collect();
+    // Coursier's own credentials go over plain HTTP only to repositories that opt in.
+    let creds = creds.restricted(&coursier::insecure_credential_origins(repos));
+    let access: HashMap<&str, RepoAccess> = repos.iter().map(|r| (r.id.as_str(), repo_access(r, &creds))).collect();
     let mut items = Vec::new();
     for key in lock.referenced_artifacts() {
         let art = lock.artifacts.get(key).ok_or_else(|| {
@@ -965,9 +967,18 @@ mod tests {
     #[test]
     fn boot_inputs_track_repositories_and_context() {
         let ctx = ResolutionContextLock { os: "linux".into(), arch: "x86_64".into(), jdk: "25".into() };
-        let central = vec![Repo { id: "central".into(), url: coursier::CENTRAL_URL.into(), credentials: None }];
-        let other =
-            vec![Repo { id: "apache".into(), url: "https://repo.maven.apache.org/maven2/".into(), credentials: None }];
+        let central = vec![Repo {
+            id: "central".into(),
+            url: coursier::CENTRAL_URL.into(),
+            credentials: None,
+            allow_insecure_credentials: false,
+        }];
+        let other = vec![Repo {
+            id: "apache".into(),
+            url: "https://repo.maven.apache.org/maven2/".into(),
+            credentials: None,
+            allow_insecure_credentials: false,
+        }];
         let base = boot_inputs_hash(&central, &ctx);
         assert_eq!(base, boot_inputs_hash(&central, &ctx));
         assert_ne!(base, boot_inputs_hash(&other, &ctx));
@@ -1037,8 +1048,18 @@ mod tests {
         let file = dir.path().join("x-1.jar");
         std::fs::write(&file, b"bytes").unwrap();
         let repos = vec![
-            Repo { id: "a".into(), url: "https://a.example/".into(), credentials: None },
-            Repo { id: "b".into(), url: "https://b.example/".into(), credentials: None },
+            Repo {
+                id: "a".into(),
+                url: "https://a.example/".into(),
+                credentials: None,
+                allow_insecure_credentials: false,
+            },
+            Repo {
+                id: "b".into(),
+                url: "https://b.example/".into(),
+                credentials: None,
+                allow_insecure_credentials: false,
+            },
         ];
         let resolved = |repo: &str| ResolvedArtifact {
             key: "g:x:1".into(),
@@ -1062,7 +1083,12 @@ mod tests {
         let mut lock = Lockfile::default();
         lock.boot.insert("x".into(), vec!["g:..:1".into()]);
         lock.artifacts.insert("g:..:1".into(), ArtifactLock { repo: "central".into(), sha256: "0".into(), size: 1 });
-        let repos = vec![Repo { id: "central".into(), url: coursier::CENTRAL_URL.into(), credentials: None }];
+        let repos = vec![Repo {
+            id: "central".into(),
+            url: coursier::CENTRAL_URL.into(),
+            credentials: None,
+            allow_insecure_credentials: false,
+        }];
         let err = fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c")).unwrap_err();
         assert!(err.to_string().contains("invalid artifact key"), "{err}");
     }
@@ -1070,8 +1096,13 @@ mod tests {
     #[test]
     fn repo_matching_prefers_longest_prefix() {
         let repos = vec![
-            Repo { id: "a".into(), url: "https://h/".into(), credentials: None },
-            Repo { id: "b".into(), url: "https://h/maven/".into(), credentials: None },
+            Repo { id: "a".into(), url: "https://h/".into(), credentials: None, allow_insecure_credentials: false },
+            Repo {
+                id: "b".into(),
+                url: "https://h/maven/".into(),
+                credentials: None,
+                allow_insecure_credentials: false,
+            },
         ];
         assert_eq!(repo_for_url(&repos, "https://h/maven/x.jar").unwrap().id, "b");
         assert_eq!(repo_for_url(&repos, "https://h/other/x.jar").unwrap().id, "a");

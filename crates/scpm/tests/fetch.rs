@@ -53,7 +53,12 @@ fn oversized_bodies_are_rejected_before_they_are_written() {
 fn realm_scoped_credentials_wait_for_a_matching_challenge() {
     // The test server challenges with `Basic realm="test"`.
     let server = Server::maven(hello_repo_files(JAR), Some(("alice", "s3cret")));
-    let repos = vec![Repo { id: "local".into(), url: server.url("/maven/"), credentials: None }];
+    let repos = vec![Repo {
+        id: "local".into(),
+        url: server.url("/maven/"),
+        credentials: None,
+        allow_insecure_credentials: true,
+    }];
     let cache = tempfile::tempdir().unwrap();
 
     let other = CoursierCredentials::from_env_value(&format!("http://127.0.0.1:{}(other) alice:s3cret", server.port));
@@ -188,7 +193,12 @@ fn hello_lock() -> Lockfile {
 #[test]
 fn coursier_credentials_authenticate_and_name_the_cache_directory() {
     let server = Server::maven(hello_repo_files(JAR), Some(("alice", "s3cret")));
-    let repos = vec![Repo { id: "local".into(), url: server.url("/maven/"), credentials: None }];
+    let repos = vec![Repo {
+        id: "local".into(),
+        url: server.url("/maven/"),
+        credentials: None,
+        allow_insecure_credentials: true,
+    }];
     let dir = tempfile::tempdir().unwrap();
     let props = dir.path().join("credentials.properties");
     fs::write(&props, "local.host=127.0.0.1\nlocal.username=alice\nlocal.password=s3cret\nlocal.https-only=false\n")
@@ -216,9 +226,39 @@ fn coursier_credentials_authenticate_and_name_the_cache_directory() {
 }
 
 #[test]
+fn coursier_credentials_need_the_repository_opt_in_over_http() {
+    let server = Server::maven(hello_repo_files(JAR), Some(("alice", "s3cret")));
+    let repo = |allow: bool| {
+        vec![Repo {
+            id: "local".into(),
+            url: server.url("/maven/"),
+            credentials: None,
+            allow_insecure_credentials: allow,
+        }]
+    };
+    let cache = tempfile::tempdir().unwrap();
+    // Both forms coursier would send over plain HTTP: `https-only=false`, and an `http://` host.
+    for creds in [
+        "x.host=127.0.0.1\nx.username=alice\nx.password=s3cret\nx.https-only=false\n".to_string(),
+        format!("x.host=http://127.0.0.1:{}\nx.username=alice\nx.password=s3cret\n", server.port),
+    ] {
+        let creds = CoursierCredentials { entries: scpm::credentials::parse_properties(&creds) };
+        let items = fetch_items(&hello_lock(), &repo(false), &creds, cache.path()).unwrap();
+        assert!(matches!(items[0].auth, Ok(None)) && items[0].challenge.is_empty(), "{creds:?}");
+        let items = fetch_items(&hello_lock(), &repo(true), &creds, cache.path()).unwrap();
+        assert!(matches!(&items[0].auth, Ok(Some(Auth::Basic { user, .. })) if user == "alice"), "{creds:?}");
+    }
+}
+
+#[test]
 fn https_only_coursier_credentials_are_not_sent_over_http() {
     let creds = CoursierCredentials::from_env_value("127.0.0.1 alice:s3cret");
-    let repos = vec![Repo { id: "local".into(), url: "http://127.0.0.1:1/maven/".into(), credentials: None }];
+    let repos = vec![Repo {
+        id: "local".into(),
+        url: "http://127.0.0.1:1/maven/".into(),
+        credentials: None,
+        allow_insecure_credentials: false,
+    }];
     let cache = tempfile::tempdir().unwrap();
     let items = fetch_items(&hello_lock(), &repos, &creds, cache.path()).unwrap();
     assert!(matches!(items[0].auth, Ok(None)));

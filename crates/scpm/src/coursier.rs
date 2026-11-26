@@ -11,6 +11,7 @@ use std::process::Command;
 use serde::Deserialize;
 
 use crate::config::{Credentials, Repository};
+use crate::credentials::CoursierCredentials;
 
 /// Maven Central, as coursier names it.
 pub const CENTRAL_URL: &str = "https://repo1.maven.org/maven2/";
@@ -41,6 +42,8 @@ pub struct Repo {
     /// Always ends with `/`.
     pub url: String,
     pub credentials: Option<RepoCredentials>,
+    /// `allowInsecureCredentials`: credentials may go to this `http://` repository's origin.
+    pub allow_insecure_credentials: bool,
 }
 
 /// Where a repository's configured credentials come from: environment variable names.
@@ -148,7 +151,7 @@ pub fn repositories(config: &[Repository]) -> Result<Vec<Repo>, CoursierError> {
         .iter()
         .map(|r| match r {
             Repository::Named(name) if name == "central" => {
-                Ok(Repo { id: "central".into(), url: CENTRAL_URL.into(), credentials: None })
+                Ok(Repo { id: "central".into(), url: CENTRAL_URL.into(), credentials: None, allow_insecure_credentials: false })
             }
             Repository::Named(name) => Err(CoursierError::Config(format!(
                 "unknown repository `{name}`; the only built-in name is `central`, others need `{{id, url}}`"
@@ -173,10 +176,35 @@ pub fn repositories(config: &[Repository]) -> Result<Vec<Repo>, CoursierError> {
                         def.id
                     )));
                 }
+                if credentials.is_some() && is_plain_http(&def.url) && !def.allow_insecure_credentials {
+                    return Err(CoursierError::Config(format!(
+                        "repository `{}`: credentials would be sent over plain HTTP to {}; use an https:// URL, or set `allowInsecureCredentials: true` to send them to exactly this scheme, host and port",
+                        def.id, def.url
+                    )));
+                }
                 let url = if def.url.ends_with('/') { def.url.clone() } else { format!("{}/", def.url) };
-                Ok(Repo { id: def.id.clone(), url, credentials })
+                Ok(Repo {
+                    id: def.id.clone(),
+                    url,
+                    credentials,
+                    allow_insecure_credentials: def.allow_insecure_credentials,
+                })
             }
         })
+        .collect()
+}
+
+fn is_plain_http(url: &str) -> bool {
+    url.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://"))
+}
+
+/// The origins (`http://host[:port]`) of plain-HTTP repositories that opted in to receiving
+/// credentials (`allowInsecureCredentials`); credentials go over plain HTTP nowhere else.
+pub fn insecure_credential_origins(repos: &[Repo]) -> Vec<String> {
+    repos
+        .iter()
+        .filter(|r| r.allow_insecure_credentials && is_plain_http(&r.url))
+        .filter_map(|r| r.origin().map(str::to_string))
         .collect()
 }
 
@@ -558,46 +586,71 @@ impl CommonArgs {
     }
 }
 
-/// Cache, repositories and credentials. Secrets never go on the command line: configured
-/// credentials are written to a private (0600) temporary `--credential-file`.
+/// Cache, repositories and credentials. Secrets never go on the command line: every credential
+/// `cs` may use is written to a private (0600) temporary file that `COURSIER_CREDENTIALS` names
+/// for the child, which also stops `cs` from reading coursier's own sources unfiltered.
 fn add_common_args(cmd: &mut Command, repos: &[Repo], cache: &Path) -> Result<CommonArgs, CoursierError> {
     cmd.arg("--cache").arg(cache).arg("--no-default").arg("--user-agent").arg(user_agent());
-    let mut properties = String::new();
-    let mut missing_credentials = Vec::new();
-    for (i, repo) in repos.iter().enumerate() {
+    for repo in repos {
         cmd.arg("--repository").arg(&repo.url);
+    }
+    let mut missing_credentials = Vec::new();
+    let properties = credential_properties(repos, &CoursierCredentials::load(), &mut missing_credentials);
+    // NamedTempFile is created with mode 0600 on Unix.
+    let mut file = tempfile::Builder::new()
+        .prefix("scpm-credentials-")
+        .suffix(".properties")
+        .tempfile()
+        .map_err(|e| CoursierError::Config(format!("cannot create a credentials file: {e}")))?;
+    file.write_all(properties.as_bytes())
+        .and_then(|()| file.flush())
+        .map_err(|e| CoursierError::Config(format!("cannot write a credentials file: {e}")))?;
+    cmd.env("COURSIER_CREDENTIALS", credentials_env_value(file.path()));
+    Ok(CommonArgs { _credential_file: Some(file), missing_credentials })
+}
+
+/// `COURSIER_CREDENTIALS` naming a file: an absolute path, or a `file:` URL on Windows.
+fn credentials_env_value(path: &Path) -> String {
+    let text = path.display().to_string();
+    if text.starts_with('/') { text } else { format!("file:///{}", text.replace('\\', "/")) }
+}
+
+/// The credentials file for `cs`: each repository's configured credentials, scoped to its
+/// origin, then coursier's own entries restricted to scpm's plain-HTTP policy.
+fn credential_properties(repos: &[Repo], coursier: &CoursierCredentials, missing: &mut Vec<String>) -> String {
+    let mut properties = String::new();
+    let mut entry = |prefix: String, host: &str, user: &str, password: &str, extra: &[(&str, String)]| {
+        properties.push_str(&format!(
+            "{prefix}.host={}\n{prefix}.username={}\n{prefix}.password={}\n",
+            escape_property(host),
+            escape_property(user),
+            escape_property(password)
+        ));
+        for (key, value) in extra {
+            properties.push_str(&format!("{prefix}.{key}={}\n", escape_property(value)));
+        }
+    };
+    for (i, repo) in repos.iter().enumerate() {
         let Some(origin) = repo.origin() else { continue };
         match repo.auth() {
+            // `scheme://host[:port]` scopes the credentials to the repository's scheme, host and
+            // port (coursier 2.1.27 ignores `https-only` for a host with a scheme).
             Ok(Some(auth)) => {
-                // `scheme://host[:port]` scopes the credentials to the repository's scheme, host
-                // and port (coursier 2.1.27 ignores `https-only` for a host with a scheme).
-                properties.push_str(&format!(
-                    "scpm{i}.host={}\nscpm{i}.username={}\nscpm{i}.password={}\nscpm{i}.auto=true\n",
-                    escape_property(origin),
-                    escape_property(auth.user()),
-                    escape_property(auth.password()),
-                ));
+                entry(format!("scpm{i}"), origin, auth.user(), auth.password(), &[("auto", "true".into())])
             }
             Ok(None) => {}
-            Err(e) => missing_credentials.push(e.to_string()),
+            Err(e) => missing.push(e.to_string()),
         }
     }
-    let credential_file = if properties.is_empty() {
-        None
-    } else {
-        // NamedTempFile is created with mode 0600 on Unix.
-        let mut file = tempfile::Builder::new()
-            .prefix("scpm-credentials-")
-            .suffix(".properties")
-            .tempfile()
-            .map_err(|e| CoursierError::Config(format!("cannot create a credentials file: {e}")))?;
-        file.write_all(properties.as_bytes())
-            .and_then(|()| file.flush())
-            .map_err(|e| CoursierError::Config(format!("cannot write a credentials file: {e}")))?;
-        cmd.arg("--credential-file").arg(file.path());
-        Some(file)
-    };
-    Ok(CommonArgs { _credential_file: credential_file, missing_credentials })
+    let allowed = coursier.restricted(&insecure_credential_origins(repos));
+    for (i, c) in allowed.entries.iter().enumerate() {
+        let mut extra = vec![("auto", c.auto.to_string()), ("https-only", c.https_only.to_string())];
+        if let Some(realm) = &c.realm {
+            extra.push(("realm", realm.clone()));
+        }
+        entry(format!("coursier{i}"), &c.host_spec(), &c.user, &c.password, &extra);
+    }
+    properties
 }
 
 /// Escapes a value for a Java properties file.
@@ -756,6 +809,7 @@ mod tests {
                 id: "acme".into(),
                 url: url.into(),
                 credentials: None,
+                allow_insecure_credentials: false,
             })])
         };
         let err = repo("https://alice:hunter2@acme.example/maven").unwrap_err().to_string();
@@ -772,6 +826,7 @@ mod tests {
             id: "r".into(),
             url: "https://repo.example:8443/maven/".into(),
             credentials: Some(RepoCredentials::Bearer { token_var: var.into() }),
+            allow_insecure_credentials: false,
         }];
         let mut cmd = Command::new("cs");
         let common = add_common_args(&mut cmd, &repos, Path::new("/c")).unwrap();
@@ -788,7 +843,54 @@ mod tests {
             id: "acme".into(),
             url: "https://acme.example/maven".into(),
             credentials: Some(credentials),
+            allow_insecure_credentials: false,
         })])
+    }
+
+    #[test]
+    fn plain_http_credentials_need_an_opt_in() {
+        let def = |url: &str, allow: bool| {
+            repositories(&[Repository::Full(crate::config::RepositoryDef {
+                id: "nexus".into(),
+                url: url.into(),
+                credentials: Some(Credentials::Bearer("env:NEXUS_TOKEN".into())),
+                allow_insecure_credentials: allow,
+            })])
+        };
+        let err = def("http://nexus.local:8081/repo", false).unwrap_err().to_string();
+        assert!(err.contains("repository `nexus`") && err.contains("plain HTTP"), "{err}");
+        assert!(err.contains("https://") && err.contains("allowInsecureCredentials: true"), "{err}");
+        assert!(def("HTTP://nexus.local:8081/repo", false).is_err());
+        assert!(def("https://nexus.local/repo", false).is_ok());
+        let repos = def("http://nexus.local:8081/repo", true).unwrap();
+        assert_eq!(insecure_credential_origins(&repos), ["http://nexus.local:8081"]);
+    }
+
+    #[test]
+    fn coursier_credentials_reach_cs_only_under_the_http_policy() {
+        let repo = |url: &str, allow: bool| Repo {
+            id: "r".into(),
+            url: url.into(),
+            credentials: None,
+            allow_insecure_credentials: allow,
+        };
+        let coursier = crate::credentials::CoursierCredentials {
+            entries: crate::credentials::parse_properties(
+                "a.host=nexus.local\na.username=alice\na.password=pw\na.https-only=false\n\
+                 b.host=https://secure.example\nb.username=bob\nb.password=pw\nb.realm=R\n",
+            ),
+        };
+        let parse = |repos: &[Repo]| {
+            let text = credential_properties(repos, &coursier, &mut Vec::new());
+            crate::credentials::CoursierCredentials { entries: crate::credentials::parse_properties(&text) }
+        };
+        let closed = parse(&[repo("http://nexus.local:8081/m/", false)]);
+        assert!(closed.find("http://nexus.local:8081/m/x.jar").is_none(), "no opt-in: HTTPS only");
+        assert_eq!(closed.find("https://nexus.local/m/x.jar").unwrap().user, "alice");
+        assert_eq!(closed.for_challenge("https://secure.example/x", Some("R")).unwrap().user, "bob");
+        let open = parse(&[repo("http://nexus.local:8081/m/", true)]);
+        assert_eq!(open.find("http://nexus.local:8081/m/x.jar").unwrap().user, "alice");
+        assert!(open.find("http://nexus.local:8082/m/x.jar").is_none(), "only the opted-in origin");
     }
 
     #[test]
@@ -823,9 +925,16 @@ mod tests {
     #[test]
     fn credential_file_never_reaches_argv() {
         let mut cmd = Command::new("cs");
-        let repos = vec![Repo { id: "r".into(), url: "http://127.0.0.1:8080/m/".into(), credentials: None }];
+        let repos = vec![Repo {
+            id: "r".into(),
+            url: "http://127.0.0.1:8080/m/".into(),
+            credentials: None,
+            allow_insecure_credentials: false,
+        }];
         let common = add_common_args(&mut cmd, &repos, Path::new("/c")).unwrap();
-        assert!(common._credential_file.is_none());
+        let file = common._credential_file.as_ref().unwrap();
+        assert!(!fs::read_to_string(file.path()).unwrap().contains("scpm0"));
+        assert!(cmd.get_envs().any(|(k, v)| k == "COURSIER_CREDENTIALS" && v.is_some_and(|v| v == file.path())));
         assert!(!cmd.get_args().any(|a| a == "--credential-file" || a == "--credentials"));
     }
 

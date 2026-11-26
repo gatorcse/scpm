@@ -187,6 +187,29 @@ fn unmatched_filter_is_a_usage_error() {
 }
 
 #[test]
+fn a_coordinate_has_one_version_across_scopes() {
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", "modules: ['modules/*']\ntoolchain:\n  scala: 3.9.0\n"),
+        (
+            "modules/a/scpm.yaml",
+            "dependencies:\n  org.typelevel::cats-core: 2.13.0\n  g:same: '1.0'\n\
+             testDependencies:\n  org.typelevel::cats-core: 2.12.0\n  g:same: '1.0'\n",
+        ),
+    ]);
+    let out = scpm(dir.path()).arg("ls").assert().code(2).get_output().stderr.clone();
+    let err = String::from_utf8_lossy(&out);
+    assert!(err.contains("modules/a/scpm.yaml"), "{err}");
+    assert!(
+        err.contains("`org.typelevel::cats-core` is declared with different versions")
+            && err.contains("`dependencies.org.typelevel::cats-core`")
+            && err.contains("testDependencies.org.typelevel::cats-core"),
+        "{err}"
+    );
+    assert!(err.contains("use one version in every scope"), "{err}");
+    assert!(!err.contains("g:same"), "the same version in two scopes is fine: {err}");
+}
+
+#[test]
 fn classpath_targets_respect_the_global_filter() {
     // Both checks fail before anything is installed, so no coursier or network is needed.
     scpm(&fixture("basic"))

@@ -541,6 +541,10 @@
     "RepositoryDef": {
       "type": "object",
       "properties": {
+        "allowInsecureCredentials": {
+          "description": "Send credentials to this `http://` repository although plain HTTP exposes them on the\nnetwork. Without it, credentials only ever go over HTTPS. They are then sent to exactly\nthis URL's scheme, host and port.",
+          "type": "boolean"
+        },
         "credentials": {
           "description": "Omit to use coursier's credentials (`COURSIER_CREDENTIALS`, `credentials.properties`).",
           "anyOf": [

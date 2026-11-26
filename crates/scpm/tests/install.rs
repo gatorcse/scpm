@@ -417,14 +417,13 @@ fn configured_credentials_reach_cs_through_a_private_file() {
     }
     let server = Server::maven(hello_repo_files(b"hello jar"), Some(("alice", "s3cret-pass")));
     let ws = tempfile::tempdir().unwrap();
-    java_workspace(
-        ws.path(),
-        &format!(
-            "repositories:\n  - id: local\n    url: '{}'\n    credentials: {{user: 'env:REPO_USER', password: 'env:REPO_PASS'}}\n",
+    let manifest = |opt_in: &str| {
+        format!(
+            "repositories:\n  - id: local\n    url: '{}'\n    credentials: {{user: 'env:REPO_USER', password: 'env:REPO_PASS'}}\n{opt_in}",
             server.url("/maven")
-        ),
-        "dependencies:\n  com.example:hello: '1.0'\n",
-    );
+        )
+    };
+    java_workspace(ws.path(), &manifest(""), "dependencies:\n  com.example:hello: '1.0'\n");
     let (wrapper, log) = logging_cs(ws.path());
     let cache = tempfile::tempdir().unwrap();
     let with_creds = |cache: &Path| {
@@ -432,10 +431,17 @@ fn configured_credentials_reach_cs_through_a_private_file() {
         cmd.env("SCPM_CS", &wrapper).env("REPO_USER", "alice").env("REPO_PASS", "s3cret-pass");
         cmd
     };
-    // The server is on a non-default port: coursier matches credentials by host alone.
+    // Credentials for a plain-HTTP repository are a config error without the opt-in.
+    let err = stderr_of(with_creds(cache.path()).arg("install"));
+    assert!(err.contains("plain HTTP") && err.contains("allowInsecureCredentials"), "{err}");
+    java_workspace(
+        ws.path(),
+        &manifest("    allowInsecureCredentials: true\n"),
+        "dependencies:\n  com.example:hello: '1.0'\n",
+    );
     with_creds(cache.path()).arg("install").assert().success();
     let args = fs::read_to_string(&log).unwrap();
-    assert!(args.contains("--credential-file") && !args.contains("s3cret-pass"), "{args}");
+    assert!(!args.contains("s3cret-pass") && !args.contains("--credential"), "{args}");
 
     // The Rust fetcher uses the same credentials and coursier's `user@host` cache layout.
     let empty = tempfile::tempdir().unwrap();
@@ -465,15 +471,25 @@ fn coursier_credentials_are_used_for_repositories_without_configured_ones() {
     }
     let server = Server::maven(hello_repo_files(b"hello jar"), Some(("alice", "s3cret")));
     let ws = tempfile::tempdir().unwrap();
+    let props = ws.path().join("coursier-credentials.properties");
+    fs::write(&props, "local.host=127.0.0.1\nlocal.username=alice\nlocal.password=s3cret\nlocal.https-only=false\n")
+        .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    // Without the repository's opt-in, not even `cs` gets them over plain HTTP.
     java_workspace(
         ws.path(),
         &format!("repositories:\n  - {{id: local, url: '{}'}}\n", server.url("/maven")),
         "dependencies:\n  com.example:hello: '1.0'\n",
     );
-    let props = ws.path().join("coursier-credentials.properties");
-    fs::write(&props, "local.host=127.0.0.1\nlocal.username=alice\nlocal.password=s3cret\nlocal.https-only=false\n")
-        .unwrap();
-    let cache = tempfile::tempdir().unwrap();
+    let err = stderr_of(scpm(ws.path(), cache.path()).env("COURSIER_CREDENTIALS", &props).arg("install"));
+    assert!(err.contains("401") || err.contains("nauthorized"), "{err}");
+    assert!(server.requests.lock().unwrap().iter().all(|r| r.authorization.is_none()));
+
+    java_workspace(
+        ws.path(),
+        &format!("repositories:\n  - {{id: local, url: '{}', allowInsecureCredentials: true}}\n", server.url("/maven")),
+        "dependencies:\n  com.example:hello: '1.0'\n",
+    );
     scpm(ws.path(), cache.path()).env("COURSIER_CREDENTIALS", &props).arg("install").assert().success();
 
     let empty = tempfile::tempdir().unwrap();

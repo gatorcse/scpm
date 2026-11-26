@@ -113,6 +113,11 @@ pub struct RepositoryDef {
     /// Omit to use coursier's credentials (`COURSIER_CREDENTIALS`, `credentials.properties`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials: Option<Credentials>,
+    /// Send credentials to this `http://` repository although plain HTTP exposes them on the
+    /// network. Without it, credentials only ever go over HTTPS. They are then sent to exactly
+    /// this URL's scheme, host and port.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_insecure_credentials: bool,
 }
 
 /// `env:VAR` (bearer token) or `{user: env:U, password: env:P}` (basic auth).

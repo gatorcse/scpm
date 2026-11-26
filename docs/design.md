@@ -226,6 +226,7 @@ repositories:
   - id: acme
     url: https://acme.jfrog.io/artifactory/maven
     credentials: env:ARTIFACTORY_TOKEN     # bearer token; or { user: env:U, password: env:P } (§5.7)
+    # allowInsecureCredentials: true       # only for an http:// repository that must get credentials (§5.7)
 
 lock:
   resolutionContext: { os: linux, arch: x86_64, jdk: 25 }   # the default (jdk = project JDK major); §5.4
@@ -679,7 +680,11 @@ The trust anchor is the advisory database's "fixed in" data (curated GHSA/OSV), 
 
 ### 5.7 Enterprise repositories (optional fast paths)
 
-**Credentials.** A repository's `credentials` is either `env:VAR` (sent as a bearer token) or `{user: env:U, password: env:P}` (basic auth). Phase 1's Rust fetcher reads those, plus coursier's `COURSIER_CREDENTIALS` / `credentials.properties` for matching hosts. Coursier's credential sources only express basic auth, so when `cs` resolves a stale lock scpm passes a bearer token as a basic-auth password of the user `token` (which Artifactory and GitHub Packages accept) **[verify per repository type in Phase 1]**. Secrets never go on `cs`'s command line (a repository URL with `user@` is rejected): scpm writes them to a private (0600) temporary `--credential-file`, scoped to the repository's scheme, host and port (coursier 2.1.27's `scheme://host:port` form). Coursier's own entries are matched the same way, a realm-scoped one only after a challenge naming its realm. The environment variables are read only when needed: a frozen restore and `classpath` with every artifact cached work without them. `why` and re-locking start `cs`, which passes the credentials it can read and needs them for any POM it has not cached (a Rust restore fetches jars, not POMs); an empty variable is an error.
+**Credentials.** A repository's `credentials` is either `env:VAR` (sent as a bearer token) or `{user: env:U, password: env:P}` (basic auth). Phase 1's Rust fetcher reads those, plus coursier's `COURSIER_CREDENTIALS` / `credentials.properties` for matching hosts. Coursier's credential sources only express basic auth, so when `cs` resolves a stale lock scpm passes a bearer token as a basic-auth password of the user `token` (which Artifactory and GitHub Packages accept) **[verify per repository type in Phase 1]**. Secrets never go on `cs`'s command line (a repository URL with `user@` is rejected): scpm writes them to a private (0600) temporary file that `COURSIER_CREDENTIALS` names for the `cs` process, scoped to the repository's scheme, host and port (coursier 2.1.27's `scheme://host:port` form). Coursier's own entries are read by scpm, matched the same way (a realm-scoped one only after a challenge naming its realm) and passed to `cs` through that file, so both paths apply one policy.
+
+**Plain HTTP.** Credentials only go over HTTPS by default. Configured `credentials` on an `http://` repository are a config error unless the repository sets `allowInsecureCredentials: true`; coursier entries that would go over plain HTTP (`https-only=false`, or an `http://` host) are dropped for every repository that hasn't opted in. With the opt-in, credentials go to exactly that repository's scheme, host and port, never to the rest of the host.
+
+The environment variables are read only when needed: a frozen restore and `classpath` with every artifact cached work without them. `why` and re-locking start `cs`, which passes the credentials it can read and needs them for any POM it has not cached (a Rust restore fetches jars, not POMs); an empty variable is an error.
 
 Correctness always comes from coursier. These only speed up `outdated`, version listing and checksums:
 

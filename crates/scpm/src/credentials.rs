@@ -136,6 +136,44 @@ impl CoursierCredentials {
         let Some(target) = UrlTarget::parse(url) else { return Vec::new() };
         self.entries.iter().filter(|c| c.auto && c.matches(&target)).collect()
     }
+
+    /// The entries restricted to scpm's policy: credentials go over HTTPS, and over plain HTTP
+    /// only to `insecure_origins` (`http://host[:port]` of repositories that set
+    /// `allowInsecureCredentials`), scoped to exactly that origin. An entry that coursier would
+    /// send over plain HTTP to a whole host (`https-only=false`) keeps only its HTTPS use plus
+    /// one copy per opted-in origin it matches.
+    pub fn restricted(&self, insecure_origins: &[String]) -> CoursierCredentials {
+        let targets: Vec<UrlTarget> =
+            insecure_origins.iter().filter_map(|o| UrlTarget::parse(&format!("{o}/"))).collect();
+        let mut entries = Vec::new();
+        for c in &self.entries {
+            if c.scheme.as_deref().is_none_or(|s| s == "https") {
+                entries.push(CoursierCredential { https_only: true, ..c.clone() });
+            }
+            let plain_http = c.scheme.as_deref() == Some("http") || (c.scheme.is_none() && !c.https_only);
+            if plain_http {
+                for t in targets.iter().filter(|t| t.scheme == "http" && c.matches(t)) {
+                    entries.push(CoursierCredential {
+                        scheme: Some("http".into()),
+                        host: t.host.clone(),
+                        port: t.port,
+                        ..c.clone()
+                    });
+                }
+            }
+        }
+        CoursierCredentials { entries }
+    }
+}
+
+impl CoursierCredential {
+    /// The entry's `host` in coursier's `[scheme://]host[:port]` form.
+    pub fn host_spec(&self) -> String {
+        let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
+        let scheme = self.scheme.as_ref().map(|s| format!("{s}://")).unwrap_or_default();
+        let port = self.port.map(|p| format!(":{p}")).unwrap_or_default();
+        format!("{scheme}{host}{port}")
+    }
 }
 
 /// A request URL's scheme (lower-cased), host and effective port.
