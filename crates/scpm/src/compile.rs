@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -116,12 +117,21 @@ fn is_scala_library(key: &str) -> bool {
     key.starts_with("org.scala-lang:scala-library:") || key.starts_with("org.scala-lang:scala3-library_3:")
 }
 
-/// Source files under the variant's source directories, sorted.
-pub fn source_files(root: &Path, dirs: &[PathBuf]) -> Vec<PathBuf> {
+/// Source files under the variant's source directories, sorted. A source directory that
+/// doesn't exist contributes nothing; any other error reading one fails the scan, so an
+/// unreadable directory is never mistaken for an empty one.
+pub fn source_files(root: &Path, dirs: &[PathBuf]) -> Result<Vec<PathBuf>, CompileError> {
     let mut files = Vec::new();
     for dir in dirs {
-        let walker = ignore::WalkBuilder::new(root.join(dir)).standard_filters(false).hidden(true).build();
-        for entry in walker.flatten() {
+        let dir = root.join(dir);
+        match fs::metadata(&dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(CompileError::Setup(format!("{}: {e}", dir.display()))),
+        }
+        let walker = ignore::WalkBuilder::new(&dir).standard_filters(false).hidden(true).build();
+        for entry in walker {
+            let entry = entry.map_err(|e| CompileError::Setup(format!("{}: {e}", dir.display())))?;
             let p = entry.path();
             if p.is_file() && p.extension().is_some_and(|e| e == "scala" || e == "java") {
                 files.push(p.to_path_buf());
@@ -130,7 +140,19 @@ pub fn source_files(root: &Path, dirs: &[PathBuf]) -> Vec<PathBuf> {
     }
     files.sort();
     files.dedup();
-    files
+    Ok(files)
+}
+
+/// Removes stale build output (`dir`: a directory tree, else a file). Output that is already
+/// gone is fine; any other failure is an error, so a later run can retry the cleanup.
+fn remove_stale(path: &Path, dir: bool) -> Result<(), CompileError> {
+    let result = if dir { fs::remove_dir_all(path) } else { fs::remove_file(path) };
+    match result {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            Err(CompileError::Setup(format!("removing stale output {}: {e}", path.display())))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A schedulable unit: a variant's main or test sources.
@@ -183,7 +205,7 @@ fn plan(tc: &Toolchain, node: &Node, upstream: &[String], tools: &str) -> Result
     };
     let out_dir = ws.root.join(".scpm/out").join(&v.id);
     let classes = out_dir.join(classes_name);
-    let sources = source_files(&ws.root, src_dirs);
+    let sources = source_files(&ws.root, src_dirs)?;
     let mut classpath: Vec<(Option<String>, PathBuf)> = tc.classpath(&v.id, kind)?;
     if node.test {
         classpath.insert(0, (None, classes_dir(&ws.root, &v.id)));
@@ -375,13 +397,15 @@ pub fn compile(
     if with_tests {
         for t in targets {
             let Some(v) = tc.ws.variant(t) else { continue };
-            if source_files(&tc.ws.root, &v.test_sources).is_empty() {
+            if source_files(&tc.ws.root, &v.test_sources)?.is_empty() {
                 // No test sources (any more): drop output left by deleted tests rather than
                 // scheduling a test node, which would also build test-only upstream modules.
+                // The fingerprint goes first so a partial cleanup is never mistaken for a
+                // finished build.
                 let out_dir = tc.ws.root.join(".scpm/out").join(&v.id);
-                let _ = fs::remove_dir_all(out_dir.join("test-classes"));
-                let _ = fs::remove_file(out_dir.join("test-analysis.zip"));
-                let _ = fs::remove_file(out_dir.join("test-fingerprint"));
+                remove_stale(&out_dir.join("test-fingerprint"), false)?;
+                remove_stale(&out_dir.join("test-analysis.zip"), false)?;
+                remove_stale(&out_dir.join("test-classes"), true)?;
             } else {
                 frontier.push(Node { variant: t.clone(), test: true });
             }
@@ -483,8 +507,9 @@ fn compile_plan(plan: &Plan, worker: &WorkerHandle) -> Result<Option<String>, Co
     }
     if plan.sources_empty {
         // Nothing to compile: make sure no output from deleted sources lingers.
-        let _ = fs::remove_dir_all(&plan.classes);
-        let _ = fs::remove_file(&plan.analysis);
+        remove_stale(&plan.fingerprint_file, false)?;
+        remove_stale(&plan.analysis, false)?;
+        remove_stale(&plan.classes, true)?;
         fs::create_dir_all(&plan.classes).map_err(|e| CompileError::Setup(e.to_string()))?;
         let _ = fs::write(&plan.fingerprint_file, &plan.fingerprint);
         end(TaskStatus::Ok, 0, Some("no sources".into()));
@@ -515,4 +540,56 @@ fn compile_plan(plan: &Plan, worker: &WorkerHandle) -> Result<Option<String>, Co
     }
     end(status, elapsed, result["message"].as_str().map(str::to_string));
     Ok((status == TaskStatus::Ok).then(|| plan.fingerprint.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_files_skips_absent_roots_and_reports_unreadable_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src/a")).unwrap();
+        fs::write(root.join("src/a/A.scala"), "object A").unwrap();
+        fs::write(root.join("src/a/notes.txt"), "").unwrap();
+        fs::create_dir_all(root.join("empty")).unwrap();
+
+        let dirs = [PathBuf::from("src"), PathBuf::from("missing"), PathBuf::from("empty")];
+        assert_eq!(source_files(root, &dirs).unwrap(), vec![root.join("src/a/A.scala")]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = root.join("src/a");
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            // Root (and some sandboxes) can read the directory anyway; only check when it's
+            // actually unreadable.
+            let unreadable = fs::read_dir(&locked).is_err();
+            let result = source_files(root, &dirs);
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            if unreadable {
+                assert!(result.is_err(), "unreadable source directory scanned as {result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn remove_stale_ignores_only_missing_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("classes");
+        fs::create_dir_all(dir.join("p")).unwrap();
+        fs::write(dir.join("p/A.class"), "").unwrap();
+        let file = tmp.path().join("fingerprint");
+        fs::write(&file, "x").unwrap();
+
+        remove_stale(&dir, true).unwrap();
+        remove_stale(&file, false).unwrap();
+        assert!(!dir.exists() && !file.exists());
+        remove_stale(&dir, true).unwrap();
+        remove_stale(&file, false).unwrap();
+        // A directory where a file is expected is a real failure, not "already gone".
+        fs::create_dir_all(&file).unwrap();
+        assert!(remove_stale(&file, false).is_err());
+    }
 }
