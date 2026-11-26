@@ -96,6 +96,9 @@ pub struct Machine {
     pub exists: bool,
     pub credentials: Vec<UserCredential>,
     pub mirrors: Vec<UserMirror>,
+    /// The proxy both download paths use. A problem with one from the environment is only an
+    /// error once something must be downloaded.
+    pub proxy: ProxyChoice,
     /// Problems worth a warning (e.g. a user config with secrets that others can read).
     pub warnings: Vec<String>,
 }
@@ -103,7 +106,20 @@ pub struct Machine {
 impl Machine {
     /// No user config.
     pub fn none() -> Machine {
-        Machine { path: None, exists: false, credentials: Vec::new(), mirrors: Vec::new(), warnings: Vec::new() }
+        Machine {
+            path: None,
+            exists: false,
+            credentials: Vec::new(),
+            mirrors: Vec::new(),
+            proxy: Ok(None),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Takes the proxy from `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`.
+    fn with_env_proxy(mut self) -> Machine {
+        self.proxy = proxy_from_env(&|var| std::env::var(var).ok());
+        self
     }
 
     /// Reads the user config at `path`; a missing file means no settings.
@@ -111,7 +127,7 @@ impl Machine {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Machine { path: Some(path.to_path_buf()), ..Machine::none() });
+                return Ok(Machine { path: Some(path.to_path_buf()), ..Machine::none() }.with_env_proxy());
             }
             Err(e) => return Err(Diagnostic::new(format!("cannot read the user config: {e}")).in_file(path).into()),
         };
@@ -182,11 +198,24 @@ impl Machine {
             let url = if m.url.ends_with('/') { m.url.clone() } else { format!("{}/", m.url) };
             mirrors.push(UserMirror { url, mirror_of: m.mirror_of.iter().map(|p| p.trim().to_string()).collect() });
         }
+        let proxy = match &config.proxy {
+            Some(entry) => match proxy_from_config(entry) {
+                Ok(p) => Ok(p),
+                Err(errors) => {
+                    for (key, message) in errors {
+                        err(format!("proxy.{key}"), message);
+                    }
+                    Ok(None)
+                }
+            },
+            None => proxy_from_env(&|var| std::env::var(var).ok()),
+        };
         diags.into_result(Machine {
             path: Some(file.to_path_buf()),
             exists: true,
             credentials,
             mirrors,
+            proxy,
             warnings: Vec::new(),
         })
     }
@@ -274,6 +303,180 @@ impl Machine {
     }
 }
 
+/// The resolved proxy, or why it can't be used.
+pub type ProxyChoice = Result<Option<ProxySettings>, String>;
+
+/// A proxy server, reached over plain HTTP (`http://host:port`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProxyServer {
+    pub host: String,
+    pub port: u16,
+}
+
+impl ProxyServer {
+    pub fn url(&self) -> String {
+        if self.host.contains(':') {
+            format!("http://[{}]:{}", self.host, self.port)
+        } else {
+            format!("http://{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// The proxy settings both download paths get (design §5.9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxySettings {
+    /// For `https://` URLs.
+    pub https: Option<ProxyServer>,
+    /// For `http://` URLs.
+    pub http: Option<ProxyServer>,
+    /// Hosts reached directly, with their subdomains; `*` is every host. Loopback is always here.
+    pub no_proxy: Vec<String>,
+    /// `noProxy` entries that `cs` can't apply (address ranges), dropped from both paths.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignored_no_proxy: Vec<String>,
+    /// `user config`, or the environment variables it was read from.
+    pub source: String,
+}
+
+/// Loopback never goes through a proxy (Java's default `http.nonProxyHosts`, made explicit so
+/// both paths agree).
+const LOOPBACK: &[&str] = &["localhost", "127.0.0.1", "::1"];
+
+impl ProxySettings {
+    fn new(https: Option<ProxyServer>, http: Option<ProxyServer>, entries: &[String], source: String) -> Self {
+        let mut no_proxy: Vec<String> = Vec::new();
+        let mut ignored_no_proxy = Vec::new();
+        for e in entries.iter().map(|e| e.trim().to_ascii_lowercase()).filter(|e| !e.is_empty()) {
+            if e.contains('/') {
+                ignored_no_proxy.push(e);
+            } else if !no_proxy.contains(&e) {
+                no_proxy.push(e);
+            }
+        }
+        for l in LOOPBACK {
+            if !no_proxy.iter().any(|e| e == l) {
+                no_proxy.push(l.to_string());
+            }
+        }
+        ProxySettings { https, http, no_proxy, ignored_no_proxy, source }
+    }
+
+    /// Whether `host` is reached directly.
+    pub fn bypasses(&self, host: &str) -> bool {
+        let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+        self.no_proxy.iter().any(|e| {
+            let domain = e.trim_start_matches('.');
+            e == "*" || host == domain || host.ends_with(&format!(".{domain}"))
+        })
+    }
+
+    /// The proxy a request to `url` goes through, if any.
+    pub fn for_url(&self, url: &str) -> Option<&ProxyServer> {
+        let parts = UrlParts::parse(url)?;
+        let server = match parts.scheme.as_str() {
+            "https" => self.https.as_ref(),
+            "http" => self.http.as_ref(),
+            _ => None,
+        }?;
+        (!self.bypasses(&parts.host)).then_some(server)
+    }
+
+    /// The settings as `cs` JVM options. `http.nonProxyHosts` covers both schemes; a
+    /// `noProxy` domain becomes `domain|*.domain`.
+    pub fn jvm_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        for (scheme, server) in [("https", &self.https), ("http", &self.http)] {
+            if let Some(s) = server {
+                args.push(format!("-J-D{scheme}.proxyHost={}", s.host));
+                args.push(format!("-J-D{scheme}.proxyPort={}", s.port));
+            }
+        }
+        if !args.is_empty() {
+            let mut hosts: Vec<String> = Vec::new();
+            for e in &self.no_proxy {
+                let domain = e.trim_start_matches('.');
+                if e == "*" || domain.parse::<std::net::IpAddr>().is_ok() {
+                    hosts.push(domain.to_string());
+                    if domain.contains(':') {
+                        hosts.push(format!("[{domain}]"));
+                    }
+                } else {
+                    hosts.push(domain.to_string());
+                    hosts.push(format!("*.{domain}"));
+                }
+            }
+            args.push(format!("-J-Dhttp.nonProxyHosts={}", hosts.join("|")));
+        }
+        args
+    }
+}
+
+/// `http://host[:port]` (or `host[:port]`); the port defaults to 80. Proxy authentication is not
+/// supported (design §5.9), so a URL with a user is an error, which never repeats the URL.
+fn parse_proxy_url(value: &str) -> Result<ProxyServer, String> {
+    let value = value.trim();
+    let (scheme, rest) = value.split_once("://").unwrap_or(("http", value));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return Err("proxy authentication is not supported yet; remove the user and password from the proxy URL".into());
+    }
+    if !scheme.eq_ignore_ascii_case("http") {
+        return Err(format!(
+            "`{scheme}://` proxies are not supported; both download paths reach the proxy over plain HTTP (`http://host:port`)"
+        ));
+    }
+    let parts = UrlParts::parse(&format!("http://{authority}"))
+        .filter(|p| !p.host.is_empty())
+        .ok_or_else(|| format!("`{value}` is not a proxy URL (`http://host:port`)"))?;
+    Ok(ProxyServer { host: parts.host, port: parts.port.unwrap_or(80) })
+}
+
+/// The user config's `proxy`: errors are `(key, message)`. No server means no proxy, whatever
+/// the environment says.
+fn proxy_from_config(entry: &ProxyEntry) -> Result<Option<ProxySettings>, Vec<(String, String)>> {
+    let mut errors = Vec::new();
+    let mut server = |key: &str, value: &Option<String>| match value.as_deref().map(parse_proxy_url) {
+        Some(Ok(s)) => Some(s),
+        Some(Err(m)) => {
+            errors.push((key.to_string(), m));
+            None
+        }
+        None => None,
+    };
+    let (https, http) = (server("https", &entry.https), server("http", &entry.http));
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok((https.is_some() || http.is_some())
+        .then(|| ProxySettings::new(https, http, &entry.no_proxy, "user config".into())))
+}
+
+/// `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` (upper case first, then lower case).
+fn proxy_from_env(env: &dyn Fn(&str) -> Option<String>) -> ProxyChoice {
+    let mut used = Vec::new();
+    let mut read = |name: &str| {
+        [name.to_string(), name.to_ascii_lowercase()].into_iter().find_map(|var| {
+            let value = env(&var).filter(|v| !v.trim().is_empty())?;
+            used.push(var);
+            Some(value)
+        })
+    };
+    let (https, http, no_proxy) = (read("HTTPS_PROXY"), read("HTTP_PROXY"), read("NO_PROXY"));
+    if https.is_none() && http.is_none() {
+        return Ok(None);
+    }
+    let source = format!("environment ({})", used.join(", "));
+    let parse = |value: Option<String>, var: &str| -> Result<Option<ProxyServer>, String> {
+        value.map(|v| parse_proxy_url(&v).map_err(|m| format!("{var}: {m}"))).transpose()
+    };
+    let https = parse(https, "HTTPS_PROXY")?;
+    let http = parse(http, "HTTP_PROXY")?;
+    let entries: Vec<String> = no_proxy.unwrap_or_default().split(',').map(str::to_string).collect();
+    Ok(Some(ProxySettings::new(https, http, &entries, source)))
+}
+
 /// The user config path: `SCPM_CONFIG`, else `<config dir>/scpm/config.yaml`.
 pub fn user_config_path() -> Option<PathBuf> {
     match std::env::var_os(USER_CONFIG_ENV).filter(|v| !v.is_empty()) {
@@ -288,7 +491,7 @@ pub fn current() -> Result<&'static Machine, Diagnostics> {
     MACHINE
         .get_or_init(|| match user_config_path() {
             Some(path) => Machine::from_file(&path),
-            None => Ok(Machine::none()),
+            None => Ok(Machine::none().with_env_proxy()),
         })
         .as_ref()
         .map_err(Clone::clone)
@@ -551,6 +754,78 @@ mod tests {
         // Workspace credentials never go to a mirror (another host).
         assert_eq!(repos[4].mirror.as_ref().unwrap().url, "https://all.example/m/");
         assert_eq!(repos[4].credentials, None);
+    }
+
+    fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let vars: Vec<(String, String)> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn proxies_come_from_the_environment() {
+        assert_eq!(proxy_from_env(&env(&[])), Ok(None));
+        assert_eq!(proxy_from_env(&env(&[("NO_PROXY", "x"), ("HTTPS_PROXY", " ")])), Ok(None), "blank is unset");
+        let p = proxy_from_env(&env(&[
+            ("HTTPS_PROXY", "http://proxy.example:3128"),
+            ("https_proxy", "http://ignored.example:1"),
+            ("http_proxy", "proxy.example"),
+            ("no_proxy", " .corp.example, 10.0.0.0/8,internal ,"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.https, Some(ProxyServer { host: "proxy.example".into(), port: 3128 }));
+        assert_eq!(p.http, Some(ProxyServer { host: "proxy.example".into(), port: 80 }));
+        assert_eq!(p.no_proxy, [".corp.example", "internal", "localhost", "127.0.0.1", "::1"]);
+        assert_eq!(p.ignored_no_proxy, ["10.0.0.0/8"]);
+        assert_eq!(p.source, "environment (HTTPS_PROXY, http_proxy, no_proxy)");
+
+        let err = proxy_from_env(&env(&[("HTTPS_PROXY", "http://alice:s3cret@proxy.example:3128")])).unwrap_err();
+        assert!(err.contains("HTTPS_PROXY") && err.contains("authentication is not supported"), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
+        let err = proxy_from_env(&env(&[("HTTP_PROXY", "socks5://proxy.example:1080")])).unwrap_err();
+        assert!(err.contains("`socks5://` proxies are not supported"), "{err}");
+    }
+
+    #[test]
+    fn the_user_config_proxy_replaces_the_environment() {
+        let m = machine("proxy:\n  https: 'http://proxy.example:3128'\n  noProxy: [.example.com]\n").unwrap();
+        let p = m.proxy.unwrap().unwrap();
+        assert_eq!(p.source, "user config");
+        assert_eq!(p.http, None);
+        // Set but without a server: no proxy at all, whatever the environment says.
+        assert_eq!(machine("proxy: {noProxy: [x]}\n").unwrap().proxy, Ok(None));
+        // In the user config, a bad proxy is a configuration error.
+        let err = machine("proxy:\n  https: 'http://u:p@proxy.example:3128'\n").unwrap_err().to_string();
+        assert!(err.contains("proxy.https") && err.contains("authentication"), "{err}");
+    }
+
+    #[test]
+    fn no_proxy_matching_and_jvm_options_agree() {
+        let p = ProxySettings::new(
+            Some(ProxyServer { host: "proxy.example".into(), port: 3128 }),
+            None,
+            &[".corp.example".into(), "internal".into(), "10.1.2.3".into()],
+            "test".into(),
+        );
+        assert_eq!(
+            p.for_url("https://repo1.maven.org/maven2/").map(ProxyServer::url).as_deref(),
+            Some("http://proxy.example:3128")
+        );
+        assert!(p.for_url("http://repo1.maven.org/maven2/").is_none(), "no http proxy");
+        for direct in
+            ["https://corp.example/m/", "https://a.corp.example/m/", "https://internal/m/", "https://127.0.0.1:8443/"]
+        {
+            assert!(p.for_url(direct).is_none(), "{direct}");
+        }
+        assert!(p.for_url("https://notcorp.example/m/").is_some());
+        assert_eq!(
+            p.jvm_args(),
+            [
+                "-J-Dhttps.proxyHost=proxy.example",
+                "-J-Dhttps.proxyPort=3128",
+                "-J-Dhttp.nonProxyHosts=corp.example|*.corp.example|internal|*.internal|10.1.2.3|localhost|*.localhost|127.0.0.1|::1|[::1]",
+            ]
+        );
     }
 
     #[test]

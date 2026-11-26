@@ -64,7 +64,7 @@ pub fn why(
     pattern: &str,
     selected: &[String],
 ) -> Result<WhyReport, InstallError> {
-    let (repos, _) = crate::install::repositories(ws)?;
+    let (repos, machine) = crate::install::repositories(ws)?;
     let cache = coursier::cache_dir();
     let mut report = WhyReport::default();
     for id in selected {
@@ -107,7 +107,7 @@ pub fn why(
         owners.extend(upstream_variants(graph, id, ClasspathKind::TestRuntime));
         let mut unexplained: Vec<String> = Vec::new();
         for module in &modules {
-            let chains = coursier::what_depends_on(&req, module, &repos, &cache)?;
+            let chains = coursier::what_depends_on(&req, module, &repos, &machine.proxy, &cache)?;
             if chains.is_empty() {
                 unexplained.extend(found.iter().filter(|k| module_of(k) == *module).map(|k| k.to_string()));
             }

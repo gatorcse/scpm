@@ -299,6 +299,7 @@ fn boot_inputs_hash(repos: &[Repo], ctx: &ResolutionContextLock) -> String {
 /// Picks exact versions for ranges, sharing catalog selections workspace-wide (design §5.4).
 struct Selector<'a> {
     repos: &'a [Repo],
+    proxy: &'a crate::machine::ProxyChoice,
     cache: &'a Path,
     previous: &'a BTreeMap<String, CatalogSelection>,
     catalogs: Mutex<BTreeMap<String, CatalogSelection>>,
@@ -332,7 +333,7 @@ impl Selector<'_> {
             match cached {
                 Some(v) => v,
                 None => {
-                    let v = coursier::list_versions(&dep.coord.org, &artifact, self.repos, self.cache)?;
+                    let v = coursier::list_versions(&dep.coord.org, &artifact, self.repos, self.proxy, self.cache)?;
                     self.listed.lock().expect("listed").insert(list_key.clone(), v.clone());
                     v
                 }
@@ -540,6 +541,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     let scratch = tempfile_dir()?;
     let selector = Selector {
         repos: &repos,
+        proxy: &machine.proxy,
         cache: &cache,
         previous: &previous.catalogs,
         catalogs: Mutex::new(BTreeMap::new()),
@@ -623,7 +625,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
 
     let all: Vec<&ResolveRequest> =
         requests.values().chain(plugin_requests.values()).chain(boot_requests.values()).collect();
-    let results = resolve_concurrently(&all, &labels, &repos, &cache, scratch.path())?;
+    let results = resolve_concurrently(&all, &labels, &repos, &machine.proxy, &cache, scratch.path())?;
 
     record_artifacts(&mut lock, all.iter().flat_map(|req| &results[*req]), &repos)?;
     for (name, req) in &boot_requests {
@@ -687,7 +689,8 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
 
     let fetch_started = Instant::now();
     let items = fetch_items(&lock, &repos, &CoursierCredentials::load(), &cache)?;
-    let fetch = fetch::fetch_all(items, FetchOptions { verify: opts.verify }).map_err(InstallError::Fetch)?;
+    let fetch = fetch::fetch_all(items, FetchOptions { verify: opts.verify, proxy: machine.proxy.clone() })
+        .map_err(InstallError::Fetch)?;
     if fetch.repaired > 0 {
         warnings.push(format!(
             "{} cached artifact{} did not match the lock and {} downloaded again",
@@ -738,6 +741,7 @@ fn resolve_concurrently<'a>(
     requests: &[&'a ResolveRequest],
     labels: &[(ResolveRequest, String)],
     repos: &[Repo],
+    proxy: &crate::machine::ProxyChoice,
     cache: &Path,
     scratch: &Path,
 ) -> Result<HashMap<&'a ResolveRequest, Vec<ResolvedArtifact>>, InstallError> {
@@ -756,7 +760,7 @@ fn resolve_concurrently<'a>(
             s.spawn(|| {
                 loop {
                     let Some(req) = queue.lock().expect("queue").pop() else { break };
-                    let r = coursier::resolve(req, repos, cache, scratch);
+                    let r = coursier::resolve(req, repos, proxy, cache, scratch);
                     results.lock().expect("results").insert(req, r);
                 }
             });

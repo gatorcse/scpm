@@ -21,6 +21,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 
 use crate::coursier::{Auth, user_agent};
+use crate::machine::{ProxyChoice, ProxySettings};
 
 /// One file to make present in the cache.
 #[derive(Debug, Clone)]
@@ -43,11 +44,20 @@ pub struct FetchItem {
     pub verify_cached: bool,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FetchOptions {
     /// Re-hash files already in the cache against the lock (`scpm install --verify`) and
     /// re-download those that don't match.
     pub verify: bool,
+    /// The proxy (design §5.9); reqwest's own environment lookup is off. An error is only
+    /// reported if something must be downloaded.
+    pub proxy: ProxyChoice,
+}
+
+impl Default for FetchOptions {
+    fn default() -> Self {
+        FetchOptions { verify: false, proxy: Ok(None) }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -78,6 +88,8 @@ pub enum FetchError {
     LockTimeout { key: String, path: PathBuf },
     #[error("{key}: {message}")]
     Credentials { key: String, message: String },
+    #[error("{0}")]
+    Proxy(String),
 }
 
 /// Every failed download, plus how many downloads were attempted per host.
@@ -190,8 +202,23 @@ pub fn fetch_all(items: Vec<FetchItem>, opts: FetchOptions) -> Result<FetchRepor
             }
         }
     }
+    let proxy = match &opts.proxy {
+        Ok(proxy) => proxy.as_ref(),
+        Err(message) if !downloads.is_empty() => {
+            errors.push(FetchError::Proxy(message.clone()));
+            return Err(FetchFailure { errors, attempted: BTreeMap::new() });
+        }
+        Err(_) => None,
+    };
+    let client = match client(proxy) {
+        Ok(client) => client,
+        Err(e) => {
+            errors.push(FetchError::Proxy(format!("cannot use the proxy: {}", error_chain(&e))));
+            return Err(FetchFailure { errors, attempted: BTreeMap::new() });
+        }
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-    let results = runtime.block_on(download_all(downloads, opts.verify));
+    let results = runtime.block_on(download_all(&client, downloads, opts.verify));
     for (r, repair) in results {
         match r {
             Ok(Fetched { downloaded, rehashed }) => {
@@ -228,13 +255,30 @@ fn hash_files(paths: Vec<&Path>) -> Vec<io::Result<String>> {
     })
 }
 
-async fn download_all(items: Vec<(FetchItem, bool)>, verify: bool) -> Vec<(Result<Fetched, FetchError>, bool)> {
-    let client = reqwest::Client::builder()
+/// The HTTP client: exactly the resolved proxy, never reqwest's own environment lookup.
+fn client(proxy: Option<&ProxySettings>) -> reqwest::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
         .user_agent(user_agent())
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(Duration::from_secs(60))
-        .build()
-        .expect("http client");
+        .no_proxy();
+    if let Some(p) = proxy {
+        let no_proxy = p.no_proxy.join(",");
+        if let Some(s) = &p.https {
+            builder = builder.proxy(reqwest::Proxy::https(s.url())?.no_proxy(reqwest::NoProxy::from_string(&no_proxy)));
+        }
+        if let Some(s) = &p.http {
+            builder = builder.proxy(reqwest::Proxy::http(s.url())?.no_proxy(reqwest::NoProxy::from_string(&no_proxy)));
+        }
+    }
+    builder.build()
+}
+
+async fn download_all(
+    client: &reqwest::Client,
+    items: Vec<(FetchItem, bool)>,
+    verify: bool,
+) -> Vec<(Result<Fetched, FetchError>, bool)> {
     let permits = Arc::new(Semaphore::new(CONCURRENCY));
     let tasks: Vec<_> = items
         .into_iter()

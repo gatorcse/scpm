@@ -610,6 +610,64 @@ fn mirrors_serve_both_paths_and_never_reach_the_lock() {
 }
 
 #[test]
+fn both_paths_use_exactly_the_resolved_proxy() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    // A forward proxy for a repository whose host doesn't resolve: requests arrive in absolute form.
+    let repo = "http://repo.scpm-test.invalid/maven";
+    let files: std::collections::HashMap<String, Vec<u8>> = hello_repo_files(b"hello jar")
+        .into_iter()
+        .map(|(p, b)| (format!("http://repo.scpm-test.invalid{p}"), b))
+        .collect();
+    let proxy = Server::maven(files, None);
+    let ws = tempfile::tempdir().unwrap();
+    java_workspace(
+        ws.path(),
+        &format!("repositories:\n  - {{id: remote, url: '{repo}'}}\n"),
+        "dependencies:\n  com.example:hello: '1.0'\n",
+    );
+    let config = ws.path().join("user-config.yaml");
+    fs::write(&config, format!("proxy:\n  http: '127.0.0.1:{}'\n", proxy.port)).unwrap();
+    let dead = "http://127.0.0.1:1";
+    let jar = |cache: &Path| cache.join("http/repo.scpm-test.invalid/maven/com/example/hello/1.0/hello-1.0.jar");
+
+    // The user config's proxy wins over the environment's, for `cs` and for the fetcher.
+    let cache = tempfile::tempdir().unwrap();
+    scpm(ws.path(), cache.path()).env("SCPM_CONFIG", &config).env("HTTP_PROXY", dead).arg("install").assert().success();
+    let empty = tempfile::tempdir().unwrap();
+    scpm(ws.path(), empty.path())
+        .env("SCPM_CONFIG", &config)
+        .env("http_proxy", dead)
+        .args(["install", "--frozen"])
+        .assert()
+        .success();
+    assert_eq!(fs::read(jar(empty.path())).unwrap(), b"hello jar");
+    assert!(proxy.count(&format!("{repo}/com/example/hello/1.0/hello-1.0.jar")) >= 2);
+
+    // Without a user config proxy, `HTTP_PROXY` applies to both paths.
+    fs::remove_file(ws.path().join("scpm-lock.yaml")).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let proxy_url = format!("http://127.0.0.1:{}", proxy.port);
+    scpm(ws.path(), cache.path()).env("HTTP_PROXY", &proxy_url).arg("install").assert().success();
+    let empty = tempfile::tempdir().unwrap();
+    scpm(ws.path(), empty.path()).env("HTTP_PROXY", &proxy_url).args(["install", "--frozen"]).assert().success();
+    assert_eq!(fs::read(jar(empty.path())).unwrap(), b"hello jar");
+
+    // Proxy authentication is not supported: a clear error that never repeats the password,
+    // and only when something must be downloaded.
+    let with_user = format!("http://alice:s3cret@127.0.0.1:{}", proxy.port);
+    let err = stderr_of(
+        scpm(ws.path(), tempfile::tempdir().unwrap().path())
+            .env("HTTP_PROXY", &with_user)
+            .args(["install", "--frozen"]),
+    );
+    assert!(err.contains("HTTP_PROXY") && err.contains("proxy authentication is not supported"), "{err}");
+    assert!(!err.contains("s3cret"), "{err}");
+    scpm(ws.path(), empty.path()).env("HTTP_PROXY", &with_user).args(["install", "--frozen"]).assert().success();
+}
+
+#[test]
 fn concurrent_installs_all_succeed() {
     if !cs_available() {
         return;

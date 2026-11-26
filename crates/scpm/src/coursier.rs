@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use crate::config::{Credentials, Repository};
 use crate::credentials::CoursierCredentials;
+use crate::machine::ProxyChoice;
 
 /// Maven Central, as coursier names it.
 pub const CENTRAL_URL: &str = "https://repo1.maven.org/maven2/";
@@ -516,6 +517,7 @@ fn report_parts(coord: &str) -> Option<(&str, &str, &str)> {
 pub fn resolve(
     req: &ResolveRequest,
     repos: &[Repo],
+    proxy: &ProxyChoice,
     cache: &Path,
     scratch: &Path,
 ) -> Result<Vec<ResolvedArtifact>, CoursierError> {
@@ -523,7 +525,7 @@ pub fn resolve(
     let mut cmd = Command::new(cs_binary());
     cmd.arg("fetch").arg("--quiet").arg("--classpath").arg("--json-output-file").arg(&report_path);
     cmd.arg("--artifact-type").arg(artifact_types(req).join(","));
-    let common = add_common_args(&mut cmd, repos, cache)?;
+    let common = add_common_args(&mut cmd, repos, proxy, cache)?;
     add_request_args(&mut cmd, req);
     let out = cmd.output().map_err(|source| CoursierError::Spawn { bin: cs_binary(), source })?;
     if !out.status.success() {
@@ -580,11 +582,12 @@ pub fn what_depends_on(
     req: &ResolveRequest,
     module: &str,
     repos: &[Repo],
+    proxy: &ProxyChoice,
     cache: &Path,
 ) -> Result<Vec<Vec<String>>, CoursierError> {
     let mut cmd = Command::new(cs_binary());
     cmd.arg("resolve").arg("--quiet").arg("--what-depends-on").arg(module);
-    let common = add_common_args(&mut cmd, repos, cache)?;
+    let common = add_common_args(&mut cmd, repos, proxy, cache)?;
     add_request_args(&mut cmd, req);
     let out = cmd.output().map_err(|source| CoursierError::Spawn { bin: cs_binary(), source })?;
     if !out.status.success() {
@@ -650,10 +653,16 @@ fn strip_ansi(line: &str) -> String {
 }
 
 /// Lists the available versions of `org:name` (ascending, as coursier prints them).
-pub fn list_versions(org: &str, name: &str, repos: &[Repo], cache: &Path) -> Result<Vec<String>, CoursierError> {
+pub fn list_versions(
+    org: &str,
+    name: &str,
+    repos: &[Repo],
+    proxy: &ProxyChoice,
+    cache: &Path,
+) -> Result<Vec<String>, CoursierError> {
     let mut cmd = Command::new(cs_binary());
     cmd.arg("complete-dep").arg("--quiet");
-    let common = add_common_args(&mut cmd, repos, cache)?;
+    let common = add_common_args(&mut cmd, repos, proxy, cache)?;
     cmd.arg(format!("{org}:{name}:"));
     let out = cmd.output().map_err(|source| CoursierError::Spawn { bin: cs_binary(), source })?;
     if !out.status.success() {
@@ -716,8 +725,18 @@ const UNSEALED_ENV: &[&str] = &["COURSIER_EXTRA_MIRRORS", "COURSIER_REPOSITORIES
 /// set) and the mirror files (a `COURSIER_MIRRORS` naming a missing file also disables
 /// `mirror.properties` in coursier's config directory; `COURSIER_EXTRA_MIRRORS` is read
 /// regardless, so it is removed). `COURSIER_MAVEN_SETTINGS=false` turns off Maven `settings.xml`.
-fn add_common_args(cmd: &mut Command, repos: &[Repo], cache: &Path) -> Result<CommonArgs, CoursierError> {
+/// The resolved proxy goes in as JVM properties (`cs` ignores `HTTPS_PROXY`).
+fn add_common_args(
+    cmd: &mut Command,
+    repos: &[Repo],
+    proxy: &ProxyChoice,
+    cache: &Path,
+) -> Result<CommonArgs, CoursierError> {
+    let proxy = proxy.as_ref().map_err(|e| CoursierError::Config(e.clone()))?;
     cmd.arg("--cache").arg(cache).arg("--no-default").arg("--user-agent").arg(user_agent());
+    if let Some(p) = proxy {
+        cmd.args(p.jvm_args());
+    }
     // Mirrors already applied, so `cs` asks the mirror directly; once per URL.
     let mut urls: Vec<&str> = Vec::new();
     for repo in repos {
@@ -1105,7 +1124,7 @@ mod tests {
             allow_insecure_credentials: false,
             ..Default::default()
         }];
-        let common = add_common_args(&mut cmd, &repos, Path::new("/c")).unwrap();
+        let common = add_common_args(&mut cmd, &repos, &Ok(None), Path::new("/c")).unwrap();
         let file = common._credential_file.as_ref().unwrap();
         assert!(!fs::read_to_string(file.path()).unwrap().contains("scpm0"));
         let env = |name: &str| cmd.get_envs().find(|(k, _)| *k == name).and_then(|(_, v)| v);
@@ -1131,7 +1150,7 @@ mod tests {
             allow_insecure_credentials: false,
             ..Default::default()
         }];
-        let common = add_common_args(&mut cmd, &repos, Path::new("/c")).unwrap();
+        let common = add_common_args(&mut cmd, &repos, &Ok(None), Path::new("/c")).unwrap();
         let sealed = common._sealed_dir.as_ref().unwrap().path();
         let envs: BTreeMap<String, Option<String>> = cmd
             .get_envs()
@@ -1148,6 +1167,34 @@ mod tests {
         let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(args.iter().any(|a| a == "--no-default"));
         assert_eq!(args.iter().filter(|a| *a == "--repository").count(), 1);
+        assert!(!args.iter().any(|a| a.starts_with("-J")), "no proxy, no JVM proxy options");
+    }
+
+    #[test]
+    fn cs_gets_the_resolved_proxy_or_its_error() {
+        let repos = vec![Repo { id: "r".into(), url: "https://repo.example/m/".into(), ..Default::default() }];
+        let proxy = crate::machine::ProxySettings {
+            https: Some(crate::machine::ProxyServer { host: "proxy.example".into(), port: 3128 }),
+            http: None,
+            no_proxy: vec!["localhost".into()],
+            ignored_no_proxy: Vec::new(),
+            source: "test".into(),
+        };
+        let mut cmd = Command::new("cs");
+        add_common_args(&mut cmd, &repos, &Ok(Some(proxy)), Path::new("/c")).unwrap();
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        for expected in [
+            "-J-Dhttps.proxyHost=proxy.example",
+            "-J-Dhttps.proxyPort=3128",
+            "-J-Dhttp.nonProxyHosts=localhost|*.localhost",
+        ] {
+            assert!(args.iter().any(|a| a == expected), "{expected} in {args:?}");
+        }
+        let err = add_common_args(&mut Command::new("cs"), &repos, &Err("HTTPS_PROXY: bad".into()), Path::new("/c"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(err, "HTTPS_PROXY: bad");
     }
 
     #[test]

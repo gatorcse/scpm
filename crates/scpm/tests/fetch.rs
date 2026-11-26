@@ -160,11 +160,11 @@ fn verify_rehashes_and_repairs_cached_files() {
     let report = fetch_all(vec![it()], FetchOptions::default()).unwrap();
     assert_eq!((report.present, report.downloaded), (1, 0));
 
-    let report = fetch_all(vec![it()], FetchOptions { verify: true }).unwrap();
+    let report = fetch_all(vec![it()], FetchOptions { verify: true, ..Default::default() }).unwrap();
     assert_eq!((report.verified, report.repaired, report.downloaded), (1, 1, 1));
     assert_eq!(fs::read(&dest).unwrap(), JAR);
 
-    let report = fetch_all(vec![it()], FetchOptions { verify: true }).unwrap();
+    let report = fetch_all(vec![it()], FetchOptions { verify: true, ..Default::default() }).unwrap();
     assert_eq!((report.verified, report.repaired, report.present), (1, 0, 1));
 }
 
