@@ -87,8 +87,8 @@ analysis nothing knows which class files are stale. A `failed` or `cancelled` co
 `classesDir` as it was before the request. A compile whose analysis cannot be written is answered
 `crashed` and deletes `analysisFile`, since its class files are already in place; the next
 compile is a full one. If `analysisFile` cannot be deleted, the worker ignores it until an
-analysis is written there again, and leaves `<analysisFile>.invalid` next to it (best effort) so
-a restarted worker ignores it too.
+analysis is written there again, and leaves a marker in a `.scpm-invalid` directory next to it (best
+effort) so a restarted worker ignores it too. That directory is reserved for the worker.
 
 `result`:
 

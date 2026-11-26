@@ -82,6 +82,9 @@ class CachesSuite extends munit.FunSuite:
 
   dir.test("AnalysisCache never returns an analysis whose rewrite failed, even if it cannot be deleted") { dir =>
     val file = dir.resolve("analysis.zip")
+    val marker = AnalysisCache.marker(Validation.canonical(file))
+    // Another target's file, with the name a marker next to analysis.zip might have had.
+    val neighbour = Files.writeString(dir.resolve("analysis.zip.invalid"), "another target")
     val first = AnalysisCache(delete = _ => ())
     first.write(file, emptyAnalysis(dir))
     assert(first.read(file).isDefined)
@@ -91,14 +94,16 @@ class CachesSuite extends munit.FunSuite:
     val e = intercept[IllegalStateException](undeletable.write(file, unwritable))
     assert(e.getSuppressed.exists(_.getMessage == "cannot delete"), e.getSuppressed.toList)
     assert(Files.exists(file), "the stale analysis is still there")
+    assert(Files.exists(marker))
     assertEquals(undeletable.read(file), None)
     assertEquals(undeletable.read(dir.resolve(".").resolve("analysis.zip")), None)
     assertEquals(AnalysisCache().read(file), None, "a restarted worker must not read it either")
 
     undeletable.write(file, emptyAnalysis(dir))
     assert(undeletable.read(file).isDefined, "a successful write makes it readable again")
-    assert(!Files.exists(AnalysisCache.marker(file)))
+    assert(!Files.exists(marker) && !Files.exists(marker.getParent))
     assert(AnalysisCache().read(file).isDefined)
+    assertEquals(Files.readString(neighbour), "another target")
   }
 
   dir.test("AnalysisCache forgets an analysis whose rewrite failed in a read-only directory") { dir =>
@@ -110,8 +115,10 @@ class CachesSuite extends munit.FunSuite:
     assert(analyses.read(file).isDefined)
     Files.setPosixFilePermissions(sub, fromString("r-xr-xr-x"))
     try
+      // Root, or CAP_DAC_OVERRIDE, can still write to it; the injected-failure test covers that case.
+      assume(!Files.isWritable(sub), "the directory is writable despite its permissions")
       intercept[IllegalStateException](analyses.write(file, unwritable))
-      assert(Files.exists(file) && !Files.exists(AnalysisCache.marker(file)), "neither deleted nor marked")
+      assert(Files.exists(file) && !Files.exists(AnalysisCache.marker(Validation.canonical(file))), "neither deleted nor marked")
       assertEquals(analyses.read(file), None)
     finally Files.setPosixFilePermissions(sub, fromString("rwxr-xr-x"))
   }
