@@ -804,9 +804,9 @@ fn resolve_concurrently<'a>(
     Ok(out)
 }
 
-/// Adds artifacts from this run's resolutions to the lock. The repository id is always
-/// re-derived from where coursier downloaded the file (repositories may have changed since the
-/// entry was written). An existing entry keeps its sha256 and size (artifacts are immutable)
+/// Adds artifacts from this run's resolutions to the lock. The repository id is re-derived
+/// from where coursier downloaded the file (repositories may have changed since the entry was
+/// written); only between repositories sharing a mirror does an existing entry keep its id. An existing entry keeps its sha256 and size (artifacts are immutable)
 /// only if the resolved file has them: the lock doesn't record repository URLs, so a
 /// repository whose URL changed under the same id must be checked like one with a new id.
 fn record_artifacts<'a>(
@@ -819,7 +819,12 @@ fn record_artifacts<'a>(
         if !seen.insert((&a.key, &a.url)) {
             continue;
         }
-        let repo = repo_for_url(repos, &a.url).ok_or_else(|| {
+        let candidates = repos_for_url(repos, &a.url);
+        // Repositories sharing a mirror can't be told apart by URL: an existing entry keeps
+        // its id if that is one of them, so re-locking through a catch-all mirror doesn't
+        // re-label artifacts the first sharer may lack (design §5.9).
+        let kept = lock.artifacts.get(&a.key).and_then(|e| candidates.iter().find(|r| r.id == e.repo));
+        let repo = kept.or(candidates.first()).copied().ok_or_else(|| {
             InstallError::Resolve(format!(
                 "{} was downloaded from {}, which matches no configured repository or mirror",
                 a.key, a.url
@@ -866,17 +871,18 @@ fn record_artifacts<'a>(
     Ok(())
 }
 
-/// The configured repository serving `url`, matched against where it is downloaded from (its
-/// mirror, if any), so a mirror maps back to the repository id. The longest prefix wins; between
-/// repositories sharing a mirror, the first in resolution order.
+/// The configured repositories serving `url`, matched against where they are downloaded from
+/// (their mirror, if any), so a mirror maps back to repository ids. The longest prefix wins;
+/// repositories sharing a mirror all match, in resolution order.
+fn repos_for_url<'a>(repos: &'a [Repo], url: &str) -> Vec<&'a Repo> {
+    let matching = repos.iter().filter(|r| url.starts_with(r.fetch_url()));
+    let longest = matching.clone().map(|r| r.fetch_url().len()).max().unwrap_or(0);
+    matching.filter(|r| r.fetch_url().len() == longest).collect()
+}
+
+#[cfg(test)]
 fn repo_for_url<'a>(repos: &'a [Repo], url: &str) -> Option<&'a Repo> {
-    let mut best: Option<&Repo> = None;
-    for r in repos.iter().filter(|r| url.starts_with(r.fetch_url())) {
-        if best.is_none_or(|b| r.fetch_url().len() > b.fetch_url().len()) {
-            best = Some(r);
-        }
-    }
-    best
+    repos_for_url(repos, url).first().copied()
 }
 
 /// How the fetcher reaches a repository: its credentials (read lazily; an error only matters
@@ -1221,5 +1227,38 @@ mod tests {
         let items = fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c")).unwrap();
         assert_eq!(items[0].url, "https://m/all/own/g/a/1/a-1.jar");
         assert_eq!(items[0].dest, Path::new("/c/https/m/all/own/g/a/1/a-1.jar"));
+    }
+
+    #[test]
+    fn relocking_through_a_shared_mirror_keeps_existing_repository_ids() {
+        let mirror = Some(coursier::Mirror { url: "https://m/all/".into(), matched: "*".into() });
+        let repos = vec![
+            Repo { id: "central".into(), url: "https://c/".into(), mirror: mirror.clone(), ..Default::default() },
+            Repo { id: "acme".into(), url: "https://a/".into(), mirror, ..Default::default() },
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x-1.jar");
+        std::fs::write(&file, b"jar").unwrap();
+        let (size, sha256) = (3, fetch::sha256_file(&file).unwrap());
+        // Locked without the mirror: `g:x:1` exists only in acme.
+        let mut lock = Lockfile::default();
+        lock.artifacts.insert("g:x:1".into(), ArtifactLock { repo: "acme".into(), sha256: sha256.clone(), size });
+        lock.artifacts.insert("g:y:1".into(), ArtifactLock { repo: "central".into(), sha256: sha256.clone(), size });
+        let via_mirror = |key: &str, path: &str| ResolvedArtifact {
+            key: key.into(),
+            file: file.clone(),
+            url: format!("https://m/all/{path}"),
+        };
+        let resolved = [via_mirror("g:x:1", "g/x/1/x-1.jar"), via_mirror("g:y:1", "g/y/1/y-1.jar")];
+        record_artifacts(&mut lock, &resolved, &repos).unwrap();
+        assert_eq!(lock.artifacts["g:x:1"].repo, "acme", "a restore without the mirror still finds it");
+        assert_eq!(lock.artifacts["g:y:1"].repo, "central");
+        // A new artifact gets the first sharer, as before.
+        record_artifacts(&mut lock, &[via_mirror("g:z:1", "g/z/1/z-1.jar")], &repos).unwrap();
+        assert_eq!(lock.artifacts["g:z:1"], ArtifactLock { repo: "central".into(), sha256, size });
+        // An id that no longer shares the mirror is re-derived.
+        let unshared = vec![repos[0].clone(), Repo { mirror: None, ..repos[1].clone() }];
+        record_artifacts(&mut lock, &[via_mirror("g:x:1", "g/x/1/x-1.jar")], &unshared).unwrap();
+        assert_eq!(lock.artifacts["g:x:1"].repo, "central");
     }
 }
