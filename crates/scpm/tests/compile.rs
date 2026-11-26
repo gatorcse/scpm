@@ -262,9 +262,17 @@ fn runs_tests_and_mains() {
     let out = scpm(ws.path()).args(["run", "app", "--", "Ann", "Bob"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "HELLO, ANN; HELLO, BOB!\n", "build output stays off stdout");
-    let out = scpm(ws.path()).args(["-F", "!app", "run", "app"]).output().unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("excluded by --filter"), "{out:?}");
+    // `run` intersects its target with the global --filter.
+    for filter in ["!app", "util"] {
+        let out = scpm(ws.path()).args(["-F", filter, "run", "app"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "-F {filter}: {out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("`app` is excluded by --filter"), "{out:?}");
+    }
+    for filter in ["!util", "app"] {
+        let out = scpm(ws.path()).args(["-F", filter, "run", "app", "--", "Ann"]).output().unwrap();
+        assert!(out.status.success(), "-F {filter}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "HELLO, ANN!\n");
+    }
 
     let out = scpm(ws.path()).args(["--json", "test", "app"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));

@@ -230,6 +230,21 @@ fn classpath_targets_respect_the_global_filter() {
 }
 
 #[test]
+fn run_target_must_also_pass_the_global_filter() {
+    // An include filter that doesn't cover the target excludes it (no union with the target).
+    scpm(&fixture("basic"))
+        .args(["-F", "javalib", "run", "util"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("`util` is excluded by --filter"));
+    scpm(&fixture("basic"))
+        .args(["-F", "!util", "run", "util"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("`util` is excluded by --filter"));
+}
+
+#[test]
 fn single_module_project_without_workspace_file() {
     let dir = workspace(&[("scpm.yaml", "name: solo\nscala: '2.13.18'\n")]);
     assert_eq!(stdout(dir.path(), &["ls"]), "solo@jvm-2.13  .\n");

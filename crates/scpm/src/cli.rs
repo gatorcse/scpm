@@ -396,11 +396,15 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Command::Run { target, main, frozen, args } => {
             let (ws, graph) = load(&start)?;
-            let mut selectors = cli.filter.clone();
-            selectors.push(target.clone());
-            let selected = filter::select(&ws, &graph, &selectors, &invocation_dir(&start)?)?;
-            if selected.is_empty() {
-                return Err(Failure::Usage(format!("`{target}` is excluded by --filter")));
+            // The target must also pass the global --filter (an intersection, as for `classpath`).
+            let cwd = invocation_dir(&start)?;
+            let mut selected = filter::select(&ws, &graph, std::slice::from_ref(&target), &cwd)?;
+            if !cli.filter.is_empty() {
+                let allowed = filter::select(&ws, &graph, &cli.filter, &cwd)?;
+                selected.retain(|id| allowed.contains(id));
+                if selected.is_empty() {
+                    return Err(Failure::Usage(format!("`{target}` is excluded by --filter")));
+                }
             }
             let [id] = selected.iter().collect::<Vec<_>>()[..] else {
                 return Err(Failure::Usage(format!(
