@@ -46,8 +46,12 @@ fn copy_dir(from: &Path, to: &Path) {
 fn scpm(dir: &Path, cache: &Path) -> Command {
     let mut cmd = Command::cargo_bin("scpm").unwrap();
     cmd.arg("-C").arg(dir).env("COURSIER_CACHE", cache).env_remove("CI").env_remove("COURSIER_CREDENTIALS");
-    // Never the developer's own machine settings.
-    cmd.env("SCPM_CONFIG", Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-user-config.yaml"));
+    // Never the developer's own machine settings: an empty user config.
+    let config = Path::new(env!("CARGO_TARGET_TMPDIR")).join("empty-user-config.yaml");
+    if !config.exists() {
+        fs::write(&config, "").unwrap();
+    }
+    cmd.env("SCPM_CONFIG", config);
     cmd
 }
 
@@ -260,6 +264,19 @@ fn why_and_classpath() {
             .contains("cats-kernel_3"))
     );
     assert_eq!(report["unexplained"], serde_json::json!([]));
+    assert!(report.get("warnings").is_none(), "{report}");
+    // Machine-settings warnings reach `why --json` too.
+    let missing = ws.path().join("no-such-config.yaml");
+    let out = scpm(ws.path(), &shared_cache())
+        .env("SCPM_CONFIG", &missing)
+        .args(["--json", "why", "cats-kernel", "-F", "util@jvm-3"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert!(report["warnings"][0].as_str().unwrap().contains("no-such-config.yaml"), "{report}");
 
     let out = scpm(ws.path(), &shared_cache())
         .args(["--json", "classpath", "core", "--kind", "test-runtime"])

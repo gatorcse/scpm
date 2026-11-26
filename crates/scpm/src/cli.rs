@@ -267,6 +267,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             if cli.json {
                 print_json(&report)?;
             } else {
+                // `report.warnings` were printed by `ensure_installed` already.
                 for n in &report.notices {
                     eprintln!("note: {n}");
                 }

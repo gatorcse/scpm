@@ -14,8 +14,12 @@ fn fixture(name: &str) -> PathBuf {
 
 fn scpm(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("scpm").unwrap();
-    // Never the developer's own machine settings.
-    cmd.arg("-C").arg(dir).env("SCPM_CONFIG", Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-user-config.yaml"));
+    // Never the developer's own machine settings: an empty user config.
+    let config = Path::new(env!("CARGO_TARGET_TMPDIR")).join("empty-user-config.yaml");
+    if !config.exists() {
+        std::fs::write(&config, "").unwrap();
+    }
+    cmd.arg("-C").arg(dir).env("SCPM_CONFIG", config);
     cmd
 }
 

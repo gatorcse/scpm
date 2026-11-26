@@ -40,6 +40,9 @@ pub struct WhyReport {
     /// Settings of other tools that touch the repositories and that scpm ignored (design §5.9).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notices: Vec<String>,
+    /// Problems with the machine settings (design §5.9), e.g. a user config others can read.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Does `key` (`g:a:v[...]`) match `pattern` (`org:name`, `org::name`, or an artifact name)?
@@ -69,7 +72,7 @@ pub fn why(
 ) -> Result<WhyReport, InstallError> {
     let (repos, machine) = crate::install::repositories(ws)?;
     let cache = coursier::cache_dir();
-    let mut report = WhyReport::default();
+    let mut report = WhyReport { warnings: machine.warnings.clone(), ..Default::default() };
     let mut ran_cs = false;
     for id in selected {
         let (Some(variant), Some(vlock)) = (ws.variant(id), lock.variants.get(id)) else { continue };
