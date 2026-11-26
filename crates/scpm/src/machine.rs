@@ -239,9 +239,9 @@ impl Machine {
     pub fn mirror_for(&self, repo: &Repo) -> Option<Mirror> {
         let named = |p: &str| {
             if p.contains("://") {
-                let prefix =
-                    if p.ends_with('/') { p.to_ascii_lowercase() } else { format!("{}/", p.to_ascii_lowercase()) };
-                repo.url.to_ascii_lowercase().starts_with(&prefix)
+                let prefix = comparable_url(p);
+                let prefix = if prefix.ends_with('/') { prefix } else { format!("{prefix}/") };
+                comparable_url(&repo.url).starts_with(&prefix)
             } else {
                 p == repo.id
             }
@@ -251,7 +251,8 @@ impl Machine {
             .iter()
             .find_map(|m| m.mirror_of.iter().find(|p| *p != "*" && named(p)).map(|p| (m, p)))
             .or_else(|| self.mirrors.iter().find_map(|m| m.mirror_of.iter().find(|p| *p == "*").map(|p| (m, p))))?;
-        (found.0.url != repo.url).then(|| Mirror { url: found.0.url.clone(), matched: found.1.clone() })
+        (comparable_url(&found.0.url) != comparable_url(&repo.url))
+            .then(|| Mirror { url: found.0.url.clone(), matched: found.1.clone() })
     }
 
     /// Applies the machine settings to the workspace's repositories (design §5.9):
@@ -647,6 +648,22 @@ impl UrlParts {
     }
 }
 
+/// `url` lower-cased and without a default port (`:443` for `https`, `:80` for `http`), so
+/// `mirrorOf` URL prefixes match however the port is written.
+fn comparable_url(url: &str) -> String {
+    let url = url.to_ascii_lowercase();
+    let Some((scheme, rest)) = url.split_once("://") else { return url };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let default = match scheme {
+        "https" => ":443",
+        "http" => ":80",
+        _ => return url.clone(),
+    };
+    let authority = authority.strip_suffix(default).unwrap_or(authority);
+    format!("{scheme}://{authority}{tail}")
+}
+
 /// An `http(s)://host[:port][/path]` URL without credentials in it. No error repeats the URL:
 /// a password that doesn't parse as one (`https://alice:pa#ss@host`) would be shown.
 fn check_url(url: &str) -> Result<UrlParts, String> {
@@ -833,6 +850,25 @@ mod tests {
         // Workspace credentials never go to a mirror (another host).
         assert_eq!(repos[4].mirror.as_ref().unwrap().url, "https://all.example/m/");
         assert_eq!(repos[4].credentials, None);
+    }
+
+    #[test]
+    fn mirror_url_prefixes_ignore_default_ports() {
+        let m = machine(
+            "mirrors:\n\
+             \x20 - {url: 'https://m1.example/m', mirrorOf: ['https://acme.example:443/maven']}\n\
+             \x20 - {url: 'https://m2.example/m', mirrorOf: ['http://plain.example/m']}\n\
+             \x20 - {url: 'https://m3.example/m', mirrorOf: ['https://other.example/m']}\n",
+        )
+        .unwrap();
+        let repo = |id: &str, url: &str| Repo { id: id.into(), url: url.into(), ..Default::default() };
+        let mirror = |r: Repo| m.mirror_for(&r).map(|m| m.url);
+        assert_eq!(mirror(repo("a", "https://acme.example/maven/x/")).as_deref(), Some("https://m1.example/m/"));
+        assert_eq!(mirror(repo("p", "http://plain.example:80/m/")).as_deref(), Some("https://m2.example/m/"));
+        assert_eq!(mirror(repo("o", "https://other.example:443/m/")).as_deref(), Some("https://m3.example/m/"));
+        assert_eq!(mirror(repo("x", "https://acme.example:8443/maven/")), None, "another port");
+        assert_eq!(mirror(repo("y", "http://acme.example:443/maven/")), None, "443 is no default for http");
+        assert_eq!(comparable_url("HTTPS://H.example:443"), "https://h.example");
     }
 
     fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
