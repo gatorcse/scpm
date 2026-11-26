@@ -83,6 +83,10 @@ pub enum InstallError {
     /// The user config is invalid (design §5.9).
     #[error("{0}")]
     MachineConfig(crate::diag::Diagnostics),
+    /// An error from contacting the repositories, with the notice about ignored settings of
+    /// other tools that may be why (design §5.9).
+    #[error("{error}\n  note: {notice}")]
+    WithNotice { error: Box<InstallError>, notice: String },
 }
 
 /// The workspace's repositories with the machine settings applied (design §5.9).
@@ -725,7 +729,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
 /// repositories: one of them may be why it failed (design §5.9).
 pub(crate) fn with_notice(e: InstallError, repos: &[Repo]) -> InstallError {
     match crate::foreign::take_notice(repos) {
-        Some(notice) => InstallError::Resolve(format!("{e}\n  note: {notice}")),
+        Some(notice) => InstallError::WithNotice { error: Box::new(e), notice },
         None => e,
     }
 }
@@ -1227,6 +1231,21 @@ mod tests {
         let items = fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c")).unwrap();
         assert_eq!(items[0].url, "https://m/all/own/g/a/1/a-1.jar");
         assert_eq!(items[0].dest, Path::new("/c/https/m/all/own/g/a/1/a-1.jar"));
+    }
+
+    #[test]
+    fn a_notice_keeps_the_error_it_is_added_to() {
+        let failure = fetch::FetchFailure {
+            errors: vec![fetch::FetchError::Proxy("HTTPS_PROXY: bad".into())],
+            attempted: BTreeMap::new(),
+        };
+        let e = InstallError::WithNotice {
+            error: Box::new(InstallError::Fetch(failure)),
+            notice: "settings.xml: …".into(),
+        };
+        assert_eq!(e.to_string(), "HTTPS_PROXY: bad\n  note: settings.xml: …");
+        let InstallError::WithNotice { error, .. } = e else { unreachable!() };
+        assert!(matches!(*error, InstallError::Fetch(ref f) if f.errors.len() == 1));
     }
 
     #[test]
