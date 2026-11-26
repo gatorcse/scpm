@@ -771,14 +771,14 @@ A machine setting can therefore only decide whether a download *succeeds*, never
 | Source coursier reads | What it can set | Today |
 |---|---|---|
 | `COURSIER_REPOSITORIES`, Scala CLI `repositories.default` | default repositories | ignored: scpm passes `--no-default` and its own `--repository` list |
-| `COURSIER_MIRRORS`, `COURSIER_EXTRA_MIRRORS`, `mirror.properties` in coursier's config directory (`COURSIER_CONFIG_DIR`) | mirrors | **live** |
-| Maven `settings.xml` (`~/.m2`, `CS_MAVEN_HOME`, `MAVEN_HOME`, `COURSIER_MAVEN_SETTINGS`) | mirrors, `<server>` credentials for mirrors, proxies | **live** |
+| `COURSIER_MIRRORS`, `COURSIER_EXTRA_MIRRORS`, `mirror.properties` in coursier's config directory (`COURSIER_CONFIG_DIR`) | mirrors | ignored: `cs` gets a `COURSIER_MIRRORS` naming no file (which also disables `mirror.properties`), and no `COURSIER_EXTRA_MIRRORS` (read even then) |
+| Maven `settings.xml` (`~/.m2`, `$CS_MAVEN_HOME/settings.xml`, `$MAVEN_HOME/settings.xml`, `COURSIER_MAVEN_SETTINGS`) | mirrors, `<server>` credentials for mirrors, proxies | ignored: `cs` gets `COURSIER_MAVEN_SETTINGS=false` |
 | Scala CLI config (`SCALA_CLI_CONFIG`) | credentials, mirrors, default repositories | ignored since M2: `cs` gets a `SCALA_CLI_CONFIG` that names no file |
 | `COURSIER_CREDENTIALS`, `credentials.properties` | credentials | read by scpm and passed on, one policy for both paths (§5.7) |
 | JVM properties (`https.proxyHost`, …) | proxies | `cs` honours them; it ignores `HTTPS_PROXY`, which the Rust fetcher honours, so the two paths disagree today |
-| `COURSIER_TTL`, `COURSIER_MODE` | cache policy | live |
+| `COURSIER_TTL`, `COURSIER_MODE` | cache policy | ignored: removed from `cs`'s environment |
 
-A mirror from `settings.xml` with `<mirrorOf>*</mirrorOf>`, common in companies, already breaks re-locking: `cs` downloads from the mirror, the URL matches no configured repository, and the lock refuses it (§5.4). The error is loud but baffling.
+A mirror from `settings.xml` with `<mirrorOf>*</mirrorOf>`, common in companies, used to break re-locking: `cs` downloads from the mirror, the URL matches no configured repository, and the lock refuses it (§5.4). The error was loud but baffling.
 
 **Rule: `cs` runs sealed.** scpm resolves every machine setting itself, then hands `cs` exactly that and nothing else:
 

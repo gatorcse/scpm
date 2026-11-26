@@ -741,3 +741,83 @@ fn pom_packaged_dependencies_resolve_to_their_dependencies() {
     let cp = strings(&lock(ws.path())["variants"]["lib@jvm"]["compileClasspath"]);
     assert!(cp.iter().any(|k| k.starts_with("org.apache.groovy:groovy:4.0.24")), "{cp:?}");
 }
+
+/// A file:// Maven repository holding `com.example:hello:1.0` with the given jar bytes.
+fn file_repo(dir: &Path, jar: &[u8]) -> String {
+    for (path, body) in hello_repo_files(jar) {
+        let file = dir.join(path.trim_start_matches('/'));
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, body).unwrap();
+    }
+    format!("file://{}/maven", dir.display())
+}
+
+/// Every mirror source coursier reads by itself, each sending `from` to `to` (design §5.9).
+fn hostile_coursier_env(dir: &Path, from: &str, to: &str) -> Vec<(&'static str, PathBuf)> {
+    let mirrors = dir.join("hostile-mirrors.properties");
+    fs::write(&mirrors, format!("m.from={from}\nm.to={to}\n")).unwrap();
+    let config_dir = dir.join("hostile-coursier-config");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::copy(&mirrors, config_dir.join("mirror.properties")).unwrap();
+    let maven = dir.join("hostile-m2");
+    fs::create_dir_all(&maven).unwrap();
+    fs::write(
+        maven.join("settings.xml"),
+        format!(
+            "<settings><mirrors><mirror><id>corp</id><mirrorOf>*</mirrorOf><url>{to}</url></mirror></mirrors></settings>"
+        ),
+    )
+    .unwrap();
+    vec![
+        ("COURSIER_MIRRORS", mirrors.clone()),
+        ("COURSIER_CONFIG_DIR", config_dir),
+        ("COURSIER_EXTRA_MIRRORS", mirrors),
+        ("MAVEN_HOME", maven.clone()),
+        ("CS_MAVEN_HOME", maven),
+    ]
+}
+
+#[test]
+fn foreign_mirror_settings_do_not_redirect_cs() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    let server = Server::maven(hello_repo_files(b"the real jar"), None);
+    let ws = tempfile::tempdir().unwrap();
+    let elsewhere = file_repo(&ws.path().join("elsewhere"), b"a hostile jar");
+    let hostile = hostile_coursier_env(ws.path(), &server.url("/maven"), &elsewhere);
+    // Each source on its own redirects a plain `cs`, so this test notices if one stops working.
+    let cs = std::env::var("SCPM_CS").unwrap_or_else(|_| "cs".into());
+    for (var, value) in &hostile {
+        let cache = tempfile::tempdir().unwrap();
+        let out = StdCommand::new(&cs)
+            .args(["fetch", "--no-default", "-r", &server.url("/maven"), "com.example:hello:1.0", "--cache"])
+            .arg(cache.path())
+            .env_remove("COURSIER_MIRRORS")
+            .env_remove("COURSIER_MAVEN_SETTINGS")
+            .env(var, value)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("/elsewhere/"), "{var} should redirect a plain cs: {stdout}");
+    }
+
+    java_workspace(
+        ws.path(),
+        &format!("repositories:\n  - {{id: local, url: '{}'}}\n", server.url("/maven")),
+        "dependencies:\n  com.example:hello: '1.0'\n",
+    );
+    let cache = tempfile::tempdir().unwrap();
+    scpm(ws.path(), cache.path())
+        .envs(hostile.iter().map(|(k, v)| (*k, v.as_os_str())))
+        .env("COURSIER_MODE", "offline")
+        .env("COURSIER_TTL", "0")
+        .env("COURSIER_REPOSITORIES", &elsewhere)
+        .arg("install")
+        .assert()
+        .success();
+    assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "local");
+    let jar = cache.path().join(format!("http/127.0.0.1%3A{}/maven/com/example/hello/1.0/hello-1.0.jar", server.port));
+    assert_eq!(fs::read(jar).unwrap(), b"the real jar");
+    assert!(server.count(HELLO_JAR_PATH) >= 1);
+}

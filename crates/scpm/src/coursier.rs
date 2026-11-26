@@ -593,8 +593,9 @@ fn add_request_args(cmd: &mut Command, req: &ResolveRequest) {
 /// credentials that could not be read (reported only if coursier then fails).
 struct CommonArgs {
     _credential_file: Option<tempfile::NamedTempFile>,
-    /// Holds the (absent) Scala CLI config `cs` is pointed at.
-    _scala_cli_config: Option<tempfile::TempDir>,
+    /// A private, empty directory: the (absent) Scala CLI config and mirror file `cs` is
+    /// pointed at live in it.
+    _sealed_dir: Option<tempfile::TempDir>,
     missing_credentials: Vec<String>,
 }
 
@@ -608,12 +609,19 @@ impl CommonArgs {
     }
 }
 
-/// Cache, repositories and credentials. Secrets never go on the command line: every credential
-/// `cs` may use is written to a private (0600) temporary file that `COURSIER_CREDENTIALS` names
-/// for the child, which also stops `cs` from reading coursier's own sources unfiltered.
-/// `SCALA_CLI_CONFIG` names a file that doesn't exist, so `cs` skips the Scala CLI config's
-/// credentials too (coursier reads those even with `COURSIER_CREDENTIALS` set, and scpm's
-/// fetcher doesn't read them at all).
+/// Environment variables through which coursier would pick up machine settings scpm doesn't
+/// apply itself (design §5.9): extra mirror files, default repositories and cache policy.
+const UNSEALED_ENV: &[&str] = &["COURSIER_EXTRA_MIRRORS", "COURSIER_REPOSITORIES", "COURSIER_TTL", "COURSIER_MODE"];
+
+/// Cache, repositories and credentials, with `cs` sealed off from every other source of machine
+/// settings (design §5.9). Secrets never go on the command line: every credential `cs` may use
+/// is written to a private (0600) temporary file that `COURSIER_CREDENTIALS` names for the
+/// child, which also stops `cs` from reading coursier's own sources unfiltered.
+/// `SCALA_CLI_CONFIG` and `COURSIER_MIRRORS` name files that don't exist, so `cs` skips the Scala
+/// CLI config's credentials and mirrors (coursier reads those even with `COURSIER_CREDENTIALS`
+/// set) and the mirror files (a `COURSIER_MIRRORS` naming a missing file also disables
+/// `mirror.properties` in coursier's config directory; `COURSIER_EXTRA_MIRRORS` is read
+/// regardless, so it is removed). `COURSIER_MAVEN_SETTINGS=false` turns off Maven `settings.xml`.
 fn add_common_args(cmd: &mut Command, repos: &[Repo], cache: &Path) -> Result<CommonArgs, CoursierError> {
     cmd.arg("--cache").arg(cache).arg("--no-default").arg("--user-agent").arg(user_agent());
     for repo in repos {
@@ -632,12 +640,17 @@ fn add_common_args(cmd: &mut Command, repos: &[Repo], cache: &Path) -> Result<Co
         .and_then(|()| file.flush())
         .map_err(|e| CoursierError::Config(format!("cannot write a credentials file: {e}")))?;
     cmd.env("COURSIER_CREDENTIALS", credentials_env_value(file.path()));
-    let scala_cli = tempfile::Builder::new()
-        .prefix("scpm-scala-cli-")
+    let sealed = tempfile::Builder::new()
+        .prefix("scpm-sealed-")
         .tempdir()
         .map_err(|e| CoursierError::Config(format!("cannot create a temporary directory: {e}")))?;
-    cmd.env("SCALA_CLI_CONFIG", scala_cli.path().join("config.json"));
-    Ok(CommonArgs { _credential_file: Some(file), _scala_cli_config: Some(scala_cli), missing_credentials })
+    cmd.env("SCALA_CLI_CONFIG", sealed.path().join("config.json"));
+    cmd.env("COURSIER_MIRRORS", sealed.path().join("mirror.properties"));
+    cmd.env("COURSIER_MAVEN_SETTINGS", "false");
+    for var in UNSEALED_ENV {
+        cmd.env_remove(var);
+    }
+    Ok(CommonArgs { _credential_file: Some(file), _sealed_dir: Some(sealed), missing_credentials })
 }
 
 /// `COURSIER_CREDENTIALS` naming a file: an absolute path, or (on Windows) a `file:` URL, which
@@ -1002,8 +1015,36 @@ mod tests {
         assert!(!cmd.get_args().any(|a| a == "--credential-file" || a == "--credentials"));
         // The Scala CLI config (whose credentials skip scpm's policy) points at nothing.
         let scala_cli = Path::new(env("SCALA_CLI_CONFIG").unwrap());
-        assert!(scala_cli.starts_with(common._scala_cli_config.as_ref().unwrap().path()));
+        assert!(scala_cli.starts_with(common._sealed_dir.as_ref().unwrap().path()));
         assert!(!scala_cli.exists());
+    }
+
+    #[test]
+    fn cs_runs_sealed() {
+        let mut cmd = Command::new("cs");
+        let repos = vec![Repo {
+            id: "r".into(),
+            url: "https://repo.example/m/".into(),
+            credentials: None,
+            allow_insecure_credentials: false,
+        }];
+        let common = add_common_args(&mut cmd, &repos, Path::new("/c")).unwrap();
+        let sealed = common._sealed_dir.as_ref().unwrap().path();
+        let envs: BTreeMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
+            .collect();
+        // A `COURSIER_MIRRORS` naming a missing file disables every mirror file.
+        let mirrors = PathBuf::from(envs["COURSIER_MIRRORS"].as_deref().unwrap());
+        assert!(mirrors.starts_with(sealed) && !mirrors.exists());
+        assert_eq!(envs["COURSIER_MAVEN_SETTINGS"].as_deref(), Some("false"));
+        for var in UNSEALED_ENV {
+            assert_eq!(envs.get(*var), Some(&None), "{var} is removed");
+        }
+        assert!(envs["SCALA_CLI_CONFIG"].is_some() && envs["COURSIER_CREDENTIALS"].is_some());
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.iter().any(|a| a == "--no-default"));
+        assert_eq!(args.iter().filter(|a| *a == "--repository").count(), 1);
     }
 
     #[test]
