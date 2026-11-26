@@ -777,6 +777,7 @@ A machine setting can therefore only decide whether a download *succeeds*, never
 | `COURSIER_CREDENTIALS`, `credentials.properties` | credentials | read by scpm and passed on, one policy for both paths (§5.7) |
 | JVM properties (`https.proxyHost`, …) | proxies | replaced: `cs` ignores `HTTPS_PROXY`, so scpm passes its resolved proxy as `-J-D` properties, and the Rust fetcher gets the same proxy explicitly with reqwest's environment lookup off |
 | `COURSIER_TTL`, `COURSIER_MODE` | cache policy | ignored: removed from `cs`'s environment |
+| `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `JAVA_OPTS` (when `SCPM_CS` is a JVM launcher) | proxies and other JVM properties | ignored: removed from `cs`'s environment |
 
 A mirror from `settings.xml` with `<mirrorOf>*</mirrorOf>`, common in companies, used to break re-locking: `cs` downloads from the mirror, the URL matches no configured repository, and the lock refuses it (§5.4). The error was loud but baffling.
 
@@ -784,7 +785,7 @@ A mirror from `settings.xml` with `<mirrorOf>*</mirrorOf>`, common in companies,
 
 - `--no-default` and one `--repository` per configured repository, with mirrors already applied (so `cs` asks the mirror directly);
 - `COURSIER_CREDENTIALS` naming scpm's private credentials file (§5.7);
-- `SCALA_CLI_CONFIG` and `COURSIER_MIRRORS` naming files that don't exist, `COURSIER_MAVEN_SETTINGS=false`, and `COURSIER_EXTRA_MIRRORS`, `COURSIER_REPOSITORIES`, `COURSIER_TTL` and `COURSIER_MODE` removed;
+- `SCALA_CLI_CONFIG` and `COURSIER_MIRRORS` naming files that don't exist, `COURSIER_MAVEN_SETTINGS=false`, and `COURSIER_EXTRA_MIRRORS`, `COURSIER_REPOSITORIES`, `COURSIER_TTL`, `COURSIER_MODE` and the JVM option variables removed;
 - the resolved proxy as JVM properties (`-J-Dhttps.proxyHost=…`, `-J-Dhttp.nonProxyHosts=…`).
 
 The Rust fetcher gets the same resolved values: the same mirror URL, the same credentials and an explicit proxy, instead of reqwest's own environment lookup. Both paths see identical inputs by construction. The compatibility suite (§5.2) runs a re-lock and a restore under a hostile environment (every source above set to something wrong) and checks they still agree.
@@ -810,7 +811,7 @@ The Rust fetcher gets the same resolved values: the same mirror URL, the same cr
    Literal secrets are allowed, as in `credentials.properties`, but scpm warns when the file is readable by group or others. A credential for a mirror is matched against the mirror's URL, not the repository it replaces.
 
    Details settled in the implementation:
-   - The file is parsed strictly (an unknown key is an error, like the workspace files); a missing file, even one `SCPM_CONFIG` names, means no settings. `scpm schema user-config` prints its JSON Schema.
+   - The file is parsed strictly (an unknown key is an error, like the workspace files); a missing file, even one `SCPM_CONFIG` names, means no settings (with a warning when `SCPM_CONFIG` names it). `scpm schema user-config` prints its JSON Schema.
    - Item 1's `credentials` live on the repository definitions in `scpm-workspace.yaml`.
    - When several credential entries match a URL, the longest path wins. A `file:` value is read without one trailing newline; `~` is the home directory and a relative path is relative to the user config's directory.
    - **One origin, one set of credentials.** `cs` scopes credentials by scheme, host and port only, so a path can choose which credentials a repository gets but can't keep them from another URL on the same origin. When two repositories or mirrors that `cs` contacts share an origin but would get different credentials (or one gets none), scpm refuses to run `cs` and names both URLs instead of sending either set somewhere it wasn't meant for. Two GitHub Packages organisations with different tokens hit this; one token for both doesn't. The Rust fetcher knows each artifact's repository and is never ambiguous, so a restore isn't affected.

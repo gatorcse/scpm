@@ -713,8 +713,17 @@ impl CommonArgs {
 }
 
 /// Environment variables through which coursier would pick up machine settings scpm doesn't
-/// apply itself (design §5.9): extra mirror files, default repositories and cache policy.
-const UNSEALED_ENV: &[&str] = &["COURSIER_EXTRA_MIRRORS", "COURSIER_REPOSITORIES", "COURSIER_TTL", "COURSIER_MODE"];
+/// apply itself (design §5.9): extra mirror files, default repositories and cache policy, and
+/// JVM options (proxy properties, say) when `SCPM_CS` is a JVM launcher.
+const UNSEALED_ENV: &[&str] = &[
+    "COURSIER_EXTRA_MIRRORS",
+    "COURSIER_REPOSITORIES",
+    "COURSIER_TTL",
+    "COURSIER_MODE",
+    "JAVA_TOOL_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "JAVA_OPTS",
+];
 
 /// Cache, repositories and credentials, with `cs` sealed off from every other source of machine
 /// settings (design §5.9). Secrets never go on the command line: every credential `cs` may use

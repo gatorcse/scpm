@@ -532,22 +532,31 @@ fn proxy_from_env(env: &dyn Fn(&str) -> Option<String>) -> ProxyChoice {
 
 /// The user config path: `SCPM_CONFIG`, else `<config dir>/scpm/config.yaml`.
 pub fn user_config_path() -> Option<PathBuf> {
-    match std::env::var_os(USER_CONFIG_ENV).filter(|v| !v.is_empty()) {
-        Some(path) => Some(PathBuf::from(path)),
-        None => dirs::config_dir().map(|d| d.join("scpm").join("config.yaml")),
-    }
+    named_config_path().or_else(|| dirs::config_dir().map(|d| d.join("scpm").join("config.yaml")))
+}
+
+/// The file `SCPM_CONFIG` names, if set.
+fn named_config_path() -> Option<PathBuf> {
+    std::env::var_os(USER_CONFIG_ENV).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 /// The machine settings for this process, read once.
 pub fn current() -> Result<&'static Machine, Diagnostics> {
     static MACHINE: OnceLock<Result<Machine, Diagnostics>> = OnceLock::new();
-    MACHINE
-        .get_or_init(|| match user_config_path() {
-            Some(path) => Machine::from_file(&path),
-            None => Ok(Machine::none().with_env_proxy()),
-        })
-        .as_ref()
-        .map_err(Clone::clone)
+    MACHINE.get_or_init(|| load(named_config_path(), user_config_path())).as_ref().map_err(Clone::clone)
+}
+
+/// Reads the user config at `path`. `named` is the file `SCPM_CONFIG` names: a typo there would
+/// otherwise silently mean no settings.
+fn load(named: Option<PathBuf>, path: Option<PathBuf>) -> Result<Machine, Diagnostics> {
+    let Some(path) = path else { return Ok(Machine::none().with_env_proxy()) };
+    let mut machine = Machine::from_file(&path)?;
+    if !machine.exists && named.is_some_and(|n| n == path) {
+        machine
+            .warnings
+            .push(format!("{USER_CONFIG_ENV} names {}, which does not exist; no user config is used", path.display()));
+    }
+    Ok(machine)
 }
 
 fn parse(path: &Path, text: &str) -> Result<UserConfigFile, Diagnostics> {
@@ -690,6 +699,20 @@ mod tests {
         assert!(!m.exists && m.credentials.is_empty() && m.mirrors.is_empty());
         let m = machine("# nothing yet\n").unwrap();
         assert!(m.exists && m.credentials.is_empty());
+    }
+
+    #[test]
+    fn a_missing_file_named_by_scpm_config_is_warned_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("confg.yaml");
+        let m = load(Some(missing.clone()), Some(missing.clone())).unwrap();
+        assert!(!m.exists);
+        assert!(m.warnings.iter().any(|w| w.contains("SCPM_CONFIG") && w.contains("confg.yaml")), "{:?}", m.warnings);
+        // The default location may well not exist: no warning.
+        assert!(load(None, Some(missing)).unwrap().warnings.is_empty());
+        let present = dir.path().join("config.yaml");
+        std::fs::write(&present, "").unwrap();
+        assert!(load(Some(present.clone()), Some(present)).unwrap().warnings.is_empty());
     }
 
     #[test]
