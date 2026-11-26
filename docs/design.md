@@ -592,7 +592,7 @@ Each variant locks four ordered classpaths:
 - **Resolution uses a fixed, declared context**, never the machine's own: by default `{os: linux, arch: x86_64, jdk: <project JDK major>}`, configurable as `lock.resolutionContext` in the workspace. It is passed to coursier, so a lock made on macOS equals one made on Linux. The lock records it, and a change re-locks every variant.
   - **Phase 1 limit:** the native `cs` CLI exposes only `--jdk-version`, so Phase 1 applies the JDK part of the context; OS and architecture profile activation follows the machine running `cs` until the resolver sidecar (Phase 3) passes them through the coursier API. The Phase 0 resolve spike checks how often this matters in practice. The lock does not record the resolving machine (that would make otherwise identical locks differ by who resolved them); `scpm install` reports it (`resolvedOn` in `--json`) and warns when it differs from the declared context, only when it actually re-locked something.
   - **Local-runtime trade-off:** with the default `linux-x86_64` context, a macOS developer's `run` and `test` get the artifacts a Linux profile selects (for example OS-classifier natives). Libraries whose natives differ by OS should be declared explicitly, one classifier per OS, in `runtimeDependencies`.
-- **Mirrors** are applied at fetch time and never recorded.
+- **Mirrors** are applied at fetch time and never recorded. They are machine settings (§5.9).
 - **`repo`** records the repository **id** from config, derived by matching the artifact's URL against the configured repository URLs (and their mirrors) by prefix, longest match first. A URL that matches no configured repository is an error. It is re-derived for every artifact a re-lock resolves, so after changing repositories (which re-locks every variant and boot entry) no entry points at a repository that is gone.
 
 #### Staleness and commands
@@ -680,7 +680,7 @@ The trust anchor is the advisory database's "fixed in" data (curated GHSA/OSV), 
 
 ### 5.7 Enterprise repositories (optional fast paths)
 
-**Credentials.** A repository's `credentials` is either `env:VAR` (sent as a bearer token) or `{user: env:U, password: env:P}` (basic auth). Phase 1's Rust fetcher reads those, plus coursier's `COURSIER_CREDENTIALS` / `credentials.properties` for matching hosts. Coursier's credential sources only express basic auth, so when `cs` resolves a stale lock scpm passes a bearer token as a basic-auth password of the user `token` (which Artifactory and GitHub Packages accept) **[verify per repository type in Phase 1]**. Secrets never go on `cs`'s command line (a repository URL with `user@` is rejected): scpm writes them to a private (0600) temporary file that `COURSIER_CREDENTIALS` names for the `cs` process, scoped to the repository's scheme, host and port (coursier 2.1.27's `scheme://host:port` form). Coursier's own entries are read by scpm, matched the same way (a realm-scoped one only after a challenge naming its realm) and passed to `cs` through that file, so both paths apply one policy. Credentials in the Scala CLI config (`scala-cli config repositories.credentials`) are not used: coursier would read them alongside that file, so `cs` gets a `SCALA_CLI_CONFIG` that names no file.
+**Credentials.** A repository's `credentials` is either `env:VAR` (sent as a bearer token) or `{user: env:U, password: env:P}` (basic auth). Phase 1's Rust fetcher reads those, plus coursier's `COURSIER_CREDENTIALS` / `credentials.properties` for matching hosts. Coursier's credential sources only express basic auth, so when `cs` resolves a stale lock scpm passes a bearer token as a basic-auth password of the user `token` (which Artifactory and GitHub Packages accept) **[verify per repository type in Phase 1]**. Secrets never go on `cs`'s command line (a repository URL with `user@` is rejected): scpm writes them to a private (0600) temporary file that `COURSIER_CREDENTIALS` names for the `cs` process, scoped to the repository's scheme, host and port (coursier 2.1.27's `scheme://host:port` form). Coursier's own entries are read by scpm, matched the same way (a realm-scoped one only after a challenge naming its realm) and passed to `cs` through that file, so both paths apply one policy. Credentials in the Scala CLI config (`scala-cli config repositories.credentials`) are not used: coursier would read them alongside that file, so `cs` gets a `SCALA_CLI_CONFIG` that names no file. Where machine-local credentials, mirrors and proxies come from, and how `cs` is kept from reading other sources, is §5.9.
 
 **Plain HTTP.** Credentials only go over HTTPS by default. Configured `credentials` on an `http://` repository are a config error unless the repository sets `allowInsecureCredentials: true`; coursier entries that would go over plain HTTP (`https-only=false`, or an `http://` host) are dropped for every repository that hasn't opted in. With the opt-in, credentials go to exactly that repository's scheme, host and port, never to the rest of the host.
 
@@ -752,6 +752,80 @@ The manifest format already helps: every dependency is one `coord: version` line
    - **Opens PRs** with release notes and changelog links.
    - Because it runs inside the tool, it handles the lock, ranges and policy natively. No external bot can.
 4. **Any time: upstream a scala-steward `BuildToolAlg` for scpm.** It's cheap and reaches teams who already run steward.
+
+### 5.9 Machine-local settings
+
+Some settings legitimately differ between a laptop and CI: a developer reaches Artifactory through the office mirror and a keychain token, while CI uses a secret in an environment variable. Other settings must never differ, because they change what a build resolves. scpm keeps the two apart, and it is the **only** program that reads the machine-local ones.
+
+**Two kinds of setting.**
+
+| Kind | Examples | Where it lives | Can it change the lock? |
+|---|---|---|---|
+| **Project**: *what* resolves | repositories, catalogs, BOMs, overrides, `lock.resolutionContext`, release-age policy | `scpm.yaml`, recorded in `scpm-lock.yaml` | Yes, and that is the point: it is reviewed and committed |
+| **Machine**: *how the bytes are reached* | credentials, mirrors, proxies, the cache directory | the environment and the user config (below) | **No.** The lock pins repository ids and sha256 values (§5.4), and mirrors are never recorded |
+
+A machine setting can therefore only decide whether a download *succeeds*, never *what* is downloaded. A difference between a laptop and CI fails loudly (a 401 naming the repository) instead of silently building something else. sbt draws this line less firmly: `~/.sbt/1.0/global.sbt` can add plugins and change settings, so the same commit builds differently per machine. scpm has no user-level file that can do that.
+
+**The real risk is two downloaders, not two machines.** scpm downloads through two paths: `cs` when it re-locks (and for `why`), and the Rust fetcher when it restores (§5.2). Coursier reads a lot of ambient configuration by itself. Every source `cs` reads that scpm doesn't is a place where the two paths disagree on one machine: a re-lock succeeds because `cs` quietly found a mirror or a password, then a restore, or CI, fails, and nothing in the repository says why. Verified against `cs` 2.1.27:
+
+| Source coursier reads | What it can set | Today |
+|---|---|---|
+| `COURSIER_REPOSITORIES`, Scala CLI `repositories.default` | default repositories | ignored: scpm passes `--no-default` and its own `--repository` list |
+| `COURSIER_MIRRORS`, `COURSIER_EXTRA_MIRRORS`, `mirror.properties` in coursier's config directory (`COURSIER_CONFIG_DIR`) | mirrors | **live** |
+| Maven `settings.xml` (`~/.m2`, `CS_MAVEN_HOME`, `MAVEN_HOME`, `COURSIER_MAVEN_SETTINGS`) | mirrors, `<server>` credentials for mirrors, proxies | **live** |
+| Scala CLI config (`SCALA_CLI_CONFIG`) | credentials, mirrors, default repositories | ignored since M2: `cs` gets a `SCALA_CLI_CONFIG` that names no file |
+| `COURSIER_CREDENTIALS`, `credentials.properties` | credentials | read by scpm and passed on, one policy for both paths (§5.7) |
+| JVM properties (`https.proxyHost`, …) | proxies | `cs` honours them; it ignores `HTTPS_PROXY`, which the Rust fetcher honours, so the two paths disagree today |
+| `COURSIER_TTL`, `COURSIER_MODE` | cache policy | live |
+
+A mirror from `settings.xml` with `<mirrorOf>*</mirrorOf>`, common in companies, already breaks re-locking: `cs` downloads from the mirror, the URL matches no configured repository, and the lock refuses it (§5.4). The error is loud but baffling.
+
+**Rule: `cs` runs sealed.** scpm resolves every machine setting itself, then hands `cs` exactly that and nothing else:
+
+- `--no-default` and one `--repository` per configured repository, with mirrors already applied (so `cs` asks the mirror directly);
+- `COURSIER_CREDENTIALS` naming scpm's private credentials file (§5.7);
+- `SCALA_CLI_CONFIG` and `COURSIER_MIRRORS` naming files that don't exist, `COURSIER_MAVEN_SETTINGS=false`, and `COURSIER_EXTRA_MIRRORS`, `COURSIER_REPOSITORIES`, `COURSIER_TTL` and `COURSIER_MODE` removed;
+- the resolved proxy as JVM properties (`-J-Dhttps.proxyHost=…`, `-J-Dhttp.nonProxyHosts=…`).
+
+The Rust fetcher gets the same resolved values: the same mirror URL, the same credentials and an explicit proxy, instead of reqwest's own environment lookup. Both paths see identical inputs by construction. The compatibility suite (§5.2) runs a re-lock and a restore under a hostile environment (every source above set to something wrong) and checks they still agree.
+
+**Where machine settings come from**, highest precedence first:
+
+1. **The project declares the need; the machine supplies the secret.** A repository's `credentials: env:ACME_TOKEN` in `scpm.yaml` (§5.7). The requirement is reviewed and committed, only the value is local, and a missing value fails with the variable's name: `repository acme needs ACME_TOKEN, which is not set`. This is the preferred form for anything CI must reach.
+2. **The user config**, scpm's own file for machine settings: `<config dir>/scpm/config.yaml` (`~/.config/scpm` on Linux, `~/Library/Application Support/scpm` on macOS, `%APPDATA%\scpm` on Windows), or the file `SCPM_CONFIG` names. It holds only machine settings, never anything that could change the lock:
+   ```yaml
+   credentials:                       # matched by scheme, host and port, like §5.7; a path prefix narrows it
+     - url: https://acme.jfrog.io
+       token: env:ACME_TOKEN          # bearer; or user/password, each `env:VAR`, `file:PATH` or a literal
+     - url: https://nexus.example.com/repository/
+       user: alice
+       password: file:~/.secrets/nexus
+   mirrors:                           # applied at fetch time, never recorded (§5.4)
+     - url: https://nexus.example.com/repository/maven-public
+       mirrorOf: [central]            # repository ids, URL prefixes, or "*"
+   proxy:
+     https: http://proxy.example.com:3128
+     noProxy: [localhost, .example.com]
+   ```
+   Literal secrets are allowed, as in `credentials.properties`, but scpm warns when the file is readable by group or others. A credential for a mirror is matched against the mirror's URL, not the repository it replaces.
+3. **Compatibility imports**, read by scpm and put through the same policy: coursier's `COURSIER_CREDENTIALS` / `credentials.properties` (§5.7), and the standard `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` variables when the user config sets no proxy. People already have these for sbt and coursier, so they keep working, but scpm reports when it uses them.
+
+**Ignored on purpose:** Maven `settings.xml`, coursier's mirror files and variables, the Scala CLI config, and JVM proxy properties. They belong to other tools, live in places nobody looks (coursier's macOS config directory is `~/Library/Application Support/Coursier`), and reading them live is how the two paths drifted. When one of them configures something for a repository or host the current command uses, scpm prints one notice naming the file and the setting, and how to move it (`scpm config import maven` converts `settings.xml` mirrors, servers and proxies into the user config, once and explicitly). There is no notice for sources that don't touch the repositories in use.
+
+**Seeing it: `scpm config explain`.** Prints, per configured repository, the URL, the effective URL after mirrors, where its credentials come from (the variable or file name, never the value), and the proxy that applies, then every ignored foreign source it found that would have applied. `--json` gives the same for scripts and agents (§9.3).
+
+```text
+$ scpm config explain
+central  https://repo1.maven.org/maven2
+         via mirror https://nexus.example.com/repository/maven-public  (user config)
+         credentials: user alice, password from file ~/.secrets/nexus  (user config)
+         proxy: none (nexus.example.com matches noProxy)
+acme     https://acme.jfrog.io/artifactory/maven
+         credentials: bearer token from env ACME_TOKEN  (scpm.yaml) — not set
+ignored  ~/.m2/settings.xml: mirror "corp" for * (run `scpm config import maven` to use it)
+```
+
+**Not in scope:** proxy authentication, and per-repository proxies. Both wait for a user who needs them; `cs`'s JVM proxy-auth properties need verifying first **[verify]**.
 
 ---
 
