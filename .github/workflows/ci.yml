@@ -4,15 +4,58 @@ on:
   push:
     branches: [main]
 
+# A new push to a PR cancels that PR's run still in progress. Pushes to main are never
+# cancelled, so every main commit gets a complete run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  rust:
+  lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
         with:
           install_args: rust
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+
+  # The integration tests are dominated by JVM start-up, Scala compiles and downloads, on a
+  # 2-vCPU runner, so they are spread over parallel shards (nextest's partitioning splits by
+  # test, not by test binary).
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          install_args: rust
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ matrix.shard == 1 }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # The tests' shared coursier cache (CARGO_TARGET_TMPDIR/coursier-cache), kept between
+      # runs so release artifacts are downloaded once, not on every run and shard.
+      - uses: actions/cache@v4
+        with:
+          path: target/tmp/coursier-cache
+          key: coursier-${{ matrix.shard }}-${{ hashFiles('Cargo.lock', 'crates/scpm/tests/**') }}
+          restore-keys: |
+            coursier-${{ matrix.shard }}-
+            coursier-
+      - run: cargo nextest run --no-fail-fast --partition hash:${{ matrix.shard }}/4
+      - run: cargo test --doc
+        if: matrix.shard == 1
