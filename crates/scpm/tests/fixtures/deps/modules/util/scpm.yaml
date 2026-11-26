@@ -1,0 +1,3 @@
+scala: [catalog, catalog:scala213]
+dependencies:
+  org.typelevel::cats-core: catalog

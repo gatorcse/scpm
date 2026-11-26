@@ -1,0 +1,800 @@
+//! Driving the native coursier CLI (`cs`) and sharing its cache (design §5.2).
+
+use std::collections::BTreeMap;
+use std::env;
+use std::fmt;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde::Deserialize;
+
+use crate::config::{Credentials, Repository};
+
+/// Maven Central, as coursier names it.
+pub const CENTRAL_URL: &str = "https://repo1.maven.org/maven2/";
+
+pub fn user_agent() -> String {
+    format!("scpm/{} (+https://github.com/gatorcse/scpm)", env!("CARGO_PKG_VERSION"))
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CoursierError {
+    #[error("could not run `{bin}`: {source}. Install coursier (https://get-coursier.io) or set SCPM_CS")]
+    Spawn { bin: String, source: std::io::Error },
+    #[error("coursier failed:\n{0}")]
+    Failed(String),
+    #[error("unexpected coursier output: {0}")]
+    Output(String),
+    #[error("{0}")]
+    Config(String),
+    #[error("{0} resolved to no file; check its `type` and `classifier`")]
+    NoArtifact(String),
+}
+
+/// A configured repository. Credentials stay environment variable names until a request
+/// actually needs them (design §5.7), so cached operations work without the secrets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Repo {
+    pub id: String,
+    /// Always ends with `/`.
+    pub url: String,
+    pub credentials: Option<RepoCredentials>,
+}
+
+/// Where a repository's configured credentials come from: environment variable names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoCredentials {
+    Bearer { token_var: String },
+    Basic { user_var: String, password_var: String },
+}
+
+#[derive(Clone, PartialEq)]
+pub enum Auth {
+    Bearer(String),
+    Basic { user: String, password: String },
+}
+
+impl fmt::Debug for Auth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Auth::Bearer(_) => f.write_str("Bearer(<redacted>)"),
+            Auth::Basic { user, .. } => {
+                f.debug_struct("Basic").field("user", user).field("password", &"<redacted>").finish()
+            }
+        }
+    }
+}
+
+impl Auth {
+    /// The user name coursier sends (and puts in cache paths): bearer tokens go as the
+    /// password of the user `token` (design §5.7).
+    pub fn user(&self) -> &str {
+        match self {
+            Auth::Bearer(_) => "token",
+            Auth::Basic { user, .. } => user,
+        }
+    }
+
+    fn password(&self) -> &str {
+        match self {
+            Auth::Bearer(token) => token,
+            Auth::Basic { password, .. } => password,
+        }
+    }
+}
+
+impl Repo {
+    /// `host[:port]` of the URL.
+    pub fn host(&self) -> Option<&str> {
+        self.url.split_once("://").map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+    }
+
+    /// The configured credentials, read from the environment. A missing or empty variable is
+    /// an error, which callers raise only when the repository is actually contacted.
+    pub fn auth(&self) -> Result<Option<Auth>, CoursierError> {
+        let read = |var: &str, what: &str| -> Result<String, CoursierError> {
+            match env::var(var) {
+                Ok(v) if !v.is_empty() => Ok(v),
+                Ok(_) => Err(CoursierError::Config(format!(
+                    "repository `{}`: environment variable `{var}` ({what}) is empty",
+                    self.id
+                ))),
+                Err(_) => Err(CoursierError::Config(format!(
+                    "repository `{}`: environment variable `{var}` ({what}) is not set",
+                    self.id
+                ))),
+            }
+        };
+        Ok(match &self.credentials {
+            None => None,
+            Some(RepoCredentials::Bearer { token_var }) => Some(Auth::Bearer(read(token_var, "token")?)),
+            Some(RepoCredentials::Basic { user_var, password_var }) => {
+                Some(Auth::Basic { user: read(user_var, "user")?, password: read(password_var, "password")? })
+            }
+        })
+    }
+
+    /// The user in coursier's cache path for configured credentials, if known without the
+    /// password (`token` for bearer tokens; the user variable for basic auth).
+    pub fn configured_user(&self) -> Option<String> {
+        match &self.credentials {
+            None => None,
+            Some(RepoCredentials::Bearer { .. }) => Some("token".to_string()),
+            Some(RepoCredentials::Basic { user_var, .. }) => env::var(user_var).ok().filter(|u| !u.is_empty()),
+        }
+    }
+}
+
+/// Resolves repository config (`central` or full definitions). Credentials must be
+/// `env:VARIABLE`; the variables are read later, when needed.
+pub fn repositories(config: &[Repository]) -> Result<Vec<Repo>, CoursierError> {
+    let env_name = |id: &str, value: &str, what: &str| -> Result<String, CoursierError> {
+        let Some(var) = value.strip_prefix("env:") else {
+            return Err(CoursierError::Config(format!(
+                "repository `{id}`: {what} must be `env:VARIABLE` so secrets stay out of the workspace file"
+            )));
+        };
+        let var = var.trim();
+        if var.is_empty() {
+            return Err(CoursierError::Config(format!("repository `{id}`: {what} is `env:` without a variable name")));
+        }
+        Ok(var.to_string())
+    };
+    config
+        .iter()
+        .map(|r| match r {
+            Repository::Named(name) if name == "central" => {
+                Ok(Repo { id: "central".into(), url: CENTRAL_URL.into(), credentials: None })
+            }
+            Repository::Named(name) => Err(CoursierError::Config(format!(
+                "unknown repository `{name}`; the only built-in name is `central`, others need `{{id, url}}`"
+            ))),
+            Repository::Full(def) => {
+                let credentials = match &def.credentials {
+                    None => None,
+                    Some(Credentials::Bearer(token)) => {
+                        Some(RepoCredentials::Bearer { token_var: env_name(&def.id, token, "token")? })
+                    }
+                    Some(Credentials::Basic { user, password }) => Some(RepoCredentials::Basic {
+                        user_var: env_name(&def.id, user, "user")?,
+                        password_var: env_name(&def.id, password, "password")?,
+                    }),
+                };
+                let url = if def.url.ends_with('/') { def.url.clone() } else { format!("{}/", def.url) };
+                Ok(Repo { id: def.id.clone(), url, credentials })
+            }
+        })
+        .collect()
+}
+
+/// The coursier cache directory: `COURSIER_CACHE`, the legacy `~/.coursier/cache/v1` if it
+/// exists, then the platform default.
+pub fn cache_dir() -> PathBuf {
+    if let Some(dir) = env::var_os("COURSIER_CACHE").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(home) = dirs::home_dir() {
+        let legacy = home.join(".coursier/cache/v1");
+        if legacy.is_dir() {
+            return legacy;
+        }
+    }
+    let base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".cache"));
+    if cfg!(target_os = "macos") {
+        base.join("Coursier/v1")
+    } else if cfg!(windows) {
+        base.join("Coursier/Cache/v1")
+    } else {
+        base.join("coursier/v1")
+    }
+}
+
+/// Where coursier stores the file for `url` (mirrors `coursier.paths.CachePath.localFile`).
+pub fn cache_path(cache: &Path, url: &str, user: Option<&str>) -> Option<PathBuf> {
+    let (protocol, rest) = url.split_once("://")?;
+    let user_part = user.map(|u| format!("{u}@")).unwrap_or_default();
+    Some(cache.join(escape(&format!("{protocol}/{user_part}{rest}"))))
+}
+
+/// The cached file for `url` downloaded with *some* user (`<protocol>/<user>@<host>/…`), for
+/// when the user isn't known (its environment variable is unset) but the file may be cached.
+pub fn cached_with_any_user(cache: &Path, url: &str) -> Option<PathBuf> {
+    let (protocol, rest) = url.split_once("://")?;
+    let (host, path) = rest.split_once('/')?;
+    let suffix = escape(&format!("@{host}"));
+    let rel_path = escape(path);
+    std::fs::read_dir(cache.join(protocol))
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(&suffix)))
+        .map(|e| e.path().join(&rel_path))
+        .find(|p| p.is_file())
+}
+
+/// Coursier's escaping: unsafe characters become `%XX`; `/` is kept.
+fn escape(input: &str) -> String {
+    let to_hex =
+        |n: u16| char::from_u32(if n < 10 { '0' as u32 + n as u32 } else { 'A' as u32 + n as u32 - 10 }).unwrap_or('?');
+    let mut out = String::with_capacity(input.len());
+    for unit in input.encode_utf16() {
+        let unsafe_char = unit > 128 || char::from_u32(unit as u32).is_some_and(|c| " %$&+,:;=?@<>#".contains(c));
+        if unsafe_char {
+            out.push('%');
+            out.push(to_hex(unit / 16));
+            out.push(to_hex(unit % 16));
+        } else {
+            out.push(char::from_u32(unit as u32).unwrap_or('?'));
+        }
+    }
+    out
+}
+
+/// The URL a cached file was downloaded from (inverse of [`cache_path`]).
+pub fn url_from_cache_path(cache: &Path, file: &Path) -> Option<String> {
+    let rel = file.strip_prefix(cache).ok()?;
+    let rel = rel.to_str()?.replace('\\', "/");
+    let (protocol, rest) = rel.split_once('/')?;
+    let rest = unescape(rest);
+    // Drop a `user@` prefix on the host.
+    let rest = match rest.split_once('/') {
+        Some((host, path)) => match host.rsplit_once('@') {
+            Some((_, h)) => format!("{h}/{path}"),
+            None => format!("{host}/{path}"),
+        },
+        None => rest,
+    };
+    Some(format!("{protocol}://{rest}"))
+}
+
+fn unescape(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("zz"), 16)
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The `cs` binary: `SCPM_CS` or `cs` on `PATH`.
+fn cs_binary() -> String {
+    env::var("SCPM_CS").unwrap_or_else(|_| "cs".to_string())
+}
+
+/// One coursier resolution.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct ResolveRequest {
+    /// Dependencies in coursier's string syntax, e.g. `org:name_3:1.0,exclude=org%x`.
+    pub dependencies: Vec<String>,
+    /// Dependencies fetched without their own dependencies (`--intransitive`).
+    pub intransitive: Vec<String>,
+    pub boms: Vec<String>,
+    /// Forced versions, `org:name:version`.
+    pub forced: Vec<String>,
+    pub jdk_version: Option<String>,
+}
+
+/// A resolved artifact, in classpath order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedArtifact {
+    /// `group:artifact:version[:classifier][@type]` (design §5.4).
+    pub key: String,
+    pub file: PathBuf,
+    pub url: String,
+}
+
+#[derive(Deserialize)]
+struct Report {
+    dependencies: Vec<ReportDep>,
+}
+
+#[derive(Deserialize)]
+struct ReportDep {
+    coord: String,
+    file: Option<String>,
+}
+
+/// A root dependency string's parts: `(org, name, classifier, type)`.
+fn dependency_parts(dep: &str) -> (&str, &str, Option<&str>, Option<&str>) {
+    let mut params = dep.split(',');
+    let mut coord = params.next().unwrap_or_default().split(':');
+    let (org, name) = (coord.next().unwrap_or_default(), coord.next().unwrap_or_default());
+    let (mut classifier, mut kind) = (None, None);
+    for p in params {
+        if let Some(c) = p.strip_prefix("classifier=") {
+            classifier = Some(c);
+        } else if let Some(t) = p.strip_prefix("type=") {
+            kind = Some(t);
+        }
+    }
+    (org, name, classifier, kind)
+}
+
+/// Artifact types coursier keeps (`-A`): its defaults plus whatever the roots declare, so
+/// `sources`/`javadoc` classifiers and types such as `exe` or `aar` are not dropped.
+fn artifact_types(req: &ResolveRequest) -> Vec<String> {
+    let mut types: Vec<String> = ["jar", "bundle", "test-jar"].map(String::from).to_vec();
+    for dep in req.dependencies.iter().chain(&req.intransitive) {
+        let (_, _, classifier, kind) = dependency_parts(dep);
+        let implied = match classifier {
+            Some("sources") => Some("src"),
+            Some("javadoc") => Some("doc"),
+            _ => None,
+        };
+        for t in [kind, implied].into_iter().flatten() {
+            if t != "pom" && !types.iter().any(|x| x == t) {
+                types.push(t.to_string());
+            }
+        }
+    }
+    types
+}
+
+/// `(group, artifact, classifier)` of a report coordinate (`g:a:v` or `g:a:type:classifier:v`).
+fn report_parts(coord: &str) -> Option<(&str, &str, &str)> {
+    let parts: Vec<&str> = coord.split(':').collect();
+    match parts.as_slice() {
+        [g, a, _] | [g, a, _, _] => Some((g, a, "")),
+        [g, a, _, c, _] => Some((g, a, c)),
+        _ => None,
+    }
+}
+
+/// Runs `cs fetch` and returns the classpath with each artifact's URL.
+pub fn resolve(
+    req: &ResolveRequest,
+    repos: &[Repo],
+    cache: &Path,
+    scratch: &Path,
+) -> Result<Vec<ResolvedArtifact>, CoursierError> {
+    let report_path = scratch.join(format!("report-{}.json", unique_suffix()));
+    let mut cmd = Command::new(cs_binary());
+    cmd.arg("fetch").arg("--quiet").arg("--classpath").arg("--json-output-file").arg(&report_path);
+    cmd.arg("--artifact-type").arg(artifact_types(req).join(","));
+    let common = add_common_args(&mut cmd, repos, cache)?;
+    add_request_args(&mut cmd, req);
+    let out = cmd.output().map_err(|source| CoursierError::Spawn { bin: cs_binary(), source })?;
+    if !out.status.success() {
+        let _ = fs::remove_file(&report_path);
+        return Err(common.failure(&out.stderr));
+    }
+    let report_text = fs::read_to_string(&report_path).map_err(|e| CoursierError::Output(e.to_string()))?;
+    let _ = fs::remove_file(&report_path);
+    let report: Report = serde_json::from_str(&report_text).map_err(|e| CoursierError::Output(e.to_string()))?;
+
+    // A root that asks for a specific artifact (a classifier or a non-jar type) must yield a
+    // file. Plain coordinates may legitimately have none: `<packaging>pom</packaging>`
+    // aggregators such as groovy-all.
+    for dep in req.dependencies.iter().chain(&req.intransitive) {
+        let (org, name, classifier, kind) = dependency_parts(dep);
+        if classifier.is_none() && kind.is_none_or(|k| matches!(k, "jar" | "bundle" | "pom")) {
+            continue;
+        }
+        let want = classifier.unwrap_or(if kind == Some("test-jar") { "tests" } else { "" });
+        let found = report.dependencies.iter().any(|d| {
+            d.file.is_some() && report_parts(&d.coord).is_some_and(|(g, a, c)| g == org && a == name && c == want)
+        });
+        if !found {
+            return Err(CoursierError::NoArtifact(dep.clone()));
+        }
+    }
+
+    let mut by_file: BTreeMap<&str, String> = BTreeMap::new();
+    for dep in &report.dependencies {
+        let Some(file) = &dep.file else { continue };
+        let key = artifact_key(&dep.coord, Path::new(file))
+            .ok_or_else(|| CoursierError::Output(format!("coordinate `{}`", dep.coord)))?;
+        by_file.insert(file.as_str(), key);
+    }
+    let classpath = String::from_utf8_lossy(&out.stdout);
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let mut result = Vec::new();
+    for entry in classpath.trim().split(sep).filter(|e| !e.is_empty()) {
+        let file = PathBuf::from(entry);
+        let key = by_file
+            .get(entry)
+            .ok_or_else(|| CoursierError::Output(format!("classpath entry {entry} missing from the report")))?;
+        let url = url_from_cache_path(cache, &file).ok_or_else(|| {
+            CoursierError::Output(format!("{entry} is not inside the coursier cache {}", cache.display()))
+        })?;
+        result.push(ResolvedArtifact { key: key.clone(), file, url });
+    }
+    Ok(result)
+}
+
+/// Asks coursier which dependency chains in `req` lead to `module` (`org:name`), via
+/// `cs resolve --what-depends-on`. Each chain runs from a root of the request to the module.
+pub fn what_depends_on(
+    req: &ResolveRequest,
+    module: &str,
+    repos: &[Repo],
+    cache: &Path,
+) -> Result<Vec<Vec<String>>, CoursierError> {
+    let mut cmd = Command::new(cs_binary());
+    cmd.arg("resolve").arg("--quiet").arg("--what-depends-on").arg(module);
+    let common = add_common_args(&mut cmd, repos, cache)?;
+    add_request_args(&mut cmd, req);
+    let out = cmd.output().map_err(|source| CoursierError::Spawn { bin: cs_binary(), source })?;
+    if !out.status.success() {
+        return Err(common.failure(&out.stderr));
+    }
+    let roots: Vec<String> = req
+        .dependencies
+        .iter()
+        .chain(&req.intransitive)
+        .map(|d| {
+            let (org, name, _, _) = dependency_parts(d);
+            format!("{org}:{name}")
+        })
+        .collect();
+    Ok(reverse_tree_chains(&String::from_utf8_lossy(&out.stdout), &roots))
+}
+
+/// Turns coursier's reversed tree (the module at the root, dependees as children) into chains
+/// from each root of the resolution (`org:name` in `roots`, or a leaf) down to the module.
+fn reverse_tree_chains(tree: &str, roots: &[String]) -> Vec<Vec<String>> {
+    let nodes: Vec<(usize, String)> = tree
+        .lines()
+        .map(strip_ansi)
+        .filter_map(|line| {
+            let start = line.char_indices().find(|(_, c)| c.is_ascii_alphanumeric())?.0;
+            let depth = line[..start].chars().count() / 3;
+            let coord = line[start..].split_whitespace().next()?.to_string();
+            (depth > 0).then(|| (depth - 1, coord))
+        })
+        .collect();
+    let mut chains: Vec<Vec<String>> = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    for (i, (depth, coord)) in nodes.iter().enumerate() {
+        stack.truncate(*depth);
+        stack.push(coord.clone());
+        let leaf = nodes.get(i + 1).is_none_or(|(next, _)| next <= depth);
+        let module: String = coord.split(':').take(2).collect::<Vec<_>>().join(":");
+        if leaf || roots.contains(&module) {
+            let chain: Vec<String> = stack.iter().rev().cloned().collect();
+            if !chains.contains(&chain) {
+                chains.push(chain);
+            }
+        }
+    }
+    chains
+}
+
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Lists the available versions of `org:name` (ascending, as coursier prints them).
+pub fn list_versions(org: &str, name: &str, repos: &[Repo], cache: &Path) -> Result<Vec<String>, CoursierError> {
+    let mut cmd = Command::new(cs_binary());
+    cmd.arg("complete-dep").arg("--quiet");
+    let common = add_common_args(&mut cmd, repos, cache)?;
+    cmd.arg(format!("{org}:{name}:"));
+    let out = cmd.output().map_err(|source| CoursierError::Spawn { bin: cs_binary(), source })?;
+    if !out.status.success() {
+        return Err(common.failure(&out.stderr));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn add_request_args(cmd: &mut Command, req: &ResolveRequest) {
+    for bom in &req.boms {
+        cmd.arg("--bom").arg(bom);
+    }
+    for forced in &req.forced {
+        cmd.arg("--force-version").arg(forced);
+    }
+    if let Some(jdk) = &req.jdk_version {
+        cmd.arg("--jdk-version").arg(jdk);
+    }
+    for dep in &req.intransitive {
+        cmd.arg("--intransitive").arg(dep);
+    }
+    cmd.args(&req.dependencies);
+}
+
+/// State that must outlive a `cs` invocation: the credential file, and notes about
+/// credentials that could not be read (reported only if coursier then fails).
+struct CommonArgs {
+    _credential_file: Option<tempfile::NamedTempFile>,
+    missing_credentials: Vec<String>,
+}
+
+impl CommonArgs {
+    fn failure(&self, stderr: &[u8]) -> CoursierError {
+        let mut msg = clean_stderr(stderr);
+        for note in &self.missing_credentials {
+            msg.push_str(&format!("\n  note: {note}"));
+        }
+        CoursierError::Failed(msg)
+    }
+}
+
+/// Cache, repositories and credentials. Secrets never go on the command line: configured
+/// credentials are written to a private (0600) temporary `--credential-file`.
+fn add_common_args(cmd: &mut Command, repos: &[Repo], cache: &Path) -> Result<CommonArgs, CoursierError> {
+    cmd.arg("--cache").arg(cache).arg("--no-default").arg("--user-agent").arg(user_agent());
+    let mut properties = String::new();
+    let mut missing_credentials = Vec::new();
+    for (i, repo) in repos.iter().enumerate() {
+        cmd.arg("--repository").arg(&repo.url);
+        let Some(host) = repo.host() else { continue };
+        match repo.auth() {
+            Ok(Some(auth)) => {
+                let https_only = !repo.url.starts_with("http://");
+                properties.push_str(&format!(
+                    "scpm{i}.host={}\nscpm{i}.username={}\nscpm{i}.password={}\nscpm{i}.auto=true\nscpm{i}.https-only={https_only}\n",
+                    escape_property(crate::credentials::hostname(host)),
+                    escape_property(auth.user()),
+                    escape_property(auth.password()),
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => missing_credentials.push(e.to_string()),
+        }
+    }
+    let credential_file = if properties.is_empty() {
+        None
+    } else {
+        // NamedTempFile is created with mode 0600 on Unix.
+        let mut file = tempfile::Builder::new()
+            .prefix("scpm-credentials-")
+            .suffix(".properties")
+            .tempfile()
+            .map_err(|e| CoursierError::Config(format!("cannot create a credentials file: {e}")))?;
+        file.write_all(properties.as_bytes())
+            .and_then(|()| file.flush())
+            .map_err(|e| CoursierError::Config(format!("cannot write a credentials file: {e}")))?;
+        cmd.arg("--credential-file").arg(file.path());
+        Some(file)
+    };
+    Ok(CommonArgs { _credential_file: credential_file, missing_credentials })
+}
+
+/// Escapes a value for a Java properties file.
+fn escape_property(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' | '=' | ':' | '#' | '!' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    if out.starts_with(' ') {
+        out.insert(0, '\\');
+    }
+    out
+}
+
+/// Drops JVM/native-image noise (e.g. `sun.misc.Unsafe` warnings) from coursier's stderr.
+fn clean_stderr(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr).lines().filter(|l| !l.starts_with("WARNING:")).collect::<Vec<_>>().join("\n")
+}
+
+fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!("{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Builds a lock key from coursier's report coordinate (`g:a:v` or `g:a:type:classifier:v`)
+/// and the file's extension.
+pub fn artifact_key(coord: &str, file: &Path) -> Option<String> {
+    let parts: Vec<&str> = coord.split(':').collect();
+    let (group, artifact, classifier, version) = match parts.as_slice() {
+        [g, a, v] | [g, a, _, v] => (*g, *a, None, *v),
+        [g, a, _ty, c, v] => (*g, *a, (!c.is_empty()).then_some(*c), *v),
+        _ => return None,
+    };
+    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("jar");
+    let mut key = format!("{group}:{artifact}:{version}");
+    if let Some(c) = classifier {
+        key.push(':');
+        key.push_str(c);
+    }
+    if ext != "jar" {
+        key.push('@');
+        key.push_str(ext);
+    }
+    Some(key)
+}
+
+/// The Maven repository path for a lock key: `g/r/o/u/p/artifact/version/artifact-version[-classifier].ext`.
+pub fn maven_path(key: &str) -> Option<String> {
+    let (coords, ext) = match key.split_once('@') {
+        Some((c, e)) => (c, e),
+        None => (key, "jar"),
+    };
+    let parts: Vec<&str> = coords.split(':').collect();
+    let (group, artifact, version, classifier) = match parts.as_slice() {
+        [g, a, v] => (*g, *a, *v, None),
+        [g, a, v, c] => (*g, *a, *v, Some(*c)),
+        _ => return None,
+    };
+    let suffix = classifier.map(|c| format!("-{c}")).unwrap_or_default();
+    Some(format!("{}/{artifact}/{version}/{artifact}-{version}{suffix}.{ext}", group.replace('.', "/")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_paths_round_trip() {
+        let cache = Path::new("/c");
+        let url = "https://repo1.maven.org/maven2/org/typelevel/cats-core_3/2.13.0/cats-core_3-2.13.0.jar";
+        let path = cache_path(cache, url, None).unwrap();
+        assert_eq!(
+            path,
+            Path::new("/c/https/repo1.maven.org/maven2/org/typelevel/cats-core_3/2.13.0/cats-core_3-2.13.0.jar")
+        );
+        assert_eq!(url_from_cache_path(cache, &path).unwrap(), url);
+    }
+
+    #[test]
+    fn escaping_matches_coursier() {
+        assert_eq!(escape("https/host:8443/a b+c"), "https/host%3A8443/a%20b%2Bc");
+        let path = cache_path(Path::new("/c"), "https://h.example/p/x.jar", Some("alice")).unwrap();
+        assert_eq!(path, Path::new("/c/https/alice%40h.example/p/x.jar"));
+        assert_eq!(url_from_cache_path(Path::new("/c"), &path).unwrap(), "https://h.example/p/x.jar");
+    }
+
+    #[test]
+    fn keys_and_paths() {
+        let key =
+            artifact_key("io.netty:netty-transport-native-epoll:jar:linux-x86_64:4.1.115.Final", Path::new("x.jar"))
+                .unwrap();
+        assert_eq!(key, "io.netty:netty-transport-native-epoll:4.1.115.Final:linux-x86_64");
+        assert_eq!(
+            maven_path(&key).unwrap(),
+            "io/netty/netty-transport-native-epoll/4.1.115.Final/netty-transport-native-epoll-4.1.115.Final-linux-x86_64.jar"
+        );
+        let aar = artifact_key("g.x:a:1.0", Path::new("a-1.0.aar")).unwrap();
+        assert_eq!(aar, "g.x:a:1.0@aar");
+        assert_eq!(maven_path(&aar).unwrap(), "g/x/a/1.0/a-1.0.aar");
+    }
+
+    fn repo_with(credentials: Credentials) -> Result<Vec<Repo>, CoursierError> {
+        repositories(&[Repository::Full(crate::config::RepositoryDef {
+            id: "acme".into(),
+            url: "https://acme.example/maven".into(),
+            credentials: Some(credentials),
+        })])
+    }
+
+    #[test]
+    fn literal_credentials_are_rejected() {
+        let err = repo_with(Credentials::Bearer("hunter2".into())).unwrap_err().to_string();
+        assert!(err.contains("env:VARIABLE") && !err.contains("hunter2"), "{err}");
+        let err = repo_with(Credentials::Bearer("env:".into())).unwrap_err().to_string();
+        assert!(err.contains("without a variable name"), "{err}");
+    }
+
+    #[test]
+    fn credentials_are_read_only_when_needed() {
+        // Unset variables are fine until a request needs them.
+        let var = "SCPM_TEST_SURELY_UNSET_TOKEN";
+        let repos = repo_with(Credentials::Bearer(format!("env:{var}"))).unwrap();
+        assert_eq!(repos[0].configured_user().as_deref(), Some("token"));
+        let err = repos[0].auth().unwrap_err().to_string();
+        assert!(err.contains(var) && err.contains("not set"), "{err}");
+        let repos =
+            repo_with(Credentials::Basic { user: format!("env:{var}_U"), password: format!("env:{var}_P") }).unwrap();
+        assert_eq!(repos[0].configured_user(), None);
+    }
+
+    #[test]
+    fn auth_debug_redacts_secrets() {
+        let basic = Auth::Basic { user: "alice".into(), password: "hunter2".into() };
+        let bearer = Auth::Bearer("tok3n".into());
+        let shown = format!("{basic:?} {bearer:?}");
+        assert!(shown.contains("alice") && !shown.contains("hunter2") && !shown.contains("tok3n"), "{shown}");
+    }
+
+    #[test]
+    fn credential_file_never_reaches_argv() {
+        let mut cmd = Command::new("cs");
+        let repos = vec![Repo { id: "r".into(), url: "http://127.0.0.1:8080/m/".into(), credentials: None }];
+        let common = add_common_args(&mut cmd, &repos, Path::new("/c")).unwrap();
+        assert!(common._credential_file.is_none());
+        assert!(!cmd.get_args().any(|a| a == "--credential-file" || a == "--credentials"));
+    }
+
+    #[test]
+    fn property_escaping() {
+        assert_eq!(escape_property("a=b:c\\d#"), "a\\=b\\:c\\\\d\\#");
+        let parsed = crate::credentials::parse_properties(&format!(
+            "x.host=h\nx.username=u\nx.password={}\n",
+            escape_property("p=a:s#s\\")
+        ));
+        assert_eq!(parsed[0].password, "p=a:s#s\\");
+    }
+
+    #[test]
+    fn artifact_types_follow_the_roots() {
+        let req = ResolveRequest {
+            dependencies: vec![
+                "org.slf4j:slf4j-api:2.0.17,classifier=sources".into(),
+                "com.google.protobuf:protoc:3.25.1,classifier=linux-x86_64,type=exe".into(),
+                "g:bom:1,type=pom".into(),
+            ],
+            intransitive: vec!["g:a:1,classifier=javadoc".into()],
+            ..Default::default()
+        };
+        assert_eq!(artifact_types(&req), ["jar", "bundle", "test-jar", "src", "exe", "doc"]);
+        assert_eq!(dependency_parts("g:a:1,exclude=x%y,classifier=c,type=t"), ("g", "a", Some("c"), Some("t")));
+    }
+
+    #[test]
+    fn reverse_trees_become_chains() {
+        let tree = "\u{1b}[0m└─ org.typelevel:cats-kernel_3:2.13.0\n\
+                    \x20  └─ org.typelevel:cats-core_3:2.13.0\n\
+                    \x20     ├─ io.circe:circe-core_3:0.14.14\n\
+                    \x20     └─ org.typelevel:cats-effect-kernel_3:3.5.7 \u{1b}[31morg.typelevel:cats-core_3:2.9.0 -> 2.13.0\u{1b}[0m\n\
+                    \x20        ├─ org.typelevel:cats-effect-std_3:3.5.7\n\
+                    \x20        │  └─ org.typelevel:cats-effect_3:3.5.7\n\
+                    \x20        └─ org.typelevel:cats-effect_3:3.5.7\n";
+        let roots = ["org.typelevel:cats-core_3".to_string()];
+        let chains = reverse_tree_chains(tree, &roots);
+        assert_eq!(
+            chains,
+            vec![
+                vec!["org.typelevel:cats-core_3:2.13.0", "org.typelevel:cats-kernel_3:2.13.0"],
+                vec![
+                    "io.circe:circe-core_3:0.14.14",
+                    "org.typelevel:cats-core_3:2.13.0",
+                    "org.typelevel:cats-kernel_3:2.13.0"
+                ],
+                vec![
+                    "org.typelevel:cats-effect_3:3.5.7",
+                    "org.typelevel:cats-effect-std_3:3.5.7",
+                    "org.typelevel:cats-effect-kernel_3:3.5.7",
+                    "org.typelevel:cats-core_3:2.13.0",
+                    "org.typelevel:cats-kernel_3:2.13.0"
+                ],
+                vec![
+                    "org.typelevel:cats-effect_3:3.5.7",
+                    "org.typelevel:cats-effect-kernel_3:3.5.7",
+                    "org.typelevel:cats-core_3:2.13.0",
+                    "org.typelevel:cats-kernel_3:2.13.0"
+                ],
+            ]
+        );
+        assert_eq!(reverse_tree_chains("└─ g:a:1\n", &[]), vec![vec!["g:a:1"]]);
+        assert!(reverse_tree_chains("", &[]).is_empty());
+    }
+}

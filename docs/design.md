@@ -470,8 +470,9 @@ The **one thing Rust does natively is restoring from the lockfile**, which is no
 - path: `<cache>/https/<host>/<path>`, with coursier's escaping rules;
 - write `.part` then rename;
 - take POSIX `fcntl` locks to interoperate with the JVM's `FileChannel.lock` (**[verify on macOS]**);
-- write checksum sidecars that match coursier's auxiliary file naming (e.g. `.<file>__sha1`), so coursier's own checks pass;
-- authenticate with the repository's `credentials` and coursier's own credentials (§5.7).
+- write no checksum sidecars: the sha256 from the lock is the check, and coursier fetches `.sha1` files on demand when it next verifies a file; files already in the cache are trusted when their size matches the lock, and `scpm install --verify` re-hashes them (re-downloading any that don't match);
+- retry 429/5xx, transport errors and truncated bodies (a byte count other than the locked `size`), honouring `Retry-After` up to 30s;
+- authenticate with the repository's `credentials` and, for repositories without them, coursier's own credential sources (§5.7), putting the matched user in the cache path (`<protocol>/<user>@<host>/…`) as coursier's `FileCache` does.
 
 Release artifacts are immutable, so this is safe. Changing (`-SNAPSHOT`) artifacts are always delegated to coursier.
 
@@ -520,6 +521,7 @@ Design goals, taking lessons from pnpm 12's experimental v13 lockfile format: fe
 ```yaml
 lockfileVersion: 1
 resolutionContext: { os: linux, arch: x86_64, jdk: 25 }   # see below; a change re-locks every variant
+bootInputs: sha256:…             # repositories + resolution context; a change re-resolves every boot entry
 
 boot:                            # everything needed before a JVM starts; lists reference `artifacts`
   jdk:                           # project JDK per os-arch; Phase 1 records only the JVM index id
@@ -527,6 +529,7 @@ boot:                            # everything needed before a JVM starts; lists 
     macos-aarch64: { id: temurin:25.0.1 }
   scala-compiler@3.9.0: [org.scala-lang:scala3-compiler_3:3.9.0, org.scala-lang:scala3-library_3:3.9.0, …]
   compiler-bridge@3.9.0: [org.scala-lang:scala3-sbt-bridge:3.9.0]
+  compiler-bridge@2.13.18+zinc-2.1.0: [org.scala-sbt:compiler-bridge_2.13:2.1.0]   # Scala 2 bridges come from Zinc
   worker: [dev.scpm:scpm-worker_3:0.4.2, …]
   test-runner: [dev.scpm:scpm-test-runner_3:0.4.2, org.scala-sbt:test-interface:1.0, …]
   tools:
@@ -558,7 +561,6 @@ artifacts:                       # group:artifact:version[:classifier][@type]; o
     repo: central                # repository id from config, never a mirror
     sha256: …
     size: 6012345
-    deps: [org.typelevel:cats-kernel_3:2.13.0]
   io.netty:netty-transport-native-epoll:4.1.115.Final:linux-x86_64: { … }
 ```
 
@@ -577,20 +579,20 @@ Each variant locks four ordered classpaths:
 - **Resolution is joint over the variant's transitive workspace closure.** A variant's external dependencies are resolved in one coursier call together with those of every upstream variant, so if A depends on B, A's classpaths hold one version of each library for both A's and B's code.
 - **Catalog ranges are resolved once per (platform, Scala binary version) for the whole workspace**, so every variant that uses that catalog entry on that platform and Scala binary version gets the same version. The selection lives in the lock's top-level `catalogs` section, keyed `<catalog>/<key>@<platform>-<scala binary>`. Re-locking a stale variant reuses an existing selection whose range is unchanged; only `scpm update` re-selects, and it then re-locks every variant that uses the entry.
 - **`specifiers`** records each direct dependency's spec as written and the version scpm selected for it (§5.5), before coursier's reconciliation, like pnpm's importers. `workspace:*` entries have no version.
-- **`inputsHash`** is a sha256 over every effective input that affects the variant's resolution, after presets and `variants` (§4.4): platform and full Scala version, dependencies of every scope (catalog references replaced by their entries), `compilerPlugins`, BOMs, overrides, repositories, the resolution context and `policy.minimumReleaseAge` / `minimumReleaseAgeExclude`, plus the same for every upstream variant in its workspace closure, since those are resolved jointly.
+- **`inputsHash`** is a sha256 over every effective input that affects the variant's resolution, after presets and `variants` (§4.4): platform and full Scala version, dependencies of every scope (catalog references replaced by their entries), `compilerPlugins`, BOMs, overrides, repositories (ids and URLs), the resolution context and `policy.minimumReleaseAge` / `minimumReleaseAgeExclude`, plus what joint resolution consumes from each upstream variant in its workspace closure: its compile and runtime dependencies, BOMs and Scala version. An upstream variant's test or provided dependencies and compiler plugins don't affect downstream variants, so editing them re-locks only that variant.
 - A variant with `compilerPlugins` also has an ordered `compilerPlugins` list.
 
-**Artifacts** are keyed `group:artifact:version[:classifier][@type]`, with `@type` omitted for `jar`. Each file has one entry, shared by every variant that uses it; `deps` lists its direct dependencies for `scpm why`. **Sources jars are not in the lock.** They are IDE-only, fetched on demand and verified against the repository's checksum.
+**Artifacts** are keyed `group:artifact:version[:classifier][@type]`, with `@type` omitted for `jar`. Each file has one entry, shared by every variant that uses it, holding `repo`, `sha256` and `size`. The lock records no dependency graph between artifacts: it would depend on the order variants happened to be locked in, so `scpm why` asks coursier instead (below). Declared classifiers and types (`classifier: sources`, `type: exe`, `aar`, `test-jar`, `bundle`, …) are locked like any other file, and a direct dependency that resolves to no file is an error naming it. **IDE sources jars are not in the lock.** They are fetched on demand and verified against the repository's checksum.
 
-**Boot** holds the closures of the Scala compiler, compiler bridge, scpm worker, test runner and tools (scalafmt, scalafix), each a list of references into `artifacts`. A CI run can then fetch everything it needs in parallel from Rust before any JVM starts. `boot.jdk` is the project JDK (§6.3), keyed by `os-arch` (`linux-x86_64`, `macos-aarch64`, …). In Phase 1 it records only the JVM index id, which `cs java-home --jvm <id>` turns into a cached JDK; the Rust JDK fetcher (Phase 3) adds a URL and sha256 per entry.
+**Boot** holds the closures of the Scala compiler, compiler bridge, scpm worker, test runner and tools (scalafmt, scalafix), each a list of references into `artifacts`. A CI run can then fetch everything it needs in parallel from Rust before any JVM starts. `boot.jdk` is the project JDK (§6.3), keyed by `os-arch` (`linux-x86_64`, `macos-aarch64`, …). In Phase 1 it records only the JVM index id, which `cs java-home --jvm <id>` turns into a cached JDK; the Rust JDK fetcher (Phase 3) adds a URL and sha256 per entry. Boot entries re-resolve when their inputs change: a Scala 2 compiler bridge's key carries the Zinc version (`compiler-bridge@2.13.18+zinc-2.1.0`), and the top-level `bootInputs` hash covers the repositories and the resolution context, so changing either re-resolves every boot entry.
 
 #### Resolution context and repositories
 
 - **Resolution uses a fixed, declared context**, never the machine's own: by default `{os: linux, arch: x86_64, jdk: <project JDK major>}`, configurable as `lock.resolutionContext` in the workspace. It is passed to coursier, so a lock made on macOS equals one made on Linux. The lock records it, and a change re-locks every variant.
-  - **Phase 1 limit:** the native `cs` CLI exposes only `--jdk-version`, so Phase 1 applies the JDK part of the context; OS and architecture profile activation follows the machine running `cs` until the resolver sidecar (Phase 3) passes them through the coursier API. The Phase 0 resolve spike checks how often this matters in practice. To keep the gap visible, the Phase 1 lock also records `resolvedOn: {os, arch}` (the machine that ran `cs`), and `scpm install` warns when it differs from the declared context.
+  - **Phase 1 limit:** the native `cs` CLI exposes only `--jdk-version`, so Phase 1 applies the JDK part of the context; OS and architecture profile activation follows the machine running `cs` until the resolver sidecar (Phase 3) passes them through the coursier API. The Phase 0 resolve spike checks how often this matters in practice. The lock does not record the resolving machine (that would make otherwise identical locks differ by who resolved them); `scpm install` reports it (`resolvedOn` in `--json`) and warns when it differs from the declared context, only when it actually re-locked something.
   - **Local-runtime trade-off:** with the default `linux-x86_64` context, a macOS developer's `run` and `test` get the artifacts a Linux profile selects (for example OS-classifier natives). Libraries whose natives differ by OS should be declared explicitly, one classifier per OS, in `runtimeDependencies`.
 - **Mirrors** are applied at fetch time and never recorded.
-- **`repo`** records the repository **id** from config, derived by matching the artifact's URL against the configured repository URLs (and their mirrors) by prefix, longest match first. A URL that matches no configured repository is an error.
+- **`repo`** records the repository **id** from config, derived by matching the artifact's URL against the configured repository URLs (and their mirrors) by prefix, longest match first. A URL that matches no configured repository is an error. It is re-derived for every artifact a re-lock resolves, so after changing repositories (which re-locks every variant and boot entry) no entry points at a repository that is gone.
 
 #### Staleness and commands
 
@@ -598,11 +600,13 @@ A variant is **stale** when its recomputed `inputsHash` differs from the lock's.
 
 - `scpm install` — re-lock stale variants, then fetch whatever is missing.
 - `scpm install --frozen` — the default when `CI=true`; a stale variant is an error.
+- `scpm install --verify` — also re-hash cached files against the lock and re-download any that don't match.
+- A corrupt or merge-conflicted lock is re-locked from scratch (with a warning); with `--frozen` it is an error suggesting to delete `scpm-lock.yaml` and run `scpm install`, or to resolve the conflict.
 - `scpm compile|test|run` — locally, a stale lock is installed first (aube-style install-before-run) and scpm prints what changed. With `CI=true` or `--frozen`, a stale lock is an error.
 - `scpm ci` — `scpm install --frozen`, then `compile` and `test` over the whole workspace; from Phase 3, `scpm install --frozen` then `scpm pipeline`.
 - `scpm update [selector]` — re-resolve within the declared ranges.
 - `scpm outdated` — list newer versions.
-- `scpm why <coord>` — explain why a coordinate is on the classpath.
+- `scpm why <coord>` — explain why a coordinate is on the classpath. It asks coursier: it rebuilds the variant's widest request (the test runtime classpath) at the locked versions and runs `cs resolve --what-depends-on org:name`, printing each chain from a direct dependency (and which variant declared it). If the artifact is on the classpath but coursier reports no chain, it says so.
 - `scpm dedupe` — collapse duplicate versions.
 
 ### 5.5 Version ranges without breaking the ecosystem
@@ -611,7 +615,7 @@ The risk is that ranges in **published** POMs are bad for Maven consumers: they 
 
 1. **Manifest syntax:**
    - exact: `1.2.3`, the default; `scpm add` writes exact versions unless `--save-range` is given
-   - `^1.2.3`, `~1.2.3`, `>=1.2 <2`
+   - `^1.2.3`, `~1.2.3`, `>=1.2 <2`, `1.2.x`; bounds must be versions, and unions (`||`) are not supported
    - `catalog`/`catalog:<name>`, `workspace:*` (publishing always writes concrete versions, so there is no `workspace:^` or `workspace:~`)
 2. **Bounds use Scala's early-semver rules**, or the dependency's `info.versionScheme` when it declares one:
    - `^1.2.3` → `>=1.2.3 <2.0.0`
@@ -619,13 +623,14 @@ The risk is that ranges in **published** POMs are bad for Maven consumers: they 
    - `~1.2.3` → `>=1.2.3 <1.3.0`
 3. **scpm selects the version itself and hands coursier an exact one.** For each range it:
    1. lists the available versions (coursier's version listing, or `maven-metadata.xml` per repository);
-   2. drops pre-releases unless the spec names one;
-   3. drops versions younger than `minimumReleaseAge` (§5.6);
-   4. keeps those within the bounds and picks the highest.
+   2. drops pre-releases (and dynver `+<hash>` builds) unless the spec names one;
+   3. honours qualifier flavours: if a bound carries a non-pre-release qualifier (`^33.0.0-android`), only versions with the same qualifier match; otherwise plain versions win over qualified ones (`42.2.29` over `42.2.29.jre7`);
+   4. drops versions younger than `minimumReleaseAge` (§5.6);
+   5. keeps those within the bounds and picks the highest.
 
    Ranges are **not** passed to coursier as Maven intervals: in Maven ordering `2.0.0-RC1 < 2.0.0`, so `[1.2.3,2.0.0)` would admit `2.0.0` pre-releases (MNG-3092). A catalog range is selected once per (platform, Scala binary version) for the whole workspace (§5.4).
 4. **Only direct dependencies get ranges.** Transitive versions follow coursier's normal reconciliation. Ranges *inside* third-party POMs are honoured, because coursier does, and then pinned by the lock. A transitive version that violates `minimumReleaseAge` is an error naming the dependency path; fix it with an `overrides` pin or an exclusion.
-5. **Ranges are resolved at lock time and never re-resolved implicitly.**
+5. **Ranges are resolved at lock time and never re-resolved implicitly.** A spec whose text is unchanged keeps its locked version even when its variant re-locks for another reason; only new or edited specs are selected (and `scpm update`).
 6. **Publishing rewrites every spec to a concrete version.** The default is the **locked** version, which is what was actually tested, so Maven consumers see an ordinary POM. Option: publish the range's lower bound instead.
 7. **Conflict policy:** after resolution, check every eviction against the evicted library's `info.versionScheme` (early-semver, pvp, semver-spec, strict, always), as sbt does. Fail with a readable diff that suggests an override.
 
@@ -674,7 +679,7 @@ The trust anchor is the advisory database's "fixed in" data (curated GHSA/OSV), 
 
 ### 5.7 Enterprise repositories (optional fast paths)
 
-**Credentials.** A repository's `credentials` is either `env:VAR` (sent as a bearer token) or `{user: env:U, password: env:P}` (basic auth). Phase 1's Rust fetcher reads those, plus coursier's `COURSIER_CREDENTIALS` / `credentials.properties` for matching hosts. Coursier's credential sources only express basic auth, so when `cs` resolves a stale lock scpm passes a bearer token as a basic-auth password (which Artifactory and GitHub Packages accept) **[verify per repository type in Phase 1]**.
+**Credentials.** A repository's `credentials` is either `env:VAR` (sent as a bearer token) or `{user: env:U, password: env:P}` (basic auth). Phase 1's Rust fetcher reads those, plus coursier's `COURSIER_CREDENTIALS` / `credentials.properties` for matching hosts. Coursier's credential sources only express basic auth, so when `cs` resolves a stale lock scpm passes a bearer token as a basic-auth password of the user `token` (which Artifactory and GitHub Packages accept) **[verify per repository type in Phase 1]**. Secrets never go on `cs`'s command line: scpm writes them to a private (0600) temporary `--credential-file`, matching the host without its port, as coursier does. The environment variables are read only when a repository is actually contacted, so cached `classpath`, `why` and a frozen restore with everything cached work without them; an empty variable is an error.
 
 Correctness always comes from coursier. These only speed up `outdated`, version listing and checksums:
 
@@ -1135,7 +1140,7 @@ Yes, if ranges stay in our manifests and lockfile and never reach published POMs
 |---|---|
 | Scope: this is pnpm + sbt + changesets + turbo. | Strict phasing (see [roadmap](roadmap.md)): each phase must be useful on its own. Phase 1 alone (lockfile, catalogs, fast compile, GitHub annotations) is already better than the status quo. |
 | bleep closes the gap first. | Differentiate on the package-manager half (lock, ranges, catalogs, releases); consider collaborating. |
-| Writing to the coursier cache from Rust corrupts it. | The Phase 1 fetcher ships behind a compatibility suite that runs `cs` and Rust concurrently on one cache (locks, `.part` files, checksum sidecars). |
+| Writing to the coursier cache from Rust corrupts it. | The Phase 1 fetcher ships behind a compatibility suite that runs `cs` and Rust concurrently on one cache (locks, `.part` files). |
 | Daemons accumulate memory (bleep's experience). | Idle timeout, heap governor, `scpm daemon top`, and one daemon per worker JDK rather than per workspace. |
 | Zinc portable analysis has edge cases (Zinc 2.1 just fixed several). | Fall back to a full compile on analysis mismatch, and report it as an event so it's visible. |
 | Ranges confuse users coming from Maven/sbt. | Exact versions by default; ranges opt-in per dependency. |
