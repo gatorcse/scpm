@@ -1183,7 +1183,7 @@ fn config_explain_shows_machine_settings_and_ignored_sources() {
     assert!(text.contains("credentials: bearer token from env ACME_TOKEN (not set)  (scpm-workspace.yaml)"), "{text}");
     assert!(
         text.contains(
-            "m2/settings.xml (MAVEN_HOME): mirror \"corp\" for * (https://corp/m) (would apply to central, acme)"
+            "m2/settings.xml (MAVEN_HOME): mirror \"corp\" for * (https://corp) (would apply to central, acme)"
         ),
         "{text}"
     );

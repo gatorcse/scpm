@@ -214,7 +214,7 @@ fn maven_settings(file: &str, text: &str) -> Vec<ForeignSetting> {
     for (id, of, url) in &mirrors {
         found.push(ForeignSetting::new(
             file,
-            format!("mirror \"{id}\" for {of} ({})", without_userinfo(url)),
+            format!("mirror \"{id}\" for {of} ({})", shown_origin(url)),
             Applies::MirrorOf(of.clone()),
         ));
     }
@@ -235,7 +235,7 @@ fn maven_settings(file: &str, text: &str) -> Vec<ForeignSetting> {
         let protocol = child(proxy, "protocol").unwrap_or_else(|| "http".into());
         let host = child(proxy, "host").unwrap_or_default();
         let port = child(proxy, "port").map(|p| format!(":{p}")).unwrap_or_default();
-        let shown = without_userinfo(&format!("{protocol}://{host}{port}"));
+        let shown = shown_origin(&format!("{protocol}://{host}{port}"));
         found.push(ForeignSetting::new(file, format!("proxy \"{id}\" ({shown})"), Applies::All));
     }
     found
@@ -251,10 +251,10 @@ fn coursier_mirrors(file: &str, text: &str) -> Vec<ForeignSetting> {
             let to = props.get(&format!("{name}.to")).cloned().unwrap_or_default();
             let prefixes: Vec<String> =
                 from.split(',').map(|f| f.trim().to_string()).filter(|f| !f.is_empty()).collect();
-            let shown: Vec<String> = prefixes.iter().map(|p| without_userinfo(p)).collect();
+            let shown: Vec<String> = prefixes.iter().map(|p| shown_origin(p)).collect();
             Some(ForeignSetting::new(
                 file,
-                format!("mirror \"{name}\" ({} to {})", shown.join(", "), without_userinfo(&to)),
+                format!("mirror \"{name}\" ({} to {})", shown.join(", "), shown_origin(&to)),
                 Applies::UrlPrefixes(prefixes),
             ))
         })
@@ -284,7 +284,7 @@ fn scala_cli(file: &str, text: &str) -> Vec<ForeignSetting> {
         });
         let (setting, applies) = match froms {
             Some(froms) if !froms.is_empty() => {
-                let shown: Vec<String> = froms.iter().map(|f| without_userinfo(f)).collect();
+                let shown: Vec<String> = froms.iter().map(|f| shown_origin(f)).collect();
                 (format!("repositories.mirrors for {}", shown.join(", ")), Applies::UrlPrefixes(froms))
             }
             _ => ("repositories.mirrors".to_string(), Applies::All),
@@ -330,25 +330,17 @@ fn host_of(url: &str) -> String {
     host.to_ascii_lowercase()
 }
 
-/// `url` without its `user[:password]@`, for display: other tools' files may hold credentials
-/// in URLs (`https://user:token@nexus/…`). A password may contain `/`, `?` or `#`, so when the
-/// authority holds an `@` or a `:` that starts no port, everything up to the last `@` goes.
-/// Otherwise an `@` is part of the path and the URL is shown as written.
-fn without_userinfo(url: &str) -> String {
+/// Only `scheme://host[:port]` of another tool's URL, for display: its files may hold
+/// credentials anywhere in a URL (`https://user:token@nexus/…`, a token with a `/` in it), so
+/// nothing else is shown, and the host is what follows the last `@`. (An `@` in a path makes
+/// the host shown wrong, never a secret visible.)
+fn shown_origin(url: &str) -> String {
     let (scheme, rest) = match url.split_once("://") {
         Some((scheme, rest)) => (format!("{scheme}://"), rest),
         None => (String::new(), url),
     };
-    let Some(at) = rest.rfind('@') else { return url.to_string() };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let not_a_port = authority
-        .rsplit_once(':')
-        .is_some_and(|(_, port)| port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()));
-    if authority.contains('@') || (not_a_port && !authority.starts_with('[')) {
-        format!("{scheme}{}", &rest[at + 1..])
-    } else {
-        url.to_string()
-    }
+    let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    format!("{scheme}{}", host.split(['/', '?', '#']).next().unwrap_or_default())
 }
 
 fn strip_comments(xml: &str) -> String {
@@ -434,7 +426,7 @@ mod tests {
         assert_eq!(
             shown,
             vec![
-                ("mirror \"corp\" for external:*,!acme (https://nexus/&m)", vec!["central".to_string()]),
+                ("mirror \"corp\" for external:*,!acme (https://nexus)", vec!["central".to_string()]),
                 ("server \"corp\" credentials", vec!["central".to_string()]),
                 ("server \"acme\" credentials", vec!["acme".to_string()]),
                 ("server \"unused\" credentials", vec![]),
@@ -447,34 +439,34 @@ mod tests {
     #[test]
     fn credentials_in_foreign_urls_are_never_shown() {
         for (url, shown) in [
-            ("https://user:t0ken@nexus/m", "https://nexus/m"),
-            ("https://t0ken@nexus/m", "https://nexus/m"),
-            ("https://user:t0#ken@nexus/m", "https://nexus/m"),
-            ("https://user:t0/ken@nexus/m", "https://nexus/m"),
-            ("https://user:@nexus/m", "https://nexus/m"),
-            ("user:t0ken@nexus/m", "nexus/m"),
-            ("https://nexus:8081/m/@scope/x", "https://nexus:8081/m/@scope/x"),
-            ("https://[::1]:8081/m/@scope/x", "https://[::1]:8081/m/@scope/x"),
-            ("https://nexus/m", "https://nexus/m"),
+            ("https://user:t0ken@nexus/m", "https://nexus"),
+            ("https://t0ken@nexus:8081/m", "https://nexus:8081"),
+            ("https://user:t0#ken@nexus/m", "https://nexus"),
+            ("https://user:t0/ken@nexus/m", "https://nexus"),
+            ("https://t0/ken@nexus/m", "https://nexus"),
+            ("https://user:@nexus/m?x", "https://nexus"),
+            ("user:t0ken@nexus/m", "nexus"),
+            ("https://[::1]:8081/m/x", "https://[::1]:8081"),
+            ("https://nexus/m", "https://nexus"),
         ] {
-            assert_eq!(without_userinfo(url), shown, "{url}");
+            assert_eq!(shown_origin(url), shown, "{url}");
         }
         let xml = "<settings><mirrors><mirror><id>corp</id><mirrorOf>*</mirrorOf>\
                    <url>https://alice:t0ken@nexus/m</url></mirror></mirrors>\
                    <proxies><proxy><id>p</id><host>bob:pw@proxy</host></proxy></proxies></settings>";
         let found = maven_settings("~/.m2/settings.xml", xml);
-        assert_eq!(found[0].setting, "mirror \"corp\" for * (https://nexus/m)");
+        assert_eq!(found[0].setting, "mirror \"corp\" for * (https://nexus)");
         assert_eq!(found[1].setting, "proxy \"p\" (http://proxy)");
         let found = coursier_mirrors(
             "m.properties",
             "corp.from=https://a:t0ken@repo1.maven.org/maven2\ncorp.to=https://b:t0ken@nexus/m\n",
         );
-        assert_eq!(found[0].setting, "mirror \"corp\" (https://repo1.maven.org/maven2 to https://nexus/m)");
+        assert_eq!(found[0].setting, "mirror \"corp\" (https://repo1.maven.org to https://nexus)");
         let found = scala_cli(
             "config.json",
             r#"{"repositories":{"mirrors":["https://a:t0ken@acme.example/maven=https://m"]}}"#,
         );
-        assert_eq!(found[0].setting, "repositories.mirrors for https://acme.example/maven");
+        assert_eq!(found[0].setting, "repositories.mirrors for https://acme.example");
     }
 
     #[test]
