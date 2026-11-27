@@ -587,7 +587,13 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     // Compilers for every Scala version in use (Java-only variants drive Zinc with one too),
     // plus the JVM helpers.
     let scala_versions: BTreeSet<String> = ws.variants().map(|v| compiler_scala(ws, v)).collect();
-    let boot: Vec<BootRoot> = scala_versions.iter().flat_map(|v| boot_roots(v)).chain(helper_roots()).collect();
+    // `SCPM_TEST_SKIP_BOOT` is a hidden switch for tests whose fake repositories can't serve
+    // these; commands that need a boot entry then say it is missing.
+    let boot: Vec<BootRoot> = if std::env::var_os("SCPM_TEST_SKIP_BOOT").is_some() {
+        Vec::new()
+    } else {
+        scala_versions.iter().flat_map(|v| boot_roots(v)).chain(helper_roots()).collect()
+    };
     let boot_inputs = (!boot.is_empty()).then(|| boot_inputs_hash(&repos, &ctx));
     let boot_inputs_changed = previous.boot_inputs != boot_inputs;
     let missing_boot: Vec<&BootRoot> =

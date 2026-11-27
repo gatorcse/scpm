@@ -56,6 +56,14 @@ fn scpm(dir: &Path, cache: &Path) -> Command {
     cmd
 }
 
+/// `scpm` for tests whose repositories can't serve scpm's own compiler and worker jars: their
+/// boot entries are left out of the lock (the hidden `SCPM_TEST_SKIP_BOOT`).
+fn scpm_no_boot(dir: &Path, cache: &Path) -> Command {
+    let mut cmd = scpm(dir, cache);
+    cmd.env("SCPM_TEST_SKIP_BOOT", "1");
+    cmd
+}
+
 fn lock(dir: &Path) -> Value {
     let text = fs::read_to_string(dir.join("scpm-lock.yaml")).unwrap();
     serde_yaml_ng::from_str(&text).unwrap()
@@ -547,7 +555,7 @@ fn user_config_credentials_reach_cs_and_the_fetcher() {
     };
     let (wrapper, log) = logging_cs(ws.path());
     let with_config = |cache: &Path| {
-        let mut cmd = scpm(ws.path(), cache);
+        let mut cmd = scpm_no_boot(ws.path(), cache);
         cmd.env("SCPM_CONFIG", &config).env("NEXUS_PASS", "s3cret-pass").env("SCPM_CS", &wrapper);
         cmd
     };
@@ -570,11 +578,12 @@ fn user_config_credentials_reach_cs_and_the_fetcher() {
 
     // A missing variable names the user config.
     let other = tempfile::tempdir().unwrap();
-    let err = stderr_of(scpm(ws.path(), other.path()).env("SCPM_CONFIG", &config).args(["install", "--frozen"]));
+    let err =
+        stderr_of(scpm_no_boot(ws.path(), other.path()).env("SCPM_CONFIG", &config).args(["install", "--frozen"]));
     assert!(err.contains("`NEXUS_PASS`") && err.contains("user config"), "{err}");
     // The file is parsed strictly: an unknown key is a configuration error.
     fs::write(&config, "mirror: []\n").unwrap();
-    let out = scpm(ws.path(), other.path()).env("SCPM_CONFIG", &config).arg("install").assert().code(2);
+    let out = scpm_no_boot(ws.path(), other.path()).env("SCPM_CONFIG", &config).arg("install").assert().code(2);
     let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
     assert!(err.contains("user-config.yaml") && err.contains("mirrors"), "{err}");
 }
@@ -607,7 +616,7 @@ fn one_origin_shares_its_credentials_on_both_paths() {
         server.url("/other")
     );
     java_workspace(ws.path(), &format!("repositories:\n{private}{other}"), deps);
-    let mut cmd = scpm(ws.path(), tempfile::tempdir().unwrap().path());
+    let mut cmd = scpm_no_boot(ws.path(), tempfile::tempdir().unwrap().path());
     env(&mut cmd);
     let out = cmd.arg("install").assert().code(2);
     let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
@@ -621,7 +630,7 @@ fn one_origin_shares_its_credentials_on_both_paths() {
     let config = ws.path().join("user-config.yaml");
     fs::write(&config, format!("mirrors:\n  - {{url: '{}', mirrorOf: [central]}}\n", server.url("/remote"))).unwrap();
     let with_config = |cache: &Path| {
-        let mut cmd = scpm(ws.path(), cache);
+        let mut cmd = scpm_no_boot(ws.path(), cache);
         env(&mut cmd);
         cmd.env("SCPM_CONFIG", &config);
         cmd
@@ -705,7 +714,7 @@ fn relocking_through_a_catch_all_mirror_keeps_repository_ids() {
     );
     java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
     let cache = tempfile::tempdir().unwrap();
-    scpm(ws.path(), cache.path()).arg("install").assert().success();
+    scpm_no_boot(ws.path(), cache.path()).arg("install").assert().success();
     assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
 
     // Re-locked through one mirror for both repositories, without error: hello keeps acme. world
@@ -715,7 +724,7 @@ fn relocking_through_a_catch_all_mirror_keeps_repository_ids() {
     java_workspace(ws.path(), &repos, deps);
     let config = ws.path().join("user-config.yaml");
     fs::write(&config, format!("mirrors:\n  - {{url: '{}', mirrorOf: ['*']}}\n", mirror.url("/mirror"))).unwrap();
-    scpm(ws.path(), cache.path()).env("SCPM_CONFIG", &config).arg("install").assert().success();
+    scpm_no_boot(ws.path(), cache.path()).env("SCPM_CONFIG", &config).arg("install").assert().success();
     assert!(mirror.count("/mirror/com/example/world/1.0/world-1.0.pom") > 0, "re-locked through the mirror");
     let locked = lock(ws.path());
     assert_eq!(locked["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
@@ -724,13 +733,13 @@ fn relocking_through_a_catch_all_mirror_keeps_repository_ids() {
     // A restore without the mirror follows the wrong hint, gets a 404 and asks acme next; the
     // sha256 decides that it is the locked file.
     let empty = tempfile::tempdir().unwrap();
-    scpm(ws.path(), empty.path()).args(["install", "--frozen"]).assert().success();
+    scpm_no_boot(ws.path(), empty.path()).args(["install", "--frozen"]).assert().success();
     assert!(main.count("/maven/com/example/world/1.0/world-1.0.jar") >= 1, "the hint was asked first");
     assert!(acme.count("/maven/com/example/world/1.0/world-1.0.jar") >= 1, "then the next repository");
     let jar = empty.path().join(format!("http/127.0.0.1%3A{}/maven/com/example/world/1.0/world-1.0.jar", acme.port));
     assert_eq!(fs::read(jar).unwrap(), b"world jar");
     // The classpath names the copy that was found.
-    let out = scpm(ws.path(), empty.path()).args(["classpath", "lib", "--frozen"]).assert().success();
+    let out = scpm_no_boot(ws.path(), empty.path()).args(["classpath", "lib", "--frozen"]).assert().success();
     let classpath = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
     assert!(classpath.contains(&format!("127.0.0.1%3A{}/maven/com/example/world", acme.port)), "{classpath}");
 }
@@ -750,7 +759,7 @@ fn an_internal_name_found_in_a_public_repository_is_not_locked() {
         acme.url("/maven")
     );
     java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
-    let err = stderr_of(scpm(ws.path(), tempfile::tempdir().unwrap().path()).arg("install"));
+    let err = stderr_of(scpm_no_boot(ws.path(), tempfile::tempdir().unwrap().path()).arg("install"));
     assert!(err.contains("com.example:hello:1.0 was found in repository `public`"), "{err}");
     assert!(err.contains("may only come from `acme`") && err.contains("dependency confusion"), "{err}");
     assert!(acme.count("/maven/com/example/hello/1.0/hello-1.0.pom") >= 1, "acme was asked first");
@@ -772,7 +781,7 @@ fn a_public_name_served_by_a_grouped_repository_is_not_locked() {
         acme.url("/maven")
     );
     java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
-    let err = stderr_of(scpm(ws.path(), tempfile::tempdir().unwrap().path()).arg("install"));
+    let err = stderr_of(scpm_no_boot(ws.path(), tempfile::tempdir().unwrap().path()).arg("install"));
     assert!(err.contains("com.example:hello:1.0 was served by repository `acme`"), "{err}");
     assert!(err.contains("may only come from the repositories without `groups` (`public`)"), "{err}");
     assert!(err.contains("internal-only repository URL") && err.contains("mirror of `central`"), "{err}");
@@ -798,12 +807,12 @@ fn groups_keep_internal_artifacts_away_from_other_repositories() {
 
     // Re-locking: `cs` asks the repositories with `groups` first, so it finds hello in acme and
     // never asks public about it.
-    scpm(ws.path(), tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    scpm_no_boot(ws.path(), tempfile::tempdir().unwrap().path()).arg("install").assert().success();
     assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
     assert_eq!(asked_public(), 0, "re-lock");
     // Restoring: only acme is ever a source for com.example.
     let empty = tempfile::tempdir().unwrap();
-    scpm(ws.path(), empty.path()).args(["install", "--frozen"]).assert().success();
+    scpm_no_boot(ws.path(), empty.path()).args(["install", "--frozen"]).assert().success();
     assert_eq!(asked_public(), 0, "restore");
     assert!(acme.count(HELLO_JAR_PATH) >= 2);
     // Even with a hint naming public (the lock's `repo` is only a hint), public isn't asked.
@@ -811,7 +820,7 @@ fn groups_keep_internal_artifacts_away_from_other_repositories() {
     let text = fs::read_to_string(&lock_file).unwrap();
     assert!(text.contains("repo: acme"), "{text}");
     fs::write(&lock_file, text.replace("repo: acme", "repo: public")).unwrap();
-    scpm(ws.path(), tempfile::tempdir().unwrap().path()).args(["install", "--frozen"]).assert().success();
+    scpm_no_boot(ws.path(), tempfile::tempdir().unwrap().path()).args(["install", "--frozen"]).assert().success();
     assert_eq!(asked_public(), 0, "restore with a hint for public");
 }
 
@@ -829,7 +838,7 @@ fn mirrors_serve_both_paths_and_never_reach_the_lock() {
     let deps = "dependencies:\n  com.example:hello: '1.0'\n";
     let plain = tempfile::tempdir().unwrap();
     java_workspace(plain.path(), &manifest, deps);
-    scpm(plain.path(), tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    scpm_no_boot(plain.path(), tempfile::tempdir().unwrap().path()).arg("install").assert().success();
     let real_requests = real.requests.lock().unwrap().len();
     assert!(real_requests > 0);
 
@@ -846,7 +855,7 @@ fn mirrors_serve_both_paths_and_never_reach_the_lock() {
     )
     .unwrap();
     let with_mirror = |cache: &Path| {
-        let mut cmd = scpm(ws.path(), cache);
+        let mut cmd = scpm_no_boot(ws.path(), cache);
         cmd.env("SCPM_CONFIG", &config).env("MIRROR_PASS", "mirror-pass");
         cmd
     };
@@ -914,11 +923,11 @@ fn both_paths_use_exactly_the_resolved_proxy() {
 
     // The user config's proxy wins over the environment's, for `cs` and for the fetcher.
     let cache = tempfile::tempdir().unwrap();
-    let mut cmd = scpm(ws.path(), cache.path());
+    let mut cmd = scpm_no_boot(ws.path(), cache.path());
     hostile_jvm(&mut cmd);
     cmd.env("SCPM_CONFIG", &config).env("HTTP_PROXY", dead).arg("install").assert().success();
     let empty = tempfile::tempdir().unwrap();
-    scpm(ws.path(), empty.path())
+    scpm_no_boot(ws.path(), empty.path())
         .env("SCPM_CONFIG", &config)
         .env("http_proxy", dead)
         .args(["install", "--frozen"])
@@ -931,33 +940,43 @@ fn both_paths_use_exactly_the_resolved_proxy() {
     fs::remove_file(ws.path().join("scpm-lock.yaml")).unwrap();
     let cache = tempfile::tempdir().unwrap();
     let proxy_url = format!("http://127.0.0.1:{}", proxy.port);
-    scpm(ws.path(), cache.path()).env("HTTP_PROXY", &proxy_url).arg("install").assert().success();
+    scpm_no_boot(ws.path(), cache.path()).env("HTTP_PROXY", &proxy_url).arg("install").assert().success();
     let empty = tempfile::tempdir().unwrap();
-    scpm(ws.path(), empty.path()).env("HTTP_PROXY", &proxy_url).args(["install", "--frozen"]).assert().success();
+    scpm_no_boot(ws.path(), empty.path())
+        .env("HTTP_PROXY", &proxy_url)
+        .args(["install", "--frozen"])
+        .assert()
+        .success();
     assert_eq!(fs::read(jar(empty.path())).unwrap(), b"hello jar");
 
     // Proxy authentication is not supported: a clear error that never repeats the password,
     // and only when something must be downloaded.
     let with_user = format!("http://alice:s3cret@127.0.0.1:{}", proxy.port);
     let err = stderr_of(
-        scpm(ws.path(), tempfile::tempdir().unwrap().path())
+        scpm_no_boot(ws.path(), tempfile::tempdir().unwrap().path())
             .env("HTTP_PROXY", &with_user)
             .args(["install", "--frozen"]),
     );
     assert!(err.contains("HTTP_PROXY") && err.contains("proxy authentication is not supported"), "{err}");
     assert!(!err.contains("s3cret"), "{err}");
-    scpm(ws.path(), empty.path()).env("HTTP_PROXY", &with_user).args(["install", "--frozen"]).assert().success();
+    scpm_no_boot(ws.path(), empty.path())
+        .env("HTTP_PROXY", &with_user)
+        .args(["install", "--frozen"])
+        .assert()
+        .success();
     // A `#` in the password used to end the authority early and land the value in the error.
     let hashed = format!("http://alice:pa#ss@127.0.0.1:{}", proxy.port);
     let err = stderr_of(
-        scpm(ws.path(), tempfile::tempdir().unwrap().path()).env("HTTP_PROXY", &hashed).args(["install", "--frozen"]),
+        scpm_no_boot(ws.path(), tempfile::tempdir().unwrap().path())
+            .env("HTTP_PROXY", &hashed)
+            .args(["install", "--frozen"]),
     );
     assert!(err.contains("proxy authentication is not supported") && !err.contains("pa#ss"), "{err}");
 
     // An unusable proxy for a scheme no repository uses blocks nothing, on either path.
     fs::remove_file(ws.path().join("scpm-lock.yaml")).unwrap();
     let with_socks = |cache: &Path| {
-        let mut cmd = scpm(ws.path(), cache);
+        let mut cmd = scpm_no_boot(ws.path(), cache);
         cmd.env("HTTPS_PROXY", "socks5://127.0.0.1:1080").env("HTTP_PROXY", &proxy_url);
         cmd
     };
@@ -1276,7 +1295,7 @@ fn foreign_mirror_settings_do_not_redirect_cs() {
     );
     let cache = tempfile::tempdir().unwrap();
     let hostile_scpm = || {
-        let mut cmd = scpm(ws.path(), cache.path());
+        let mut cmd = scpm_no_boot(ws.path(), cache.path());
         cmd.envs(hostile.iter().map(|(k, v)| (*k, v.as_os_str())))
             .env("COURSIER_MODE", "offline")
             .env("COURSIER_TTL", "0")
@@ -1307,7 +1326,7 @@ fn foreign_mirror_settings_do_not_redirect_cs() {
     assert!(!explained.contains("offline"), "names only, never values: {explained}");
     // `why --json` keeps the notice of the install it runs first.
     let fresh = tempfile::tempdir().unwrap();
-    let mut cmd = scpm(ws.path(), fresh.path());
+    let mut cmd = scpm_no_boot(ws.path(), fresh.path());
     cmd.envs(hostile.iter().map(|(k, v)| (*k, v.as_os_str()))).env("HOME", ws.path());
     let out = cmd.args(["--json", "why", "com.example:hello"]).assert().success();
     let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
