@@ -37,6 +37,12 @@ pub struct Unexplained {
 pub struct WhyReport {
     pub paths: Vec<WhyPath>,
     pub unexplained: Vec<Unexplained>,
+    /// Settings of other tools that touch the repositories and that scpm ignored (design §5.9).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
+    /// Problems with the machine settings (design §5.9), e.g. a user config others can read.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Does `key` (`g:a:v[...]`) match `pattern` (`org:name`, `org::name`, or an artifact name)?
@@ -64,9 +70,10 @@ pub fn why(
     pattern: &str,
     selected: &[String],
 ) -> Result<WhyReport, InstallError> {
-    let repos = coursier::repositories(&ws.repositories())?;
+    let (repos, machine) = crate::install::repositories(ws)?;
     let cache = coursier::cache_dir();
-    let mut report = WhyReport::default();
+    let mut report = WhyReport { warnings: machine.warnings.clone(), ..Default::default() };
+    let mut ran_cs = false;
     for id in selected {
         let (Some(variant), Some(vlock)) = (ws.variant(id), lock.variants.get(id)) else { continue };
         let found: Vec<&str> = ClasspathKind::TestRuntime
@@ -107,7 +114,9 @@ pub fn why(
         owners.extend(upstream_variants(graph, id, ClasspathKind::TestRuntime));
         let mut unexplained: Vec<String> = Vec::new();
         for module in &modules {
-            let chains = coursier::what_depends_on(&req, module, &repos, &cache)?;
+            let chains = coursier::what_depends_on(&req, module, &repos, &machine.proxy, &cache)
+                .map_err(|e| crate::install::with_notice(e.into(), &repos, true))?;
+            ran_cs = true;
             if chains.is_empty() {
                 unexplained.extend(found.iter().filter(|k| module_of(k) == *module).map(|k| k.to_string()));
             }
@@ -122,6 +131,9 @@ pub fn why(
         if !unexplained.is_empty() {
             report.unexplained.push(Unexplained { variant: id.clone(), artifacts: unexplained });
         }
+    }
+    if ran_cs {
+        report.notices.extend(crate::foreign::take_notice(&repos, true));
     }
     Ok(report)
 }

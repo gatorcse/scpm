@@ -33,7 +33,69 @@ fn item(url: String, dest: &Path, body: &[u8]) -> FetchItem {
         auth: Ok(None),
         challenge: Vec::new(),
         verify_cached: false,
+        fallbacks: Vec::new(),
     }
+}
+
+#[test]
+fn fallbacks_are_asked_only_after_a_not_found_each_with_its_own_credentials() {
+    let basic = |user: &str, password: &str| Ok(Some(Auth::Basic { user: user.into(), password: password.into() }));
+    let source = |server: &Server, cache: &Path, auth: Result<Option<Auth>, String>| FetchItem {
+        auth,
+        ..item(server.url(HELLO_JAR_PATH), &cache.join(format!("{}/hello-1.0.jar", server.port)), JAR)
+    };
+
+    // The hint answers 404 for its own token; the fallback must get its own token, not the hint's.
+    let hint = Server::maven(Default::default(), Some(("a", "token-a")));
+    let other = Server::maven(hello_repo_files(JAR), Some(("b", "token-b")));
+    let cache = tempfile::tempdir().unwrap();
+    let mut first = source(&hint, cache.path(), basic("a", "token-a"));
+    first.fallbacks = vec![source(&other, cache.path(), basic("b", "token-b"))];
+    assert_eq!(fetch_all(vec![first], FetchOptions::default()).unwrap().downloaded, 1);
+    assert_eq!(hint.count(HELLO_JAR_PATH), 1);
+    let sent: Vec<Option<String>> = other.requests.lock().unwrap().iter().map(|r| r.authorization.clone()).collect();
+    assert_eq!(sent.len(), 1);
+    assert!(sent.iter().all(|a| a.as_deref() == Some("Basic Yjp0b2tlbi1i")), "token B only: {sent:?}");
+
+    // A 401 (or 403) from the hint is an answer, not a miss: no fallback is asked.
+    let locked = Server::maven(hello_repo_files(JAR), Some(("alice", "s3cret")));
+    let open = Server::maven(hello_repo_files(JAR), None);
+    let cache = tempfile::tempdir().unwrap();
+    let mut first = source(&locked, cache.path(), Ok(None));
+    first.fallbacks = vec![source(&open, cache.path(), Ok(None))];
+    let err = fetch_all(vec![first], FetchOptions::default()).unwrap_err().to_string();
+    assert!(err.contains("HTTP 401"), "{err}");
+    assert_eq!(open.requests.lock().unwrap().len(), 0);
+
+    // A hint that can't be asked (an unset credential variable) is skipped like a 404; its
+    // problem is the error only when no source has the file.
+    let cache = tempfile::tempdir().unwrap();
+    let mut first = source(&locked, cache.path(), Err("repository `a` needs `UNSET`, which is not set".into()));
+    first.fallbacks = vec![source(&open, cache.path(), Ok(None))];
+    let report = fetch_all(vec![first], FetchOptions::default()).unwrap();
+    assert_eq!(report.downloaded, 1);
+    // ... but it is a warning, so a missing token doesn't go unnoticed.
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].contains("was not asked") && report.warnings[0].contains("`UNSET`"),
+        "{:?}",
+        report.warnings
+    );
+    let empty = Server::maven(Default::default(), None);
+    let mut first = source(&locked, cache.path(), Err("repository `a` needs `UNSET`, which is not set".into()));
+    first.fallbacks = vec![source(&empty, cache.path(), Ok(None))];
+    first.dest = cache.path().join("elsewhere/hello-1.0.jar");
+    let err = fetch_all(vec![first], FetchOptions::default()).unwrap_err().to_string();
+    assert!(err.contains("`UNSET`"), "{err}");
+
+    // The hint answers 404 and the only other source can't be asked: the error says why.
+    let cache = tempfile::tempdir().unwrap();
+    let mut first = source(&empty, cache.path(), Ok(None));
+    first.fallbacks =
+        vec![source(&open, cache.path(), Err("repository `acme` needs `ACME_TOKEN`, which is not set".into()))];
+    let err = fetch_all(vec![first], FetchOptions::default()).unwrap_err().to_string();
+    assert!(err.contains("HTTP 404"), "{err}");
+    assert!(err.contains("note: ") && err.contains("was not asked") && err.contains("`ACME_TOKEN`"), "{err}");
 }
 
 #[test]
@@ -58,18 +120,19 @@ fn realm_scoped_credentials_wait_for_a_matching_challenge() {
         url: server.url("/maven/"),
         credentials: None,
         allow_insecure_credentials: true,
+        ..Default::default()
     }];
     let cache = tempfile::tempdir().unwrap();
 
     let other = CoursierCredentials::from_env_value(&format!("http://127.0.0.1:{}(other) alice:s3cret", server.port));
-    let items = fetch_items(&hello_lock(), &repos, &other, cache.path()).unwrap();
+    let items = fetch_items(&hello_lock(), &repos, &other, cache.path(), &mut Vec::new()).unwrap();
     assert!(matches!(items[0].auth, Ok(None)), "realm-scoped credentials are not sent up front");
     let err = fetch_all(items, FetchOptions::default()).unwrap_err().to_string();
     assert!(err.contains("HTTP 401"), "{err}");
     assert!(server.requests.lock().unwrap().iter().all(|r| r.authorization.is_none()), "wrong realm: never sent");
 
     let creds = CoursierCredentials::from_env_value(&format!("http://127.0.0.1:{}(test) alice:s3cret", server.port));
-    let items = fetch_items(&hello_lock(), &repos, &creds, cache.path()).unwrap();
+    let items = fetch_items(&hello_lock(), &repos, &creds, cache.path(), &mut Vec::new()).unwrap();
     // Not matched up front, so coursier's cache path has no `user@`.
     assert!(!items[0].dest.to_string_lossy().contains("alice"));
     assert_eq!(fetch_all(items, FetchOptions::default()).unwrap().downloaded, 1);
@@ -159,11 +222,11 @@ fn verify_rehashes_and_repairs_cached_files() {
     let report = fetch_all(vec![it()], FetchOptions::default()).unwrap();
     assert_eq!((report.present, report.downloaded), (1, 0));
 
-    let report = fetch_all(vec![it()], FetchOptions { verify: true }).unwrap();
+    let report = fetch_all(vec![it()], FetchOptions { verify: true, ..Default::default() }).unwrap();
     assert_eq!((report.verified, report.repaired, report.downloaded), (1, 1, 1));
     assert_eq!(fs::read(&dest).unwrap(), JAR);
 
-    let report = fetch_all(vec![it()], FetchOptions { verify: true }).unwrap();
+    let report = fetch_all(vec![it()], FetchOptions { verify: true, ..Default::default() }).unwrap();
     assert_eq!((report.verified, report.repaired, report.present), (1, 0, 1));
 }
 
@@ -198,6 +261,7 @@ fn coursier_credentials_authenticate_and_name_the_cache_directory() {
         url: server.url("/maven/"),
         credentials: None,
         allow_insecure_credentials: true,
+        ..Default::default()
     }];
     let dir = tempfile::tempdir().unwrap();
     let props = dir.path().join("credentials.properties");
@@ -207,11 +271,12 @@ fn coursier_credentials_authenticate_and_name_the_cache_directory() {
     let cache = tempfile::tempdir().unwrap();
 
     // Without credentials the server refuses.
-    let anonymous = fetch_items(&hello_lock(), &repos, &CoursierCredentials::default(), cache.path()).unwrap();
+    let anonymous =
+        fetch_items(&hello_lock(), &repos, &CoursierCredentials::default(), cache.path(), &mut Vec::new()).unwrap();
     let err = fetch_all(anonymous, FetchOptions::default()).unwrap_err().to_string();
     assert!(err.contains("HTTP 401") && err.contains("credentials"), "{err}");
 
-    let items = fetch_items(&hello_lock(), &repos, &creds, cache.path()).unwrap();
+    let items = fetch_items(&hello_lock(), &repos, &creds, cache.path(), &mut Vec::new()).unwrap();
     assert!(matches!(&items[0].auth, Ok(Some(Auth::Basic { user, .. })) if user == "alice"));
     // coursier's FileCache puts the user in the path: `http/alice@127.0.0.1:<port>/…`.
     let expected = cache
@@ -234,6 +299,7 @@ fn coursier_credentials_need_the_repository_opt_in_over_http() {
             url: server.url("/maven/"),
             credentials: None,
             allow_insecure_credentials: allow,
+            ..Default::default()
         }]
     };
     let cache = tempfile::tempdir().unwrap();
@@ -243,9 +309,9 @@ fn coursier_credentials_need_the_repository_opt_in_over_http() {
         format!("x.host=http://127.0.0.1:{}\nx.username=alice\nx.password=s3cret\n", server.port),
     ] {
         let creds = CoursierCredentials { entries: scpm::credentials::parse_properties(&creds) };
-        let items = fetch_items(&hello_lock(), &repo(false), &creds, cache.path()).unwrap();
+        let items = fetch_items(&hello_lock(), &repo(false), &creds, cache.path(), &mut Vec::new()).unwrap();
         assert!(matches!(items[0].auth, Ok(None)) && items[0].challenge.is_empty(), "{creds:?}");
-        let items = fetch_items(&hello_lock(), &repo(true), &creds, cache.path()).unwrap();
+        let items = fetch_items(&hello_lock(), &repo(true), &creds, cache.path(), &mut Vec::new()).unwrap();
         assert!(matches!(&items[0].auth, Ok(Some(Auth::Basic { user, .. })) if user == "alice"), "{creds:?}");
     }
 }
@@ -258,9 +324,10 @@ fn https_only_coursier_credentials_are_not_sent_over_http() {
         url: "http://127.0.0.1:1/maven/".into(),
         credentials: None,
         allow_insecure_credentials: false,
+        ..Default::default()
     }];
     let cache = tempfile::tempdir().unwrap();
-    let items = fetch_items(&hello_lock(), &repos, &creds, cache.path()).unwrap();
+    let items = fetch_items(&hello_lock(), &repos, &creds, cache.path(), &mut Vec::new()).unwrap();
     assert!(matches!(items[0].auth, Ok(None)));
     let attempted: BTreeMap<_, _> = BTreeMap::from([("dest", items[0].dest.clone())]);
     assert!(!attempted["dest"].to_string_lossy().contains("alice"));

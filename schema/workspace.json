@@ -556,6 +556,17 @@
             }
           ]
         },
+        "groups": {
+          "description": "Group-id prefixes (`com.acme` covers `com.acme` and `com.acme.*`) served only by this\nrepository and any other that lists the same longest prefix: those artifacts are\nrestored from nowhere else, and nothing else is restored from here. Without it, the\nrepository serves every group no repository claims.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
         "id": {
           "type": "string"
         },

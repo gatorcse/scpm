@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scpm user config",
+  "description": "The user config file as written.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "credentials": {
+      "description": "Credentials, matched against a repository's (or its mirror's) URL by scheme, host and\nport; a path narrows the match to URLs under it.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CredentialEntry"
+      }
+    },
+    "mirrors": {
+      "description": "Mirrors, applied at download time and never recorded in the lock.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MirrorEntry"
+      }
+    },
+    "proxy": {
+      "description": "The proxy for every download. Set, it replaces `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProxyEntry"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "CredentialEntry": {
+      "description": "`{url, token}` (bearer) or `{url, user, password}` (basic auth). Each value is `env:VAR`,\n`file:PATH` (`~` is the home directory) or the value itself.",
+      "type": "object",
+      "properties": {
+        "password": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "token": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": "string"
+        },
+        "user": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "title": "bearer token",
+          "properties": {
+            "password": {
+              "type": "null"
+            },
+            "token": {
+              "type": "string"
+            },
+            "user": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "token"
+          ]
+        },
+        {
+          "title": "user and password",
+          "properties": {
+            "password": {
+              "type": "string"
+            },
+            "token": {
+              "type": "null"
+            },
+            "user": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "user",
+            "password"
+          ]
+        }
+      ],
+      "required": [
+        "url"
+      ]
+    },
+    "MirrorEntry": {
+      "type": "object",
+      "properties": {
+        "allowInsecureCredentials": {
+          "description": "Send credentials to this mirror although it is `http://` and plain HTTP exposes them: to\nexactly its scheme, host and port, for the repositories reached through it, and nowhere\nelse. Without it, credentials go to a mirror only over HTTPS.",
+          "type": "boolean"
+        },
+        "mirrorOf": {
+          "description": "Repository ids, URL prefixes, or `*` for every repository.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url",
+        "mirrorOf"
+      ]
+    },
+    "ProxyEntry": {
+      "type": "object",
+      "properties": {
+        "http": {
+          "description": "Proxy for `http://` URLs, `http://host:port`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "https": {
+          "description": "Proxy for `https://` URLs, `http://host:port`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "noProxy": {
+          "description": "Hosts reached directly: a name also covers its subdomains (`.example.com` or\n`example.com`), `*` covers every host.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

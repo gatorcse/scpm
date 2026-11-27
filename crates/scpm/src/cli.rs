@@ -37,7 +37,10 @@ pub enum Command {
     /// List modules and their variants.
     Ls,
     /// Print the resolved configuration of modules or variants.
+    #[command(args_conflicts_with_subcommands = true)]
     Config {
+        #[command(subcommand)]
+        action: Option<ConfigCommand>,
         /// Module names or variant ids; shorthand for `-F`.
         targets: Vec<String>,
     },
@@ -73,6 +76,13 @@ pub enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Show where each repository's credentials, mirror and proxy come from (machine-local
+    /// settings), and which settings of other tools are ignored.
+    Explain,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum GraphFormat {
     Text,
@@ -84,6 +94,8 @@ pub enum GraphFormat {
 pub enum SchemaFile {
     Workspace,
     Module,
+    /// The user config with machine-local settings (design §5.9).
+    UserConfig,
 }
 
 /// Exit codes: 0 success, 1 the command failed (including writing its output), 2 invalid
@@ -147,7 +159,13 @@ enum Failure {
 
 impl From<install::InstallError> for Failure {
     fn from(e: install::InstallError) -> Self {
-        Failure::Command(e.to_string())
+        match e {
+            install::InstallError::MachineConfig(diags) => Failure::Config(diags),
+            install::InstallError::Coursier(crate::coursier::CoursierError::CredentialClash(d)) => {
+                Failure::Config(d.into())
+            }
+            other => Failure::Command(other.to_string()),
+        }
     }
 }
 
@@ -180,6 +198,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let schema = match file {
                 SchemaFile::Workspace => schemars::schema_for!(WorkspaceFile),
                 SchemaFile::Module => schemars::schema_for!(ModuleFile),
+                SchemaFile::UserConfig => schemars::schema_for!(crate::machine::UserConfigFile),
             };
             Ok(print_json(&schema)?)
         }
@@ -205,7 +224,19 @@ fn run(cli: Cli) -> Result<(), Failure> {
             }
             Ok(())
         }
-        Command::Config { targets } => {
+        Command::Config { action: Some(ConfigCommand::Explain), .. } => {
+            let (ws, _) = load(&start)?;
+            let explanation = crate::explain::explain(&ws)?;
+            if cli.json {
+                print_json(&explanation)?;
+            } else {
+                let mut out = io::stdout().lock();
+                out.write_all(crate::explain::render(&explanation).as_bytes())?;
+                out.flush()?;
+            }
+            Ok(())
+        }
+        Command::Config { action: None, targets } => {
             let (ws, graph) = load(&start)?;
             let mut selectors = cli.filter.clone();
             selectors.extend(targets);
@@ -232,13 +263,19 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Command::Why { artifact } => {
             let (ws, graph) = load(&start)?;
-            let lock = ensure_installed(&ws, &graph, false)?;
+            let (lock, install_notices) = ensure_installed(&ws, &graph, false)?;
             let selected: Vec<String> =
                 filter::select(&ws, &graph, &cli.filter, &invocation_dir(&start)?)?.into_iter().collect();
-            let report = crate::why::why(&ws, &graph, &lock, &artifact, &selected)?;
+            let mut report = crate::why::why(&ws, &graph, &lock, &artifact, &selected)?;
             if cli.json {
+                // The install before `why` may have taken the notice (printed on stderr); keep it here too.
+                report.notices.splice(0..0, install_notices);
                 print_json(&report)?;
             } else {
+                // `report.warnings` were printed by `ensure_installed` already.
+                for n in &report.notices {
+                    eprintln!("note: {n}");
+                }
                 let mut out = io::stdout().lock();
                 if report.paths.is_empty() && report.unexplained.is_empty() {
                     writeln!(out, "`{artifact}` is not on any selected classpath")?;
@@ -279,7 +316,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                     selected.iter().cloned().collect::<Vec<_>>().join(", ")
                 )));
             };
-            let lock = ensure_installed(&ws, &graph, frozen)?;
+            let (lock, _) = ensure_installed(&ws, &graph, frozen)?;
             let files = install::classpath_files(&ws, &lock, id, kind)?;
             if cli.json {
                 print_json(&files)?;
@@ -359,17 +396,22 @@ fn load(start: &std::path::Path) -> Result<(Workspace, Graph), Failure> {
 }
 
 /// Install-before-run (design §5.4): re-lock and fetch as needed (frozen in CI), then read the lock.
-fn ensure_installed(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<Lockfile, Failure> {
+/// Warnings and notices are printed on stderr; the notices are returned too, for `--json` reports.
+fn ensure_installed(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<(Lockfile, Vec<String>), Failure> {
     let summary = install::install(ws, graph, InstallOptions { frozen: frozen || in_ci(), verify: false })?;
     for w in &summary.warnings {
         eprintln!("warning: {w}");
     }
+    for n in &summary.notices {
+        eprintln!("note: {n}");
+    }
     if !summary.relocked.is_empty() || summary.fetch.downloaded > 0 {
         eprintln!("installed: {} re-locked, {} downloaded", summary.relocked.len(), summary.fetch.downloaded);
     }
-    Lockfile::read(&ws.root)
+    let lock = Lockfile::read(&ws.root)
         .map_err(|e| Failure::Command(e.to_string()))?
-        .ok_or_else(|| Failure::Command("no scpm-lock.yaml; run `scpm install`".into()))
+        .ok_or_else(|| Failure::Command("no scpm-lock.yaml; run `scpm install`".into()))?;
+    Ok((lock, summary.notices))
 }
 
 /// CI mode (implied `--frozen`) is `CI=true` (any case: AppVeyor sets `True`).
@@ -380,6 +422,9 @@ fn in_ci() -> bool {
 fn print_install_summary(s: &InstallSummary) -> io::Result<()> {
     for w in &s.warnings {
         eprintln!("warning: {w}");
+    }
+    for n in &s.notices {
+        eprintln!("note: {n}");
     }
     let mut out = io::stdout().lock();
     let removed = if s.removed.is_empty() { String::new() } else { format!("removed {}", s.removed.join(", ")) };

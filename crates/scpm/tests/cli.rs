@@ -14,7 +14,13 @@ fn fixture(name: &str) -> PathBuf {
 
 fn scpm(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("scpm").unwrap();
-    cmd.arg("-C").arg(dir);
+    // Never the developer's own machine settings: an empty user config.
+    let config = Path::new(env!("CARGO_TARGET_TMPDIR")).join("empty-user-config.yaml");
+    // Rewritten if anything else ever left content there; writing "" over "" is harmless.
+    if !std::fs::metadata(&config).is_ok_and(|m| m.len() == 0) {
+        std::fs::write(&config, "").unwrap();
+    }
+    cmd.arg("-C").arg(dir).env("SCPM_CONFIG", config);
     cmd
 }
 
@@ -358,7 +364,9 @@ fn no_workspace_found() {
 
 #[test]
 fn committed_schemas_are_up_to_date() {
-    for (kind, file) in [("workspace", "workspace.json"), ("module", "module.json")] {
+    for (kind, file) in
+        [("workspace", "workspace.json"), ("module", "module.json"), ("user-config", "user-config.json")]
+    {
         let generated = stdout(&fixture("basic"), &["schema", kind]);
         let committed = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schema").join(file))
             .unwrap_or_default();
@@ -1133,4 +1141,64 @@ fn module_discovery_walks_only_the_glob_prefixes() {
         .assert()
         .success()
         .stdout("a@jvm-3  modules/a\n");
+}
+
+#[test]
+fn config_explain_shows_machine_settings_and_ignored_sources() {
+    let ws = "toolchain: {scala: '3.9.0'}\nmodules: ['modules/*']\nrepositories:\n  - central\n  - {id: acme, url: 'https://acme.example/maven', credentials: 'env:ACME_TOKEN'}\n";
+    let dir = workspace(&[("scpm-workspace.yaml", ws), ("modules/a/scpm.yaml", "{}\n")]);
+    let config = dir.path().join("user-config.yaml");
+    fs::write(
+        &config,
+        "mirrors:\n  - {url: 'https://nexus.example/m', mirrorOf: [central]}\n\
+         credentials:\n  - {url: 'https://nexus.example', token: 'env:NEXUS_TOKEN'}\n",
+    )
+    .unwrap();
+    let maven = dir.path().join("m2");
+    fs::create_dir_all(&maven).unwrap();
+    fs::write(
+        maven.join("settings.xml"),
+        "<settings><mirrors><mirror><id>corp</id><mirrorOf>*</mirrorOf><url>https://corp/m</url></mirror></mirrors></settings>",
+    )
+    .unwrap();
+    let explain = |json: bool| {
+        let mut cmd = scpm(dir.path());
+        cmd.env("SCPM_CONFIG", &config)
+            .env("MAVEN_HOME", &maven)
+            .env("NEXUS_TOKEN", "s3cret-token")
+            .env_remove("ACME_TOKEN")
+            .env_remove("COURSIER_MAVEN_SETTINGS")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("https_proxy");
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd.args(["config", "explain"]).assert().success().get_output().stdout.clone();
+        String::from_utf8(out).unwrap()
+    };
+    let text = explain(false);
+    assert!(!text.contains("s3cret-token"), "{text}");
+    assert!(text.contains("central  https://repo1.maven.org/maven2/\n"), "{text}");
+    assert!(text.contains("via mirror https://nexus.example/m/  (user config, mirrorOf central)"), "{text}");
+    assert!(text.contains("credentials: bearer token from env NEXUS_TOKEN  (user config)"), "{text}");
+    assert!(text.contains("credentials: bearer token from env ACME_TOKEN (not set)  (scpm-workspace.yaml)"), "{text}");
+    assert!(
+        text.contains(
+            "m2/settings.xml (MAVEN_HOME): mirror \"corp\" for * (https://corp) (would apply to central, acme)"
+        ),
+        "{text}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&explain(true)).unwrap();
+    assert_eq!(json["repositories"][0]["effectiveUrl"], "https://nexus.example/m/");
+    assert_eq!(
+        json["repositories"][1]["credentials"]["secret"],
+        serde_json::json!({"from": "env", "name": "ACME_TOKEN", "set": false})
+    );
+    assert!(json["ignored"].as_array().unwrap().iter().any(|i| i["setting"].as_str().unwrap().contains("corp")));
+    assert_eq!(json["userConfig"]["exists"], true);
+
+    // `config` with targets still prints variants.
+    let out = scpm(dir.path()).args(["config", "a"]).assert().success().get_output().stdout.clone();
+    assert!(String::from_utf8_lossy(&out).contains("a@jvm-3"));
 }

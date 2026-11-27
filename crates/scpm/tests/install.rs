@@ -46,6 +46,13 @@ fn copy_dir(from: &Path, to: &Path) {
 fn scpm(dir: &Path, cache: &Path) -> Command {
     let mut cmd = Command::cargo_bin("scpm").unwrap();
     cmd.arg("-C").arg(dir).env("COURSIER_CACHE", cache).env_remove("CI").env_remove("COURSIER_CREDENTIALS");
+    // Never the developer's own machine settings: an empty user config.
+    let config = Path::new(env!("CARGO_TARGET_TMPDIR")).join("empty-user-config.yaml");
+    // Rewritten if anything else ever left content there; writing "" over "" is harmless.
+    if !fs::metadata(&config).is_ok_and(|m| m.len() == 0) {
+        fs::write(&config, "").unwrap();
+    }
+    cmd.env("SCPM_CONFIG", config);
     cmd
 }
 
@@ -258,6 +265,19 @@ fn why_and_classpath() {
             .contains("cats-kernel_3"))
     );
     assert_eq!(report["unexplained"], serde_json::json!([]));
+    assert!(report.get("warnings").is_none(), "{report}");
+    // Machine-settings warnings reach `why --json` too.
+    let missing = ws.path().join("no-such-config.yaml");
+    let out = scpm(ws.path(), &shared_cache())
+        .env("SCPM_CONFIG", &missing)
+        .args(["--json", "why", "cats-kernel", "-F", "util@jvm-3"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert!(report["warnings"][0].as_str().unwrap().contains("no-such-config.yaml"), "{report}");
 
     let out = scpm(ws.path(), &shared_cache())
         .args(["--json", "classpath", "core", "--kind", "test-runtime"])
@@ -502,6 +522,448 @@ fn coursier_credentials_are_used_for_repositories_without_configured_ones() {
 }
 
 #[test]
+fn user_config_credentials_reach_cs_and_the_fetcher() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    let server = Server::maven(hello_repo_files(b"hello jar"), Some(("alice", "s3cret-pass")));
+    let ws = tempfile::tempdir().unwrap();
+    let config = ws.path().join("user-config.yaml");
+    fs::write(
+        &config,
+        format!("credentials:\n  - {{url: '{}', user: alice, password: 'env:NEXUS_PASS'}}\n", server.url("/")),
+    )
+    .unwrap();
+    let workspace = |opt_in: &str| {
+        java_workspace(
+            ws.path(),
+            &format!("repositories:\n  - {{id: local, url: '{}'{opt_in}}}\n", server.url("/maven")),
+            "dependencies:\n  com.example:hello: '1.0'\n",
+        )
+    };
+    let (wrapper, log) = logging_cs(ws.path());
+    let with_config = |cache: &Path| {
+        let mut cmd = scpm(ws.path(), cache);
+        cmd.env("SCPM_CONFIG", &config).env("NEXUS_PASS", "s3cret-pass").env("SCPM_CS", &wrapper);
+        cmd
+    };
+    // Over plain HTTP they need the repository's opt-in, like coursier's own.
+    workspace("");
+    let cache = tempfile::tempdir().unwrap();
+    let err = stderr_of(with_config(cache.path()).arg("install"));
+    assert!(err.contains("401") || err.contains("nauthorized"), "{err}");
+    assert!(server.requests.lock().unwrap().iter().all(|r| r.authorization.is_none()));
+
+    workspace(", allowInsecureCredentials: true");
+    with_config(cache.path()).arg("install").assert().success();
+    assert!(!fs::read_to_string(&log).unwrap().contains("s3cret-pass"));
+    let empty = tempfile::tempdir().unwrap();
+    with_config(empty.path()).args(["install", "--frozen"]).assert().success();
+    let jar = empty
+        .path()
+        .join(format!("http/alice%40127.0.0.1%3A{}/maven/com/example/hello/1.0/hello-1.0.jar", server.port));
+    assert_eq!(fs::read(&jar).unwrap(), b"hello jar");
+
+    // A missing variable names the user config.
+    let other = tempfile::tempdir().unwrap();
+    let err = stderr_of(scpm(ws.path(), other.path()).env("SCPM_CONFIG", &config).args(["install", "--frozen"]));
+    assert!(err.contains("`NEXUS_PASS`") && err.contains("user config"), "{err}");
+    // The file is parsed strictly: an unknown key is a configuration error.
+    fs::write(&config, "mirror: []\n").unwrap();
+    let out = scpm(ws.path(), other.path()).env("SCPM_CONFIG", &config).arg("install").assert().code(2);
+    let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(err.contains("user-config.yaml") && err.contains("mirrors"), "{err}");
+}
+
+/// `files` with every path's `/maven/` replaced by `/{dir}/`.
+fn moved(files: std::collections::HashMap<String, Vec<u8>>, dir: &str) -> std::collections::HashMap<String, Vec<u8>> {
+    files.into_iter().map(|(p, b)| (p.replace("/maven/", &format!("/{dir}/")), b)).collect()
+}
+
+#[test]
+fn one_origin_shares_its_credentials_on_both_paths() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    // Only the mirror path holds the artifact, behind the same login as the private repository.
+    let server = Server::maven(moved(hello_repo_files(b"hello jar"), "remote"), Some(("alice", "s3cret-pass")));
+    let ws = tempfile::tempdir().unwrap();
+    let private = format!(
+        "  - {{id: private, url: '{}', allowInsecureCredentials: true, credentials: {{user: 'env:A_USER', password: 'env:A_PASS'}}}}\n",
+        server.url("/maven")
+    );
+    let deps = "dependencies:\n  com.example:hello: '1.0'\n";
+    let env = |cmd: &mut Command| {
+        cmd.env("A_USER", "alice").env("A_PASS", "s3cret-pass").env("B_USER", "bob").env("B_PASS", "other-pass");
+    };
+
+    // Different credentials on one origin: a configuration error naming both repositories.
+    let other = format!(
+        "  - {{id: other, url: '{}', allowInsecureCredentials: true, credentials: {{user: 'env:B_USER', password: 'env:B_PASS'}}}}\n",
+        server.url("/other")
+    );
+    java_workspace(ws.path(), &format!("repositories:\n{private}{other}"), deps);
+    let mut cmd = scpm(ws.path(), tempfile::tempdir().unwrap().path());
+    env(&mut cmd);
+    let out = cmd.arg("install").assert().code(2);
+    let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(err.contains(&server.url("/maven/")) && err.contains(&server.url("/other/")), "{err}");
+    assert!(!err.contains("pass"), "{err}");
+
+    // An anonymous mirror on that origin gets the private repository's credentials, from `cs`
+    // when re-locking and from the fetcher when restoring. Over plain HTTP that needs the
+    // mirrored repository's own `allowInsecureCredentials`: the private one's covers only itself.
+    java_workspace(ws.path(), &format!("repositories:\n{private}  - central\n"), deps);
+    let config = ws.path().join("user-config.yaml");
+    fs::write(&config, format!("mirrors:\n  - {{url: '{}', mirrorOf: [central]}}\n", server.url("/remote"))).unwrap();
+    let with_config = |cache: &Path| {
+        let mut cmd = scpm(ws.path(), cache);
+        env(&mut cmd);
+        cmd.env("SCPM_CONFIG", &config);
+        cmd
+    };
+    let out = with_config(tempfile::tempdir().unwrap().path()).arg("install").assert().code(2);
+    let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(err.contains("`central`") && err.contains("allowInsecureCredentials"), "{err}");
+    assert!(err.contains("to the user config mirror"), "the mirror's opt-in is suggested first: {err}");
+    assert!(!err.contains("pass"), "{err}");
+
+    // The mirror's own opt-in (a machine choice) covers central reached through it: both paths.
+    let opted_in = |allow: bool| {
+        fs::write(
+            &config,
+            format!(
+                "mirrors:\n  - {{url: '{}', mirrorOf: [central], allowInsecureCredentials: {allow}}}\n",
+                server.url("/remote")
+            ),
+        )
+        .unwrap();
+    };
+    opted_in(true);
+    with_config(tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "central");
+    let empty = tempfile::tempdir().unwrap();
+    with_config(empty.path()).args(["install", "--frozen"]).assert().success();
+    let jar = empty
+        .path()
+        .join(format!("http/alice%40127.0.0.1%3A{}/remote/com/example/hello/1.0/hello-1.0.jar", server.port));
+    assert_eq!(fs::read(&jar).unwrap(), b"hello jar");
+    let explained = with_config(tempfile::tempdir().unwrap().path()).args(["config", "explain"]).assert().success();
+    let explained = String::from_utf8_lossy(&explained.get_output().stdout).into_owned();
+    assert!(
+        explained.contains("credentials over plain HTTP: allowed  (user config, mirror http://127.0.0.1:"),
+        "{explained}"
+    );
+    // With `false`, nothing goes over plain HTTP: the (fresh) lock restores without credentials.
+    opted_in(false);
+    let err = stderr_of(with_config(tempfile::tempdir().unwrap().path()).arg("install"));
+    assert!(err.contains("HTTP 401") && !err.contains("pass"), "{err}");
+    fs::remove_file(ws.path().join("scpm-lock.yaml")).unwrap();
+    fs::write(&config, format!("mirrors:\n  - {{url: '{}', mirrorOf: [central]}}\n", server.url("/remote"))).unwrap();
+
+    // Or central's own opt-in, written in full.
+    let central =
+        format!("  - {{id: central, url: '{}', allowInsecureCredentials: true}}\n", "https://repo1.maven.org/maven2/");
+    java_workspace(ws.path(), &format!("repositories:\n{private}{central}"), deps);
+    with_config(tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "central");
+    let empty = tempfile::tempdir().unwrap();
+    with_config(empty.path()).args(["install", "--frozen"]).assert().success();
+    let jar = empty
+        .path()
+        .join(format!("http/alice%40127.0.0.1%3A{}/remote/com/example/hello/1.0/hello-1.0.jar", server.port));
+    assert_eq!(fs::read(&jar).unwrap(), b"hello jar");
+}
+
+#[test]
+fn relocking_through_a_catch_all_mirror_keeps_repository_ids() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    let renamed = |name: &str| -> std::collections::HashMap<String, Vec<u8>> {
+        hello_repo_files(format!("{name} jar").as_bytes())
+            .into_iter()
+            .map(|(p, b)| (p.replace("hello", name), String::from_utf8(b).unwrap().replace("hello", name).into_bytes()))
+            .collect()
+    };
+    let main = Server::maven(Default::default(), None);
+    let mut acme_files = hello_repo_files(b"hello jar");
+    acme_files.extend(renamed("world"));
+    let acme = Server::maven(acme_files, None);
+    let mut mirrored = moved(hello_repo_files(b"hello jar"), "mirror");
+    mirrored.extend(moved(renamed("world"), "mirror"));
+    let mirror = Server::maven(mirrored, None);
+    let ws = tempfile::tempdir().unwrap();
+    let repos = format!(
+        "repositories:\n  - {{id: main, url: '{}'}}\n  - {{id: acme, url: '{}'}}\n",
+        main.url("/maven"),
+        acme.url("/maven")
+    );
+    java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
+    let cache = tempfile::tempdir().unwrap();
+    scpm(ws.path(), cache.path()).arg("install").assert().success();
+    assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
+
+    // Re-locked through one mirror for both repositories, without error: hello keeps acme. world
+    // is new and only in acme, but which sharer served it can't be told, so the hint is the
+    // first one, main.
+    let deps = "dependencies:\n  com.example:hello: '1.0'\n  com.example:world: '1.0'\n";
+    java_workspace(ws.path(), &repos, deps);
+    let config = ws.path().join("user-config.yaml");
+    fs::write(&config, format!("mirrors:\n  - {{url: '{}', mirrorOf: ['*']}}\n", mirror.url("/mirror"))).unwrap();
+    scpm(ws.path(), cache.path()).env("SCPM_CONFIG", &config).arg("install").assert().success();
+    assert!(mirror.count("/mirror/com/example/world/1.0/world-1.0.pom") > 0, "re-locked through the mirror");
+    let locked = lock(ws.path());
+    assert_eq!(locked["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
+    assert_eq!(locked["artifacts"]["com.example:world:1.0"]["repo"], "main");
+
+    // A restore without the mirror follows the wrong hint, gets a 404 and asks acme next; the
+    // sha256 decides that it is the locked file.
+    let empty = tempfile::tempdir().unwrap();
+    scpm(ws.path(), empty.path()).args(["install", "--frozen"]).assert().success();
+    assert!(main.count("/maven/com/example/world/1.0/world-1.0.jar") >= 1, "the hint was asked first");
+    assert!(acme.count("/maven/com/example/world/1.0/world-1.0.jar") >= 1, "then the next repository");
+    let jar = empty.path().join(format!("http/127.0.0.1%3A{}/maven/com/example/world/1.0/world-1.0.jar", acme.port));
+    assert_eq!(fs::read(jar).unwrap(), b"world jar");
+    // The classpath names the copy that was found.
+    let out = scpm(ws.path(), empty.path()).args(["classpath", "lib", "--frozen"]).assert().success();
+    let classpath = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(classpath.contains(&format!("127.0.0.1%3A{}/maven/com/example/world", acme.port)), "{classpath}");
+}
+
+#[test]
+fn an_internal_name_found_in_a_public_repository_is_not_locked() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    // Dependency confusion: com.example belongs to acme, which lacks hello; public has a copy.
+    let acme = Server::maven(Default::default(), None);
+    let public = Server::maven(hello_repo_files(b"someone else's jar"), None);
+    let ws = tempfile::tempdir().unwrap();
+    let repos = format!(
+        "repositories:\n  - {{id: public, url: '{}'}}\n  - {{id: acme, url: '{}', groups: [com.example]}}\n",
+        public.url("/maven"),
+        acme.url("/maven")
+    );
+    java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
+    let err = stderr_of(scpm(ws.path(), tempfile::tempdir().unwrap().path()).arg("install"));
+    assert!(err.contains("com.example:hello:1.0 was found in repository `public`"), "{err}");
+    assert!(err.contains("may only come from `acme`") && err.contains("dependency confusion"), "{err}");
+    assert!(acme.count("/maven/com/example/hello/1.0/hello-1.0.pom") >= 1, "acme was asked first");
+    assert!(!ws.path().join("scpm-lock.yaml").exists(), "nothing was locked");
+}
+
+#[test]
+fn a_public_name_served_by_a_grouped_repository_is_not_locked() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    // acme is for com.acme, but its URL is a combined one that also proxies public artifacts.
+    let public = Server::maven(Default::default(), None);
+    let acme = Server::maven(hello_repo_files(b"hello jar"), None);
+    let ws = tempfile::tempdir().unwrap();
+    let repos = format!(
+        "repositories:\n  - {{id: public, url: '{}'}}\n  - {{id: acme, url: '{}', groups: [com.acme]}}\n",
+        public.url("/maven"),
+        acme.url("/maven")
+    );
+    java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
+    let err = stderr_of(scpm(ws.path(), tempfile::tempdir().unwrap().path()).arg("install"));
+    assert!(err.contains("com.example:hello:1.0 was served by repository `acme`"), "{err}");
+    assert!(err.contains("may only come from the repositories without `groups` (`public`)"), "{err}");
+    assert!(err.contains("internal-only repository URL") && err.contains("mirror of `central`"), "{err}");
+    assert!(!ws.path().join("scpm-lock.yaml").exists(), "nothing was locked");
+}
+
+#[test]
+fn groups_keep_internal_artifacts_away_from_other_repositories() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    // `public` is declared first and has nothing; `com.example` belongs to `acme` alone.
+    let public = Server::maven(Default::default(), None);
+    let acme = Server::maven(hello_repo_files(b"hello jar"), None);
+    let ws = tempfile::tempdir().unwrap();
+    let repos = format!(
+        "repositories:\n  - {{id: public, url: '{}'}}\n  - {{id: acme, url: '{}', groups: [com.example]}}\n",
+        public.url("/maven"),
+        acme.url("/maven")
+    );
+    java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
+    let asked_public = || public.requests.lock().unwrap().iter().filter(|r| r.path.contains("com/example")).count();
+
+    // Re-locking: `cs` asks the repositories with `groups` first, so it finds hello in acme and
+    // never asks public about it.
+    scpm(ws.path(), tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
+    assert_eq!(asked_public(), 0, "re-lock");
+    // Restoring: only acme is ever a source for com.example.
+    let empty = tempfile::tempdir().unwrap();
+    scpm(ws.path(), empty.path()).args(["install", "--frozen"]).assert().success();
+    assert_eq!(asked_public(), 0, "restore");
+    assert!(acme.count(HELLO_JAR_PATH) >= 2);
+    // Even with a hint naming public (the lock's `repo` is only a hint), public isn't asked.
+    let lock_file = ws.path().join("scpm-lock.yaml");
+    let text = fs::read_to_string(&lock_file).unwrap();
+    assert!(text.contains("repo: acme"), "{text}");
+    fs::write(&lock_file, text.replace("repo: acme", "repo: public")).unwrap();
+    scpm(ws.path(), tempfile::tempdir().unwrap().path()).args(["install", "--frozen"]).assert().success();
+    assert_eq!(asked_public(), 0, "restore with a hint for public");
+}
+
+#[test]
+fn mirrors_serve_both_paths_and_never_reach_the_lock() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    let real = Server::maven(hello_repo_files(b"hello jar"), None);
+    let mirrored: std::collections::HashMap<String, Vec<u8>> =
+        hello_repo_files(b"hello jar").into_iter().map(|(p, b)| (p.replace("/maven/", "/mirror/"), b)).collect();
+    let mirror = Server::maven(mirrored, Some(("alice", "mirror-pass")));
+    let manifest =
+        format!("repositories:\n  - {{id: local, url: '{}', allowInsecureCredentials: true}}\n", real.url("/maven"));
+    let deps = "dependencies:\n  com.example:hello: '1.0'\n";
+    let plain = tempfile::tempdir().unwrap();
+    java_workspace(plain.path(), &manifest, deps);
+    scpm(plain.path(), tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    let real_requests = real.requests.lock().unwrap().len();
+    assert!(real_requests > 0);
+
+    // The same workspace through a mirror; its credentials are matched against the mirror's URL.
+    let ws = tempfile::tempdir().unwrap();
+    java_workspace(ws.path(), &manifest, deps);
+    let config = ws.path().join("user-config.yaml");
+    fs::write(
+        &config,
+        format!(
+            "mirrors:\n  - {{url: '{m}', mirrorOf: [local]}}\ncredentials:\n  - {{url: '{m}', user: alice, password: 'env:MIRROR_PASS'}}\n",
+            m = mirror.url("/mirror")
+        ),
+    )
+    .unwrap();
+    let with_mirror = |cache: &Path| {
+        let mut cmd = scpm(ws.path(), cache);
+        cmd.env("SCPM_CONFIG", &config).env("MIRROR_PASS", "mirror-pass");
+        cmd
+    };
+    with_mirror(tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    assert_eq!(
+        fs::read(ws.path().join("scpm-lock.yaml")).unwrap(),
+        fs::read(plain.path().join("scpm-lock.yaml")).unwrap(),
+        "the lock is byte-identical with and without the mirror"
+    );
+    // A restore downloads from the mirror too, into the mirror's place in coursier's cache.
+    let empty = tempfile::tempdir().unwrap();
+    with_mirror(empty.path()).args(["install", "--frozen"]).assert().success();
+    let jar = empty
+        .path()
+        .join(format!("http/alice%40127.0.0.1%3A{}/mirror/com/example/hello/1.0/hello-1.0.jar", mirror.port));
+    assert_eq!(fs::read(&jar).unwrap(), b"hello jar");
+    assert!(mirror.count("/mirror/com/example/hello/1.0/hello-1.0.jar") >= 2, "both paths used the mirror");
+    assert_eq!(real.requests.lock().unwrap().len(), real_requests, "the repository itself is never asked");
+}
+
+#[test]
+fn both_paths_use_exactly_the_resolved_proxy() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    // A forward proxy for a repository whose host doesn't resolve: requests arrive in absolute form.
+    let repo = "http://repo.scpm-test.invalid/maven";
+    let files: std::collections::HashMap<String, Vec<u8>> = hello_repo_files(b"hello jar")
+        .into_iter()
+        .map(|(p, b)| (format!("http://repo.scpm-test.invalid{p}"), b))
+        .collect();
+    let proxy = Server::maven(files, None);
+    let ws = tempfile::tempdir().unwrap();
+    java_workspace(
+        ws.path(),
+        &format!("repositories:\n  - {{id: remote, url: '{repo}'}}\n"),
+        "dependencies:\n  com.example:hello: '1.0'\n",
+    );
+    let config = ws.path().join("user-config.yaml");
+    fs::write(&config, format!("proxy:\n  http: '127.0.0.1:{}'\n", proxy.port)).unwrap();
+    let dead = "http://127.0.0.1:1";
+    let jar = |cache: &Path| cache.join("http/repo.scpm-test.invalid/maven/com/example/hello/1.0/hello-1.0.jar");
+    // Every other way a proxy could reach `cs` points at the dead one: Maven's settings.xml
+    // (which coursier reads for proxies even with `COURSIER_MAVEN_SETTINGS=false`) and the JVM
+    // option variables (which only a JVM launcher reads; scpm sets `JAVA_TOOL_OPTIONS` itself
+    // for one). Coursier's cache server would take every download, and a checksum policy only
+    // SHA-512 satisfies fails on this repository, which serves no checksum files.
+    let m2 = ws.path().join("hostile-m2");
+    fs::create_dir_all(&m2).unwrap();
+    fs::write(
+        m2.join("settings.xml"),
+        "<settings><proxies><proxy><active>true</active><protocol>http</protocol>\
+         <host>127.0.0.1</host><port>1</port></proxy></proxies></settings>",
+    )
+    .unwrap();
+    let dead_properties = "-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=1 -Dhttp.nonProxyHosts=nothing";
+    let hostile_jvm = |cmd: &mut Command| {
+        cmd.env("CS_MAVEN_HOME", &m2).env("MAVEN_HOME", &m2).env("HOME", ws.path());
+        cmd.env("COURSIER_CACHE_SERVER", dead).env("COURSIER_CACHE_SERVER_USER", "u");
+        cmd.env("COURSIER_CACHE_SERVER_PASSWORD", "p").env("COURSIER_CHECKSUMS", "SHA-512");
+        for var in ["JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS", "JAVA_OPTS"] {
+            cmd.env(var, dead_properties);
+        }
+    };
+
+    // The user config's proxy wins over the environment's, for `cs` and for the fetcher.
+    let cache = tempfile::tempdir().unwrap();
+    let mut cmd = scpm(ws.path(), cache.path());
+    hostile_jvm(&mut cmd);
+    cmd.env("SCPM_CONFIG", &config).env("HTTP_PROXY", dead).arg("install").assert().success();
+    let empty = tempfile::tempdir().unwrap();
+    scpm(ws.path(), empty.path())
+        .env("SCPM_CONFIG", &config)
+        .env("http_proxy", dead)
+        .args(["install", "--frozen"])
+        .assert()
+        .success();
+    assert_eq!(fs::read(jar(empty.path())).unwrap(), b"hello jar");
+    assert!(proxy.count(&format!("{repo}/com/example/hello/1.0/hello-1.0.jar")) >= 2);
+
+    // Without a user config proxy, `HTTP_PROXY` applies to both paths.
+    fs::remove_file(ws.path().join("scpm-lock.yaml")).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let proxy_url = format!("http://127.0.0.1:{}", proxy.port);
+    scpm(ws.path(), cache.path()).env("HTTP_PROXY", &proxy_url).arg("install").assert().success();
+    let empty = tempfile::tempdir().unwrap();
+    scpm(ws.path(), empty.path()).env("HTTP_PROXY", &proxy_url).args(["install", "--frozen"]).assert().success();
+    assert_eq!(fs::read(jar(empty.path())).unwrap(), b"hello jar");
+
+    // Proxy authentication is not supported: a clear error that never repeats the password,
+    // and only when something must be downloaded.
+    let with_user = format!("http://alice:s3cret@127.0.0.1:{}", proxy.port);
+    let err = stderr_of(
+        scpm(ws.path(), tempfile::tempdir().unwrap().path())
+            .env("HTTP_PROXY", &with_user)
+            .args(["install", "--frozen"]),
+    );
+    assert!(err.contains("HTTP_PROXY") && err.contains("proxy authentication is not supported"), "{err}");
+    assert!(!err.contains("s3cret"), "{err}");
+    scpm(ws.path(), empty.path()).env("HTTP_PROXY", &with_user).args(["install", "--frozen"]).assert().success();
+    // A `#` in the password used to end the authority early and land the value in the error.
+    let hashed = format!("http://alice:pa#ss@127.0.0.1:{}", proxy.port);
+    let err = stderr_of(
+        scpm(ws.path(), tempfile::tempdir().unwrap().path()).env("HTTP_PROXY", &hashed).args(["install", "--frozen"]),
+    );
+    assert!(err.contains("proxy authentication is not supported") && !err.contains("pa#ss"), "{err}");
+
+    // An unusable proxy for a scheme no repository uses blocks nothing, on either path.
+    fs::remove_file(ws.path().join("scpm-lock.yaml")).unwrap();
+    let with_socks = |cache: &Path| {
+        let mut cmd = scpm(ws.path(), cache);
+        cmd.env("HTTPS_PROXY", "socks5://127.0.0.1:1080").env("HTTP_PROXY", &proxy_url);
+        cmd
+    };
+    with_socks(tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    let empty = tempfile::tempdir().unwrap();
+    with_socks(empty.path()).args(["install", "--frozen"]).assert().success();
+    assert_eq!(fs::read(jar(empty.path())).unwrap(), b"hello jar");
+}
+
+#[test]
 fn concurrent_installs_all_succeed() {
     if !cs_available() {
         return;
@@ -740,4 +1202,121 @@ fn pom_packaged_dependencies_resolve_to_their_dependencies() {
     scpm(ws.path(), &shared_cache()).arg("install").assert().success();
     let cp = strings(&lock(ws.path())["variants"]["lib@jvm"]["compileClasspath"]);
     assert!(cp.iter().any(|k| k.starts_with("org.apache.groovy:groovy:4.0.24")), "{cp:?}");
+}
+
+/// A file:// Maven repository holding `com.example:hello:1.0` with the given jar bytes.
+fn file_repo(dir: &Path, jar: &[u8]) -> String {
+    for (path, body) in hello_repo_files(jar) {
+        let file = dir.join(path.trim_start_matches('/'));
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, body).unwrap();
+    }
+    format!("file://{}/maven", dir.display())
+}
+
+/// Every mirror source coursier reads by itself, each sending `from` to `to` (design §5.9).
+fn hostile_coursier_env(dir: &Path, from: &str, to: &str) -> Vec<(&'static str, PathBuf)> {
+    let mirrors = dir.join("hostile-mirrors.properties");
+    fs::write(&mirrors, format!("m.from={from}\nm.to={to}\n")).unwrap();
+    let config_dir = dir.join("hostile-coursier-config");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::copy(&mirrors, config_dir.join("mirror.properties")).unwrap();
+    let maven = dir.join("hostile-m2");
+    fs::create_dir_all(&maven).unwrap();
+    fs::write(
+        maven.join("settings.xml"),
+        format!(
+            "<settings><mirrors><mirror><id>corp</id><mirrorOf>*</mirrorOf><url>{to}</url></mirror></mirrors></settings>"
+        ),
+    )
+    .unwrap();
+    vec![
+        ("COURSIER_MIRRORS", mirrors.clone()),
+        ("COURSIER_CONFIG_DIR", config_dir),
+        ("COURSIER_EXTRA_MIRRORS", mirrors),
+        ("MAVEN_HOME", maven.clone()),
+        ("CS_MAVEN_HOME", maven),
+    ]
+}
+
+#[test]
+fn foreign_mirror_settings_do_not_redirect_cs() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    let server = Server::maven(hello_repo_files(b"the real jar"), None);
+    let ws = tempfile::tempdir().unwrap();
+    let elsewhere = file_repo(&ws.path().join("elsewhere"), b"a hostile jar");
+    let hostile = hostile_coursier_env(ws.path(), &server.url("/maven"), &elsewhere);
+    // Each source on its own redirects a plain `cs`, so this test notices if one stops working.
+    let cs = std::env::var("SCPM_CS").unwrap_or_else(|_| "cs".into());
+    for (var, value) in &hostile {
+        let cache = tempfile::tempdir().unwrap();
+        let out = StdCommand::new(&cs)
+            .args(["fetch", "--no-default", "-r", &server.url("/maven"), "com.example:hello:1.0", "--cache"])
+            .arg(cache.path())
+            .env_remove("COURSIER_MIRRORS")
+            .env_remove("COURSIER_MAVEN_SETTINGS")
+            .env(var, value)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("/elsewhere/"), "{var} should redirect a plain cs: {stdout}");
+    }
+
+    java_workspace(
+        ws.path(),
+        &format!("repositories:\n  - {{id: local, url: '{}'}}\n", server.url("/maven")),
+        "dependencies:\n  com.example:hello: '1.0'\n",
+    );
+    let cache = tempfile::tempdir().unwrap();
+    let hostile_scpm = || {
+        let mut cmd = scpm(ws.path(), cache.path());
+        cmd.envs(hostile.iter().map(|(k, v)| (*k, v.as_os_str())))
+            .env("COURSIER_MODE", "offline")
+            .env("COURSIER_TTL", "0")
+            .env("COURSIER_REPOSITORIES", &elsewhere)
+            // Not the developer's own ~/.m2.
+            .env("HOME", ws.path());
+        cmd
+    };
+    let out = hostile_scpm().arg("install").assert().success();
+    assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "local");
+    let jar = cache.path().join(format!("http/127.0.0.1%3A{}/maven/com/example/hello/1.0/hello-1.0.jar", server.port));
+    assert_eq!(fs::read(jar).unwrap(), b"the real jar");
+    assert!(server.count(HELLO_JAR_PATH) >= 1);
+
+    // One notice names an ignored setting that touched the repository, and how to see more.
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert_eq!(stderr.matches("note:").count(), 1, "{stderr}");
+    assert!(stderr.contains("~/hostile-m2/settings.xml (CS_MAVEN_HOME): mirror \"corp\" for *"), "{stderr}");
+    // The other two files, and COURSIER_MODE, COURSIER_TTL and COURSIER_REPOSITORIES, which this
+    // re-lock's `cs` didn't get.
+    assert!(stderr.contains("is ignored for local (and 5 more settings)"), "{stderr}");
+    assert!(stderr.contains("scpm config explain"), "{stderr}");
+    let explained = hostile_scpm().args(["config", "explain"]).assert().success();
+    let explained = String::from_utf8_lossy(&explained.get_output().stdout).into_owned();
+    for name in ["COURSIER_MODE", "COURSIER_TTL", "COURSIER_REPOSITORIES"] {
+        assert!(explained.contains(name), "{name}: {explained}");
+    }
+    assert!(!explained.contains("offline"), "names only, never values: {explained}");
+    // `why --json` keeps the notice of the install it runs first.
+    let fresh = tempfile::tempdir().unwrap();
+    let mut cmd = scpm(ws.path(), fresh.path());
+    cmd.envs(hostile.iter().map(|(k, v)| (*k, v.as_os_str()))).env("HOME", ws.path());
+    let out = cmd.args(["--json", "why", "com.example:hello"]).assert().success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(report["notices"].as_array().map(Vec::len), Some(1), "{report}");
+    assert!(report["notices"][0].as_str().unwrap().contains("settings.xml (CS_MAVEN_HOME)"), "{report}");
+    // Nothing contacted, no notice.
+    let out = hostile_scpm().arg("install").assert().success();
+    assert!(!String::from_utf8_lossy(&out.get_output().stderr).contains("note:"));
+    // A failure that may be caused by an ignored setting carries the notice too.
+    java_workspace(
+        ws.path(),
+        "repositories:\n  - {id: local, url: 'http://127.0.0.1:1/maven'}\n",
+        "dependencies:\n  com.example:hello: '1.0'\n",
+    );
+    let err = stderr_of(hostile_scpm().arg("install"));
+    assert!(err.contains("note: ") && err.contains("scpm config explain"), "{err}");
 }

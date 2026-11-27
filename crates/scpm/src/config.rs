@@ -118,6 +118,13 @@ pub struct RepositoryDef {
     /// this URL's scheme, host and port.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_insecure_credentials: bool,
+    /// Group-id prefixes (`com.acme` covers `com.acme` and `com.acme.*`) served only by this
+    /// repository and any other that lists the same longest prefix: those artifacts are
+    /// restored from nowhere else, and nothing else is restored from here. Without it, the
+    /// repository serves every group no repository claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub groups: Option<Vec<String>>,
 }
 
 /// `env:VAR` (bearer token) or `{user: env:U, password: env:P}` (basic auth).
