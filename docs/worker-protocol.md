@@ -104,7 +104,8 @@ sources Zinc compiled in this run (changed plus invalidated, across all incremen
 A compile that overflows the stack is answered `crashed` and the worker keeps serving. Any other
 fatal JVM error (`VirtualMachineError`: `InternalError`, `OutOfMemoryError` when
 `-XX:+ExitOnOutOfMemoryError` did not already end the JVM) is answered `crashed`, then the worker
-exits with status 3; the CLI restarts it.
+exits with status 3. The CLI does not replace the worker within the same command: the remaining
+compile requests fail with the worker error. The next command starts a new worker.
 
 ### `cancel`
 

@@ -439,7 +439,7 @@ fn configured_credentials_reach_cs_through_a_private_file() {
     let ws = tempfile::tempdir().unwrap();
     let manifest = |opt_in: &str| {
         format!(
-            "repositories:\n  - id: local\n    url: '{}'\n    credentials: {{user: 'env:REPO_USER', password: 'env:REPO_PASS'}}\n{opt_in}",
+            "repositories:\n  - id: local\n    url: '{}'\n    credentials: {{user: 'env:REPO_USER', password: 'env:REPO_PASS'}}\n{opt_in}  - central\n",
             server.url("/maven")
         )
     };
@@ -498,7 +498,8 @@ fn coursier_credentials_are_used_for_repositories_without_configured_ones() {
     // Without the repository's opt-in, not even `cs` gets them over plain HTTP.
     java_workspace(
         ws.path(),
-        &format!("repositories:\n  - {{id: local, url: '{}'}}\n", server.url("/maven")),
+        // Central serves the compiler and worker boot closures.
+        &format!("repositories:\n  - {{id: local, url: '{}'}}\n  - central\n", server.url("/maven")),
         "dependencies:\n  com.example:hello: '1.0'\n",
     );
     let err = stderr_of(scpm(ws.path(), cache.path()).env("COURSIER_CREDENTIALS", &props).arg("install"));
@@ -507,7 +508,10 @@ fn coursier_credentials_are_used_for_repositories_without_configured_ones() {
 
     java_workspace(
         ws.path(),
-        &format!("repositories:\n  - {{id: local, url: '{}', allowInsecureCredentials: true}}\n", server.url("/maven")),
+        &format!(
+            "repositories:\n  - {{id: local, url: '{}', allowInsecureCredentials: true}}\n  - central\n",
+            server.url("/maven")
+        ),
         "dependencies:\n  com.example:hello: '1.0'\n",
     );
     scpm(ws.path(), cache.path()).env("COURSIER_CREDENTIALS", &props).arg("install").assert().success();
@@ -1054,7 +1058,8 @@ fn boot_entries_follow_their_inputs() {
     let text = fs::read_to_string(&wsfile).unwrap();
     fs::write(&wsfile, format!("{text}lock:\n  resolutionContext: {{jdk: '21'}}\n")).unwrap();
     let summary = json_install(ws.path(), &shared_cache(), &[]);
-    assert_eq!(summary["bootRelocked"].as_array().unwrap().len(), 4, "{summary}");
+    // Two compilers and two bridges, plus the worker and test-runner closures.
+    assert_eq!(summary["bootRelocked"].as_array().unwrap().len(), 6, "{summary}");
     let l = lock(ws.path());
     assert_ne!(l["bootInputs"], before);
     assert_eq!(strings(&l["boot"]["scala-compiler@3.9.0"]), full);

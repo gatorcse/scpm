@@ -21,6 +21,11 @@ Milestones land as a stack of PRs; see [docs/roadmap.md](docs/roadmap.md).
   exclusions, compiler boot closures) and restores locked jars into the coursier cache with
   the Rust fetcher; `scpm why`, `scpm classpath`. Needs the native coursier CLI (`cs`) on
   `PATH` (or `SCPM_CS`); the network tests in `tests/install.rs` skip without it.
+- **M3:** `scpm compile [--tests]`: variants compile in dependency order on the Zinc
+  worker (`worker/`), unchanged variants are skipped by a Rust fingerprint without
+  starting a JVM, and every run writes `.scpm/runs/*.ndjson`. Output is text, GitHub
+  Actions annotations plus a step summary (automatic under `GITHUB_ACTIONS`), or `--json`.
+  Build the worker first: `cd worker && sbt package` (or set `SCPM_WORKER_JAR`).
 
 ## Development
 

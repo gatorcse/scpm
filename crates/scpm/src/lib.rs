@@ -6,6 +6,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod cli;
+pub mod compile;
 pub mod config;
 pub mod coord;
 pub mod coursier;
@@ -21,8 +22,10 @@ pub mod lockfile;
 pub mod machine;
 pub mod merge;
 pub mod platform;
+pub mod report;
 pub mod selector;
 pub mod semver;
 pub mod version;
 pub mod why;
+pub mod worker;
 pub mod workspace;
