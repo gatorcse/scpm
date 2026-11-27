@@ -889,16 +889,32 @@ pub fn shared_credentials(
     lookup: &dyn Fn(&str) -> Option<String>,
     missing: &mut Vec<String>,
 ) -> Result<Vec<Option<Auth>>, CoursierError> {
-    Ok(credential_sources(repos, lookup, missing)?.into_iter().map(|s| s.map(|(_, auth)| auth)).collect())
+    let found = credential_sources(repos, lookup, missing);
+    if let Some(clash) = found.clashes.into_iter().next() {
+        return Err(CoursierError::CredentialClash(clash));
+    }
+    Ok(found.sources.into_iter().map(|s| s.map(|(_, auth)| auth)).collect())
+}
+
+/// What [`credential_sources`] found.
+#[derive(Debug, Default)]
+pub struct CredentialSources {
+    /// Per repository, its origin's credentials and the index of the first repository on the
+    /// origin whose readable credentials they are. On an origin in `clashes`, each repository
+    /// has only its own.
+    pub sources: Vec<Option<(usize, Auth)>>,
+    /// One per origin whose repositories have different readable credentials, naming two of
+    /// them. `cs` can't keep those apart; the Rust fetcher sends each repository its own.
+    pub clashes: Vec<crate::diag::Diagnostic>,
 }
 
 /// [`shared_credentials`], each with the index of the first repository on the origin whose
-/// readable credentials they are.
+/// readable credentials they are; a clash affects only its own origin.
 pub fn credential_sources(
     repos: &[Repo],
     lookup: &dyn Fn(&str) -> Option<String>,
     missing: &mut Vec<String>,
-) -> Result<Vec<Option<(usize, Auth)>>, CoursierError> {
+) -> CredentialSources {
     let own: Vec<Option<Auth>> = repos
         .iter()
         .map(|repo| {
@@ -911,12 +927,14 @@ pub fn credential_sources(
     let origin_of = |r: &Repo| r.origin().map(crate::machine::comparable_url);
     // Each origin with credentials, and the first repository that has them.
     let mut origins: Vec<(String, usize)> = Vec::new();
+    let mut clashed: Vec<String> = Vec::new();
+    let mut clashes = Vec::new();
     for (i, repo) in repos.iter().enumerate() {
         let (Some(origin), Some(auth)) = (origin_of(repo), &own[i]) else { continue };
         match origins.iter().find(|(o, _)| *o == origin) {
-            Some((_, first)) if own[*first].as_ref() != Some(auth) => {
+            Some((_, first)) if own[*first].as_ref() != Some(auth) && !clashed.contains(&origin) => {
                 let other = &repos[*first];
-                return Err(CoursierError::CredentialClash(
+                clashes.push(
                     crate::diag::Diagnostic::new(format!(
                         "repositories `{}` ({}) and `{}` ({}) have different credentials but share the origin {origin}; \
                          coursier scopes credentials by scheme, host and port only, so scpm won't guess which to send",
@@ -926,20 +944,26 @@ pub fn credential_sources(
                         repo.fetch_url(),
                     ))
                     .with_help("give both the same credentials, or reach one of them through another host or port"),
-                ));
+                );
+                clashed.push(origin);
             }
             Some(_) => {}
             None => origins.push((origin, i)),
         }
     }
-    Ok(repos
+    let sources = repos
         .iter()
-        .map(|repo| {
+        .enumerate()
+        .map(|(i, repo)| {
             let origin = origin_of(repo)?;
+            if clashed.contains(&origin) {
+                return own[i].clone().map(|auth| (i, auth));
+            }
             let first = origins.iter().find(|(o, _)| *o == origin)?.1;
             own[first].clone().map(|auth| (first, auth))
         })
-        .collect())
+        .collect();
+    CredentialSources { sources, clashes }
 }
 
 /// The credentials file for `cs`: each origin's credentials ([`shared_credentials`]), then
@@ -980,13 +1004,32 @@ fn credential_properties(
     // there, and `cs` does not take entries in file order (with `cs` 2.1.27, a `coursier0`
     // entry beat an `scpm0` one wherever it was written), so a second matching entry could win.
     let allowed = coursier.restricted(&insecure_credential_origins(repos));
+    // An entry that also matches such an origin (`repo.example` matches every port) is kept,
+    // scoped to each configured origin it still serves, so a repository on another port gets it
+    // from `cs` as it does from the fetcher.
     let shadowed = |c: &crate::credentials::CoursierCredential| written.iter().any(|o| c.applies_to(&format!("{o}/")));
-    for (i, c) in allowed.entries.iter().enumerate().filter(|(_, c)| !shadowed(c)) {
+    let written_origins: Vec<String> = written.iter().map(|o| crate::machine::comparable_url(o)).collect();
+    for (i, c) in allowed.entries.iter().enumerate() {
         let mut extra = vec![("auto", c.auto.to_string()), ("https-only", c.https_only.to_string())];
         if let Some(realm) = &c.realm {
             extra.push(("realm", realm.clone()));
         }
-        entry(format!("coursier{i}"), &c.host_spec(), &c.user, &c.password, &extra);
+        if !shadowed(c) {
+            entry(format!("coursier{i}"), &c.host_spec(), &c.user, &c.password, &extra);
+            continue;
+        }
+        let mut kept: Vec<String> = Vec::new();
+        for origin in repos.iter().filter_map(Repo::origin) {
+            let comparable = crate::machine::comparable_url(origin);
+            if written_origins.contains(&comparable)
+                || kept.contains(&comparable)
+                || !c.applies_to(&format!("{origin}/"))
+            {
+                continue;
+            }
+            entry(format!("coursier{i}x{}", kept.len()), origin, &c.user, &c.password, &extra);
+            kept.push(comparable);
+        }
     }
     Ok(properties)
 }
@@ -1216,6 +1259,17 @@ mod tests {
         let mut users: Vec<&str> = parsed.iter().map(|c| c.user.as_str()).collect();
         users.sort();
         assert_eq!(users, ["carol", "token"], "{text}");
+
+        // A repository on another port of acme's host still gets the host-wide entry, scoped to
+        // its own origin, as the fetcher sends it.
+        let mut repos = repos.to_vec();
+        repos.push(Repo { id: "acme-8443".into(), url: "https://acme.example:8443/m/".into(), ..Default::default() });
+        let text = credential_properties(&repos, &|_| None, &coursier, &mut Vec::new()).unwrap();
+        let parsed = crate::credentials::CoursierCredentials { entries: crate::credentials::parse_properties(&text) };
+        assert_eq!(parsed.find("https://acme.example:8443/m/x.jar").unwrap().user, "alice", "{text}");
+        assert_eq!(parsed.find("https://acme.example/m/x.jar").unwrap().user, "token", "{text}");
+        let acme_entries = parsed.entries.iter().filter(|c| c.applies_to("https://acme.example/m/")).count();
+        assert_eq!(acme_entries, 1, "only scpm's matches acme's origin: {text}");
     }
 
     #[test]
@@ -1252,6 +1306,24 @@ mod tests {
             assert!(err.contains("share the origin https://maven.pkg.github.com;"), "{err}");
             assert!(!err.contains("secret-"), "{err}");
         }
+        // For the fetcher, a clash affects only its origin: each repository there keeps its own,
+        // and another origin's credentials are still shared.
+        let found = credential_sources(
+            &[
+                repo("orgA", "https://maven.pkg.github.com/orgA/", token("TOKEN_A")),
+                repo("orgB", "https://maven.pkg.github.com/orgB/", token("TOKEN_B")),
+                repo("orgC", "https://maven.pkg.github.com/orgC/", None),
+                repo("acme", "https://acme.example/libs/", token("TOKEN_A")),
+                repo("acme-snapshots", "https://acme.example/snapshots/", None),
+            ],
+            &lookup,
+            &mut Vec::new(),
+        );
+        assert_eq!(found.clashes.len(), 1);
+        assert!(found.clashes[0].message.contains("`orgA`") && found.clashes[0].message.contains("`orgB`"));
+        let a = Some(Auth::Bearer("secret-a".into()));
+        let auths: Vec<Option<Auth>> = found.sources.into_iter().map(|s| s.map(|(_, auth)| auth)).collect();
+        assert_eq!(auths, [a.clone(), Some(Auth::Bearer("secret-b".into())), None, a.clone(), a]);
 
         // A mirror without credentials on a private repository's origin gets the origin's,
         // from `cs` and from the fetcher alike.

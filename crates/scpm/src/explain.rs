@@ -163,7 +163,7 @@ fn build(
         },
     };
     // What both download paths send each repository: its origin's readable credentials.
-    let sources = coursier::credential_sources(repos, env, &mut Vec::new()).unwrap_or_else(|_| vec![None; repos.len()]);
+    let coursier::CredentialSources { sources, clashes } = coursier::credential_sources(repos, env, &mut Vec::new());
     let repositories = repos
         .iter()
         .enumerate()
@@ -229,7 +229,8 @@ fn build(
             .into_iter()
             .map(|(f, ids)| IgnoredSetting { file: f.file, setting: f.setting, repositories: ids })
             .collect(),
-        warnings: machine.warnings.clone(),
+        // A clash stops a re-lock, so the report must not look like a working configuration.
+        warnings: machine.warnings.iter().cloned().chain(clashes.iter().map(|c| c.message.clone())).collect(),
     }
 }
 

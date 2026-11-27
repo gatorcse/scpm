@@ -63,14 +63,14 @@ fn realm_scoped_credentials_wait_for_a_matching_challenge() {
     let cache = tempfile::tempdir().unwrap();
 
     let other = CoursierCredentials::from_env_value(&format!("http://127.0.0.1:{}(other) alice:s3cret", server.port));
-    let items = fetch_items(&hello_lock(), &repos, &other, cache.path()).unwrap();
+    let items = fetch_items(&hello_lock(), &repos, &other, cache.path(), &mut Vec::new()).unwrap();
     assert!(matches!(items[0].auth, Ok(None)), "realm-scoped credentials are not sent up front");
     let err = fetch_all(items, FetchOptions::default()).unwrap_err().to_string();
     assert!(err.contains("HTTP 401"), "{err}");
     assert!(server.requests.lock().unwrap().iter().all(|r| r.authorization.is_none()), "wrong realm: never sent");
 
     let creds = CoursierCredentials::from_env_value(&format!("http://127.0.0.1:{}(test) alice:s3cret", server.port));
-    let items = fetch_items(&hello_lock(), &repos, &creds, cache.path()).unwrap();
+    let items = fetch_items(&hello_lock(), &repos, &creds, cache.path(), &mut Vec::new()).unwrap();
     // Not matched up front, so coursier's cache path has no `user@`.
     assert!(!items[0].dest.to_string_lossy().contains("alice"));
     assert_eq!(fetch_all(items, FetchOptions::default()).unwrap().downloaded, 1);
@@ -209,11 +209,12 @@ fn coursier_credentials_authenticate_and_name_the_cache_directory() {
     let cache = tempfile::tempdir().unwrap();
 
     // Without credentials the server refuses.
-    let anonymous = fetch_items(&hello_lock(), &repos, &CoursierCredentials::default(), cache.path()).unwrap();
+    let anonymous =
+        fetch_items(&hello_lock(), &repos, &CoursierCredentials::default(), cache.path(), &mut Vec::new()).unwrap();
     let err = fetch_all(anonymous, FetchOptions::default()).unwrap_err().to_string();
     assert!(err.contains("HTTP 401") && err.contains("credentials"), "{err}");
 
-    let items = fetch_items(&hello_lock(), &repos, &creds, cache.path()).unwrap();
+    let items = fetch_items(&hello_lock(), &repos, &creds, cache.path(), &mut Vec::new()).unwrap();
     assert!(matches!(&items[0].auth, Ok(Some(Auth::Basic { user, .. })) if user == "alice"));
     // coursier's FileCache puts the user in the path: `http/alice@127.0.0.1:<port>/…`.
     let expected = cache
@@ -246,9 +247,9 @@ fn coursier_credentials_need_the_repository_opt_in_over_http() {
         format!("x.host=http://127.0.0.1:{}\nx.username=alice\nx.password=s3cret\n", server.port),
     ] {
         let creds = CoursierCredentials { entries: scpm::credentials::parse_properties(&creds) };
-        let items = fetch_items(&hello_lock(), &repo(false), &creds, cache.path()).unwrap();
+        let items = fetch_items(&hello_lock(), &repo(false), &creds, cache.path(), &mut Vec::new()).unwrap();
         assert!(matches!(items[0].auth, Ok(None)) && items[0].challenge.is_empty(), "{creds:?}");
-        let items = fetch_items(&hello_lock(), &repo(true), &creds, cache.path()).unwrap();
+        let items = fetch_items(&hello_lock(), &repo(true), &creds, cache.path(), &mut Vec::new()).unwrap();
         assert!(matches!(&items[0].auth, Ok(Some(Auth::Basic { user, .. })) if user == "alice"), "{creds:?}");
     }
 }
@@ -264,7 +265,7 @@ fn https_only_coursier_credentials_are_not_sent_over_http() {
         ..Default::default()
     }];
     let cache = tempfile::tempdir().unwrap();
-    let items = fetch_items(&hello_lock(), &repos, &creds, cache.path()).unwrap();
+    let items = fetch_items(&hello_lock(), &repos, &creds, cache.path(), &mut Vec::new()).unwrap();
     assert!(matches!(items[0].auth, Ok(None)));
     let attempted: BTreeMap<_, _> = BTreeMap::from([("dest", items[0].dest.clone())]);
     assert!(!attempted["dest"].to_string_lossy().contains("alice"));

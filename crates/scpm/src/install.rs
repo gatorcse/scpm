@@ -697,7 +697,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     }
 
     let fetch_started = Instant::now();
-    let items = fetch_items(&lock, &repos, &CoursierCredentials::load(), &cache)?;
+    let items = fetch_items(&lock, &repos, &CoursierCredentials::load(), &cache, &mut warnings)?;
     let fetch = fetch::fetch_all(items, FetchOptions { verify: opts.verify, proxy: machine.proxy.clone() })
         .map_err(|f| with_notice(InstallError::Fetch(f), &repos))?;
     let contacted = !stale.is_empty() || !missing_boot.is_empty() || fetch.downloaded > 0;
@@ -941,14 +941,21 @@ pub fn fetch_items(
     repos: &[Repo],
     creds: &CoursierCredentials,
     cache: &Path,
+    warnings: &mut Vec<String>,
 ) -> Result<Vec<FetchItem>, InstallError> {
     // Coursier's own credentials go over plain HTTP only to repositories that opt in.
     let creds = creds.restricted(&coursier::insecure_credential_origins(repos));
-    // Origins with different credentials only stop `cs`; here each repository keeps its own.
-    let shared = coursier::shared_credentials(repos, &|var| std::env::var(var).ok(), &mut Vec::new())
-        .unwrap_or_else(|_| vec![None; repos.len()]);
-    let access: HashMap<&str, RepoAccess> =
-        repos.iter().zip(shared).map(|(r, s)| (r.id.as_str(), repo_access(r, s, &creds))).collect();
+    // Origins with different credentials only stop `cs`; here each repository on such an origin
+    // keeps its own, and every other origin still shares its credentials.
+    let found = coursier::credential_sources(repos, &|var| std::env::var(var).ok(), &mut Vec::new());
+    for clash in &found.clashes {
+        warnings.push(format!("{}; each repository there gets its own when restoring", clash.message));
+    }
+    let access: HashMap<&str, RepoAccess> = repos
+        .iter()
+        .zip(found.sources)
+        .map(|(r, s)| (r.id.as_str(), repo_access(r, s.map(|(_, auth)| auth), &creds)))
+        .collect();
     let mut items = Vec::new();
     for key in lock.referenced_artifacts() {
         let art = lock.artifacts.get(key).ok_or_else(|| {
@@ -1004,10 +1011,11 @@ pub fn classpath_files(
     let (repos, _) = repositories(ws)?;
     let cache = coursier::cache_dir();
     let variant = lock.variants.get(id).ok_or_else(|| InstallError::Stale(vec![id.to_string()]))?;
-    let by_key: HashMap<String, FetchItem> = fetch_items(lock, &repos, &CoursierCredentials::load(), &cache)?
-        .into_iter()
-        .map(|i| (i.key.clone(), i))
-        .collect();
+    let by_key: HashMap<String, FetchItem> =
+        fetch_items(lock, &repos, &CoursierCredentials::load(), &cache, &mut Vec::new())?
+            .into_iter()
+            .map(|i| (i.key.clone(), i))
+            .collect();
     Ok(kind
         .entries(variant)
         .iter()
@@ -1179,7 +1187,8 @@ mod tests {
             allow_insecure_credentials: false,
             ..Default::default()
         }];
-        let err = fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c")).unwrap_err();
+        let err =
+            fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c"), &mut Vec::new()).unwrap_err();
         assert!(err.to_string().contains("invalid artifact key"), "{err}");
     }
 
@@ -1242,7 +1251,8 @@ mod tests {
         record_artifacts(&mut lock, [&resolved], &repos).unwrap();
         assert_eq!(lock.artifacts["g:a:1"].repo, "own");
         lock.boot.insert("b".into(), vec!["g:a:1".into()]);
-        let items = fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c")).unwrap();
+        let items =
+            fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c"), &mut Vec::new()).unwrap();
         assert_eq!(items[0].url, "https://m/all/own/g/a/1/a-1.jar");
         assert_eq!(items[0].dest, Path::new("/c/https/m/all/own/g/a/1/a-1.jar"));
     }
@@ -1267,7 +1277,8 @@ mod tests {
         let mut lock = Lockfile::default();
         lock.artifacts.insert("g:a:1".into(), ArtifactLock { repo: "central".into(), sha256: "0".into(), size: 1 });
         lock.boot.insert("b".into(), vec!["g:a:1".into()]);
-        let items = fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c")).unwrap();
+        let items =
+            fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c"), &mut Vec::new()).unwrap();
         assert_eq!(items[0].auth, Ok(Some(Auth::Bearer("t0k".into()))));
         assert!(
             items[0].dest.starts_with("/c/https/token%40acme.example%3A443/remote/"),
