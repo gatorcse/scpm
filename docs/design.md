@@ -875,15 +875,15 @@ dependencies:
 - **The system set.**
   - When `lock.systems` is unset and the header carries `defaultSystems: <set version>`, **the header governs** (default; user may revisit).
   - The binary's default set applies only to a new lock, to `scpm install --reset-systems`, and to a header without `defaultSystems`: one written from an explicit `lock.systems` that has since been removed falls back to the current default.
-- **`nativeMappings: <table version>`** in the header (N) is compared with the binary's table (M):
+- **`nativeMappings: <table version>`** in the header (N) is compared with the binary's table (M). The non-frozen rows apply to sidecar runs only: `cs` skips the table comparison, re-locks no variant because of mappings, and keeps the header.
 
   | Run | N vs M | What happens |
   |---|---|---|
   | Frozen | any difference | Never stale because of mappings. The lock is used as it is, with a note: "lock uses mapping table N, this scpm has M" |
   | Non-frozen | M > N | Re-lock, in this same run, every **affected** variant: one whose locked classpath has a module at a version inside the range of an entry (or tombstone) that changed in (N, M]. A change to the Netty 4.2 entry doesn't re-lock 4.1 users. **Whenever the install writes the lock at all**, the header becomes M: every affected variant was re-locked in the same run, so all variants match M. An install that writes nothing leaves the header alone, so jar-only projects see no churn |
-  | Non-frozen | M < N | Never downgrade. An install that would re-lock anything (a manifest edit, a variant without `fullContext`, …) stops with "lock uses mapping table N; upgrade scpm". One with nothing to re-lock only restores. This applies to sidecar re-locks; a `cs` re-lock applies no mappings and keeps the header, and the variants it writes are unmarked, so a sidecar re-locks them later |
+  | Non-frozen | M < N | Never downgrade. An install that would re-lock anything (a manifest edit, a variant without `fullContext`, …) stops with "lock uses mapping table N; upgrade scpm". One with nothing to re-lock only restores |
 
-  So every variant in a lock always matches the header's table: a re-lock never mixes tables, and never moves one back. A mapping for a module that first arrives in a re-lock is applied by that re-lock. A lock without `nativeMappings` holds no sidecar-written variants (below), so the first sidecar re-lock sets it.
+  So every variant marked `fullContext` matches the header's table; unmarked variants have no mappings, and the next sidecar run re-locks them. A mapping for a module that first arrives in a re-lock is applied by that re-lock. A lock without `nativeMappings` holds no sidecar-written variants (below), so the first sidecar re-lock sets it.
 - **`inputsHash`** covers the system set and `lock.jdk`, and the configured overrides (`natives:`, `lock.nativeClassifiers`), which live in the manifest like any other dependency setting. Absent overrides hash as they did before the keys existed. The **whole** workspace-level `lock.nativeClassifiers` list is in every JVM variant's hash, not just the entries that apply to it, so any edit to it re-locks every JVM variant. Nothing in it depends on the lock or on the binary's table, so it can be computed before resolving.
 - **`bootInputs`** covers the repositories, the system set and the JDK. No mappings apply to boot closures.
 
