@@ -58,7 +58,7 @@ pub struct FetchOptions {
     pub proxy: ProxyChoice,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FetchReport {
     pub present: usize,
@@ -68,6 +68,10 @@ pub struct FetchReport {
     pub verified: usize,
     /// Cached files that failed `--verify` and were downloaded again.
     pub repaired: usize,
+    /// Problems that didn't stop the restore, e.g. a lock's repository that couldn't be asked
+    /// (an unset credential variable) while another repository had the file.
+    #[serde(skip)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +92,9 @@ pub enum FetchError {
     Credentials { key: String, message: String },
     #[error("{0}")]
     Proxy(String),
+    /// No source had the file: the first one's answer, and why other sources weren't asked.
+    #[error("{error}{}", notes.iter().map(|n| format!("\n  note: {n}")).collect::<String>())]
+    WithNotes { error: Box<FetchError>, notes: Vec<String> },
 }
 
 /// Every failed download, plus how many downloads were attempted per host.
@@ -99,15 +106,22 @@ pub struct FetchFailure {
 
 impl fmt::Display for FetchFailure {
     /// One line per problem: transport errors are collapsed per host (with a hint when every
-    /// request to the host failed before an HTTP response), and credential errors per message.
+    /// request to the host failed before an HTTP response), and credential and proxy errors per
+    /// message.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut lines: Vec<String> = Vec::new();
         let mut transport: BTreeMap<&str, Vec<&FetchError>> = BTreeMap::new();
         let mut credentials: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        let mut proxy: Vec<&str> = Vec::new();
         for e in &self.errors {
             match e {
                 FetchError::Transport { host, .. } => transport.entry(host).or_default().push(e),
                 FetchError::Credentials { key, message } => credentials.entry(message).or_default().push(key),
+                FetchError::Proxy(message) => {
+                    if !proxy.contains(&message.as_str()) {
+                        proxy.push(message);
+                    }
+                }
                 other => lines.push(other.to_string()),
             }
         }
@@ -132,6 +146,7 @@ impl fmt::Display for FetchFailure {
                 format!("{message} (needed to download {} artifacts, e.g. {})", keys.len(), keys[0])
             });
         }
+        lines.extend(proxy.into_iter().map(str::to_string));
         f.write_str(&lines.join("\n"))
     }
 }
@@ -188,7 +203,6 @@ pub fn fetch_all(items: Vec<FetchItem>, opts: FetchOptions) -> Result<FetchRepor
     if missing.is_empty() {
         return Ok(report);
     }
-    let mut attempted: BTreeMap<String, usize> = BTreeMap::new();
     let mut errors = Vec::new();
     let mut proxy_errors: Vec<String> = Vec::new();
     let mut downloads = Vec::new();
@@ -197,7 +211,6 @@ pub fn fetch_all(items: Vec<FetchItem>, opts: FetchOptions) -> Result<FetchRepor
         // With fallbacks, a source that can't be asked is skipped like one answering 404
         // ([`fetch_with_fallbacks`]); its problem is reported only if no source has the file.
         if !item.fallbacks.is_empty() {
-            *attempted.entry(host_of(&item.url)).or_default() += 1;
             downloads.push((item, repair));
         } else if let Err(message) = &item.auth {
             errors.push(FetchError::Credentials { key: item.key.clone(), message: message.clone() });
@@ -207,13 +220,12 @@ pub fn fetch_all(items: Vec<FetchItem>, opts: FetchOptions) -> Result<FetchRepor
                 proxy_errors.push(message);
             }
         } else {
-            *attempted.entry(host_of(&item.url)).or_default() += 1;
             downloads.push((item, repair));
         }
     }
     errors.extend(proxy_errors.into_iter().map(FetchError::Proxy));
     if downloads.is_empty() {
-        return if errors.is_empty() { Ok(report) } else { Err(FetchFailure { errors, attempted }) };
+        return if errors.is_empty() { Ok(report) } else { Err(FetchFailure { errors, attempted: BTreeMap::new() }) };
     }
     let client = match client(proxy) {
         Ok(client) => client,
@@ -223,10 +235,16 @@ pub fn fetch_all(items: Vec<FetchItem>, opts: FetchOptions) -> Result<FetchRepor
         }
     };
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-    let results = runtime.block_on(download_all(&client, downloads, opts.verify, proxy));
+    // Only requests actually sent count, so "every request failed" stays true to its word.
+    let (results, attempted) = runtime.block_on(download_all(&client, downloads, opts.verify, proxy));
     for (r, repair) in results {
         match r {
-            Ok(Fetched { downloaded, rehashed }) => {
+            Ok(Fetched { downloaded, rehashed, warnings }) => {
+                for w in warnings {
+                    if !report.warnings.contains(&w) {
+                        report.warnings.push(w);
+                    }
+                }
                 if rehashed && opts.verify {
                     report.verified += 1;
                 }
@@ -308,22 +326,27 @@ fn redirect_refusal(previous: &[reqwest::Url], next: &reqwest::Url, proxy: Optio
     }
 }
 
+/// Requests sent per host, for the "every request failed" help.
+type Attempted = std::sync::Mutex<BTreeMap<String, usize>>;
+
 async fn download_all(
     client: &reqwest::Client,
     items: Vec<(FetchItem, bool)>,
     verify: bool,
     proxy: Option<&ProxySettings>,
-) -> Vec<(Result<Fetched, FetchError>, bool)> {
+) -> (Vec<(Result<Fetched, FetchError>, bool)>, BTreeMap<String, usize>) {
     let permits = Arc::new(Semaphore::new(CONCURRENCY));
+    let attempted = Arc::new(Attempted::default());
     let tasks: Vec<_> = items
         .into_iter()
         .map(|(item, repair)| {
             let client = client.clone();
             let permits = permits.clone();
+            let attempted = attempted.clone();
             let proxy = proxy.cloned();
             tokio::spawn(async move {
                 let _permit = permits.acquire().await.expect("semaphore open");
-                (fetch_with_fallbacks(&client, &item, repair, verify, proxy.as_ref()).await, repair)
+                (fetch_with_fallbacks(&client, &item, repair, verify, proxy.as_ref(), &attempted).await, repair)
             })
         })
         .collect();
@@ -331,20 +354,23 @@ async fn download_all(
     for t in tasks {
         out.push(t.await.expect("download task panicked"));
     }
-    out
+    let attempted = attempted.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    (out, attempted)
 }
 
 /// [`fetch_one`] from `item`, then from each of its fallbacks while the answer is 404 or 410
 /// (design §5.4). A source whose credentials can't be read or whose scheme's proxy is unusable
 /// can't be asked, and counts like a 404; any other answer (a 401 or 403, a transport error, a
 /// checksum mismatch) ends the search. If no source has the file, the first one's answer is the
-/// error.
+/// error, with a note for each source that couldn't be asked. If the first source couldn't be
+/// asked but another had the file, that is a warning, so a missing token doesn't go unnoticed.
 async fn fetch_with_fallbacks(
     client: &reqwest::Client,
     item: &FetchItem,
     repair: bool,
     verify: bool,
     proxy: Option<&ProxySettings>,
+    attempted: &Attempted,
 ) -> Result<Fetched, FetchError> {
     let unusable = |source: &FetchItem| -> Option<FetchError> {
         if let Err(message) = &source.auth {
@@ -352,10 +378,27 @@ async fn fetch_with_fallbacks(
         }
         proxy.and_then(|p| p.route(&source.url).err()).map(FetchError::Proxy)
     };
+    let not_asked = |source: &FetchItem, why: &FetchError| {
+        let why = match why {
+            FetchError::Credentials { message, .. } | FetchError::Proxy(message) => message.clone(),
+            other => other.to_string(),
+        };
+        format!("{} was not asked: {why}", source.url)
+    };
+    let count = |source: &FetchItem| {
+        *attempted.lock().unwrap_or_else(|e| e.into_inner()).entry(host_of(&source.url)).or_default() += 1;
+    };
     let not_found = |r: &Result<Fetched, FetchError>| matches!(r, Err(FetchError::Http { status: 404 | 410, .. }));
+    let mut skipped: Vec<String> = Vec::new();
     let first = match unusable(item) {
-        Some(problem) => Err(problem),
+        Some(problem) => {
+            if !item.fallbacks.is_empty() {
+                skipped.push(not_asked(item, &problem));
+            }
+            Err(problem)
+        }
         None => {
+            count(item);
             let first = fetch_one(client, item, repair, verify).await;
             if !not_found(&first) {
                 return first;
@@ -363,16 +406,32 @@ async fn fetch_with_fallbacks(
             first
         }
     };
+    let first_skipped = !skipped.is_empty();
     for fallback in &item.fallbacks {
-        if unusable(fallback).is_some() {
+        if let Some(problem) = unusable(fallback) {
+            skipped.push(not_asked(fallback, &problem));
             continue;
         }
-        let next = fetch_one(client, fallback, repair, verify).await;
+        count(fallback);
+        let mut next = fetch_one(client, fallback, repair, verify).await;
+        if let Ok(fetched) = &mut next
+            && first_skipped
+        {
+            fetched.warnings.push(format!("{}: {}; {} had it", item.key, skipped[0], fallback.url));
+        }
         if !not_found(&next) {
             return next;
         }
     }
-    first
+    match first {
+        // The first source's own problem is already the error; only the others need a note.
+        Err(error) if first_skipped => {
+            let notes: Vec<String> = skipped.into_iter().skip(1).collect();
+            if notes.is_empty() { Err(error) } else { Err(FetchError::WithNotes { error: Box::new(error), notes }) }
+        }
+        Err(error) if !skipped.is_empty() => Err(FetchError::WithNotes { error: Box::new(error), notes: skipped }),
+        other => other,
+    }
 }
 
 /// What [`fetch_one`] did with a file.
@@ -382,6 +441,8 @@ struct Fetched {
     /// A file that appeared while waiting for the lock was hashed against the lock (and
     /// downloaded again if it didn't match).
     rehashed: bool,
+    /// Worth a warning though the file is present (see [`fetch_with_fallbacks`]).
+    warnings: Vec<String>,
 }
 
 /// Makes `item` present. `replace` downloads even if a file of the right size is present (it
@@ -408,7 +469,7 @@ async fn fetch_one(
     if fs::metadata(&item.dest).is_ok_and(|m| m.len() == item.size) {
         if !(replace || verify || item.verify_cached) {
             release(lock, &lock_path);
-            return Ok(Fetched { downloaded: None, rehashed });
+            return Ok(Fetched { downloaded: None, rehashed, warnings: Vec::new() });
         }
         // A queued repair was already counted as verified; a new file wasn't.
         rehashed = !replace;
@@ -416,7 +477,7 @@ async fn fetch_one(
         let hash = tokio::task::spawn_blocking(move || sha256_file(&dest)).await.expect("hash task");
         if hash.is_ok_and(|h| h == item.sha256) {
             release(lock, &lock_path);
-            return Ok(Fetched { downloaded: None, rehashed });
+            return Ok(Fetched { downloaded: None, rehashed, warnings: Vec::new() });
         }
     }
     let auth = item.auth.as_ref().ok().cloned().flatten();
@@ -435,7 +496,7 @@ async fn fetch_one(
             Ok(bytes) => {
                 let renamed = fs::rename(&part, &item.dest).map_err(|e| io_err(&item.dest, e));
                 release(lock, &lock_path);
-                return renamed.map(|()| Fetched { downloaded: Some(bytes), rehashed });
+                return renamed.map(|()| Fetched { downloaded: Some(bytes), rehashed, warnings: Vec::new() });
             }
             Err(e) if retryable(&e) => last_error = Some(e),
             Err(e) => {
@@ -832,6 +893,19 @@ mod tests {
         );
         assert_eq!(parse_basic_realms("Basic realm=\"a\", realm=\"b\""), ["a"]);
         assert_eq!(parse_basic_realms("Basic realm=\"a\", Basic realm=\"unterminated"), ["a"]);
+    }
+
+    #[test]
+    fn proxy_errors_are_collapsed_by_message() {
+        let failure = FetchFailure {
+            errors: vec![
+                FetchError::Proxy("HTTPS_PROXY: bad".into()),
+                FetchError::Proxy("HTTPS_PROXY: bad".into()),
+                FetchError::Proxy("HTTP_PROXY: bad".into()),
+            ],
+            attempted: BTreeMap::new(),
+        };
+        assert_eq!(failure.to_string(), "HTTPS_PROXY: bad\nHTTP_PROXY: bad");
     }
 
     #[test]

@@ -726,6 +726,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     let contacted = ran_cs || fetch.downloaded > 0;
     let notices =
         if contacted { crate::foreign::take_notice(&repos, ran_cs).into_iter().collect() } else { Vec::new() };
+    warnings.extend(fetch.warnings.iter().cloned());
     if fetch.repaired > 0 {
         warnings.push(format!(
             "{} cached artifact{} did not match the lock and {} downloaded again",

@@ -72,13 +72,30 @@ fn fallbacks_are_asked_only_after_a_not_found_each_with_its_own_credentials() {
     let cache = tempfile::tempdir().unwrap();
     let mut first = source(&locked, cache.path(), Err("repository `a` needs `UNSET`, which is not set".into()));
     first.fallbacks = vec![source(&open, cache.path(), Ok(None))];
-    assert_eq!(fetch_all(vec![first], FetchOptions::default()).unwrap().downloaded, 1);
+    let report = fetch_all(vec![first], FetchOptions::default()).unwrap();
+    assert_eq!(report.downloaded, 1);
+    // ... but it is a warning, so a missing token doesn't go unnoticed.
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].contains("was not asked") && report.warnings[0].contains("`UNSET`"),
+        "{:?}",
+        report.warnings
+    );
     let empty = Server::maven(Default::default(), None);
     let mut first = source(&locked, cache.path(), Err("repository `a` needs `UNSET`, which is not set".into()));
     first.fallbacks = vec![source(&empty, cache.path(), Ok(None))];
     first.dest = cache.path().join("elsewhere/hello-1.0.jar");
     let err = fetch_all(vec![first], FetchOptions::default()).unwrap_err().to_string();
     assert!(err.contains("`UNSET`"), "{err}");
+
+    // The hint answers 404 and the only other source can't be asked: the error says why.
+    let cache = tempfile::tempdir().unwrap();
+    let mut first = source(&empty, cache.path(), Ok(None));
+    first.fallbacks =
+        vec![source(&open, cache.path(), Err("repository `acme` needs `ACME_TOKEN`, which is not set".into()))];
+    let err = fetch_all(vec![first], FetchOptions::default()).unwrap_err().to_string();
+    assert!(err.contains("HTTP 404"), "{err}");
+    assert!(err.contains("note: ") && err.contains("was not asked") && err.contains("`ACME_TOKEN`"), "{err}");
 }
 
 #[test]
