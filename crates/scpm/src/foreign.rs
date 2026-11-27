@@ -266,7 +266,9 @@ fn scala_cli(file: &str, text: &str) -> Vec<ForeignSetting> {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else { return Vec::new() };
     let repositories = &json["repositories"];
     let mut found = Vec::new();
-    if let Some(credentials) = repositories.get("credentials") {
+    // An empty array configures nothing; any other shape counts as applying to every repository.
+    let empty = |v: &serde_json::Value| v.as_array().is_some_and(Vec::is_empty) || v.is_null();
+    if let Some(credentials) = repositories.get("credentials").filter(|v| !empty(v)) {
         let hosts: Option<Vec<String>> = credentials
             .as_array()
             .map(|entries| entries.iter().filter_map(|e| e["host"].as_str().map(str::to_string)).collect());
@@ -278,7 +280,7 @@ fn scala_cli(file: &str, text: &str) -> Vec<ForeignSetting> {
         };
         found.push(ForeignSetting::new(file, setting, applies));
     }
-    if let Some(mirrors) = repositories.get("mirrors") {
+    if let Some(mirrors) = repositories.get("mirrors").filter(|v| !empty(v)) {
         let froms: Option<Vec<String>> = mirrors.as_array().map(|entries| {
             entries.iter().filter_map(|e| e.as_str()?.split_once('=').map(|(f, _)| f.trim().to_string())).collect()
         });
@@ -354,7 +356,11 @@ fn shown_origin(url: &str) -> String {
             }
         }
     };
-    format!("{scheme}{}", host.split(['/', '?', '#']).next().unwrap_or_default())
+    let host = host.split(['/', '?', '#']).next().unwrap_or_default();
+    // Anything but a plain scheme, host and port (an undecoded reference, say) is not shown.
+    let plain_scheme = scheme.trim_end_matches("://").chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+    let plain_host = host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'));
+    if plain_scheme && plain_host { format!("{scheme}{host}") } else { "(URL not shown)".to_string() }
 }
 
 fn strip_comments(xml: &str) -> String {
@@ -391,14 +397,54 @@ fn blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
 
 /// The trimmed, unescaped text of the first `<tag>` child.
 fn child(xml: &str, tag: &str) -> Option<String> {
-    let text = blocks(xml, tag).into_iter().next()?.trim();
-    Some(
-        text.replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&amp;", "&"),
-    )
+    Some(unescape_xml(blocks(xml, tag).into_iter().next()?).trim().to_string())
+}
+
+/// XML text with the predefined entities, character references (`&#64;`, `&#x40;`) and CDATA
+/// sections decoded, in one pass; other entities (`settings.xml` declares none) stay as written.
+fn unescape_xml(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let Some(at) = rest.find(['&', '<']) else { break };
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        if let Some(cdata) = rest.strip_prefix("<![CDATA[") {
+            let end = cdata.find("]]>").unwrap_or(cdata.len());
+            out.push_str(&cdata[..end]);
+            rest = cdata.get(end + 3..).unwrap_or("");
+            continue;
+        }
+        let decoded = rest.find(';').filter(|_| rest.starts_with('&')).and_then(|semi| {
+            let c = match &rest[1..semi] {
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "amp" => Some('&'),
+                name => {
+                    let code = match name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => name.strip_prefix('#').and_then(|dec| dec.parse().ok()),
+                    };
+                    code.and_then(char::from_u32)
+                }
+            };
+            c.map(|c| (c, semi + 1))
+        });
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push_str(&rest[..1]);
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -464,9 +510,24 @@ mod tests {
             ("user:t0ken@nexus/m", "nexus"),
             ("https://[::1]:8081/m/x", "https://[::1]:8081"),
             ("https://nexus/m", "https://nexus"),
+            ("https://user:t0&ken@nexus/m", "https://nexus"),
+            ("https://user:t0ken&#64;nexus/m", "(URL not shown)"),
         ] {
             assert_eq!(shown_origin(url), shown, "{url}");
         }
+        // Character references and CDATA are decoded before the userinfo is cut off.
+        for url in [
+            "https://alice:t0ken&#64;nexus/m",
+            "https://alice:t0ken&#x40;nexus/m",
+            "<![CDATA[https://alice:t0ken@nexus/m]]>",
+        ] {
+            let xml = format!(
+                "<settings><mirrors><mirror><id>corp</id><mirrorOf>*</mirrorOf><url>{url}</url></mirror></mirrors></settings>"
+            );
+            let found = maven_settings("~/.m2/settings.xml", &xml);
+            assert_eq!(found[0].setting, "mirror \"corp\" for * (https://nexus)", "{url}");
+        }
+        assert_eq!(unescape_xml("a&amp;lt;b &#60; &bogus; &"), "a&lt;b < &bogus; &");
         let xml = "<settings><mirrors><mirror><id>corp</id><mirrorOf>*</mirrorOf>\
                    <url>https://alice:t0ken@nexus/m</url></mirror></mirrors>\
                    <proxies><proxy><id>p</id><host>bob:pw@proxy</host></proxy></proxies></settings>";
@@ -499,6 +560,8 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert!(found.iter().all(|f| f.repositories(&repos()) == ["acme"]), "{found:?}");
         assert!(scala_cli("config.json", r#"{"java":{"home":"/x"}}"#).is_empty());
+        let empty = r#"{"repositories":{"credentials":[],"mirrors":[]}}"#;
+        assert!(scala_cli("config.json", empty).is_empty(), "empty arrays configure nothing");
     }
 
     #[test]

@@ -802,6 +802,8 @@ fn add_common_args_for(
     let mut tool_options = None;
     if let Some(p) = proxy {
         // An unusable environment proxy fails only if a repository needs that scheme's proxy.
+        // `cs`'s requests can't be checked one by one, so that fails the whole run up front,
+        // even one `cs` could answer from its cache (design §5.9); the fetcher checks per download.
         for repo in repos {
             p.route(repo.fetch_url()).map_err(CoursierError::Config)?;
         }
@@ -840,10 +842,16 @@ fn add_common_args_for(
         .and_then(|()| file.flush())
         .map_err(|e| CoursierError::Config(format!("cannot write a credentials file: {e}")))?;
     cmd.env("COURSIER_CREDENTIALS", credentials_env_value(file.path()));
-    let sealed = tempfile::Builder::new()
-        .prefix("scpm-sealed-")
-        .tempdir()
-        .map_err(|e| CoursierError::Config(format!("cannot create a temporary directory: {e}")))?;
+    // Owner-only: the files `cs` is pointed at must stay absent, so nobody else may create them.
+    let mut sealed = tempfile::Builder::new();
+    sealed.prefix("scpm-sealed-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        sealed.permissions(fs::Permissions::from_mode(0o700));
+    }
+    let sealed =
+        sealed.tempdir().map_err(|e| CoursierError::Config(format!("cannot create a temporary directory: {e}")))?;
     cmd.env("SCALA_CLI_CONFIG", sealed.path().join("config.json"));
     cmd.env("COURSIER_MIRRORS", sealed.path().join("mirror.properties"));
     cmd.env("COURSIER_MAVEN_SETTINGS", "false");
@@ -1501,6 +1509,15 @@ mod tests {
         // Coursier reads `settings.xml` proxies from here, whatever `COURSIER_MAVEN_SETTINGS` says.
         let maven_home = PathBuf::from(envs["CS_MAVEN_HOME"].as_deref().unwrap());
         assert!(maven_home.starts_with(sealed) && !maven_home.join("settings.xml").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(sealed).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "nobody else may write there"
+            );
+        }
         let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(args.iter().any(|a| a == "--no-default"));
         assert_eq!(args.iter().filter(|a| *a == "--repository").count(), 1);

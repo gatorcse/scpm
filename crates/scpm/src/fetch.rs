@@ -256,12 +256,13 @@ fn hash_files(paths: Vec<&Path>) -> Vec<io::Result<String>> {
 /// explain` uses and `cs`'s `http.nonProxyHosts` is built to agree with. Redirects never go
 /// from HTTPS to plain HTTP, as in coursier.
 fn client(proxy: Option<&ProxySettings>) -> reqwest::Result<reqwest::Client> {
+    let routes = proxy.cloned();
     let mut builder = reqwest::Client::builder()
         .user_agent(user_agent())
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(Duration::from_secs(60))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            match redirect_refusal(attempt.previous(), attempt.url()) {
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            match redirect_refusal(attempt.previous(), attempt.url(), routes.as_ref()) {
                 Some(reason) => attempt.error(reason),
                 None => attempt.follow(),
             }
@@ -280,16 +281,22 @@ fn client(proxy: Option<&ProxySettings>) -> reqwest::Result<reqwest::Client> {
 
 /// Up to 10 redirects, never from HTTPS to plain HTTP: the bytes are checked against the lock
 /// either way, but coursier refuses such a downgrade and the fetcher must not differ. (reqwest
-/// already drops `Authorization` when a redirect changes the scheme, host or port.)
-fn redirect_refusal(previous: &[reqwest::Url], next: &reqwest::Url) -> Option<String> {
+/// already drops `Authorization` when a redirect changes the scheme, host or port.) Nor to a
+/// URL whose scheme's environment proxy is unusable: checked before the first request, it must
+/// be checked again for the next, or the request would go out directly.
+fn redirect_refusal(previous: &[reqwest::Url], next: &reqwest::Url, proxy: Option<&ProxySettings>) -> Option<String> {
     if previous.len() >= 10 {
         return Some("too many redirects".into());
     }
+    let origin = next.host_str().map(|h| format!(" ({h})")).unwrap_or_default();
     let from_https = previous.iter().any(|u| u.scheme() == "https");
-    (from_https && next.scheme() == "http").then(|| {
-        let origin = next.host_str().map(|h| format!(" ({h})")).unwrap_or_default();
-        format!("refused a redirect from HTTPS to plain HTTP{origin}")
-    })
+    if from_https && next.scheme() == "http" {
+        return Some(format!("refused a redirect from HTTPS to plain HTTP{origin}"));
+    }
+    match proxy.map(|p| p.route(next.as_str())) {
+        Some(Err(e)) => Some(format!("refused a redirect{origin}: {e}")),
+        _ => None,
+    }
 }
 
 async fn download_all(
@@ -780,13 +787,31 @@ mod tests {
         let url = |u: &str| reqwest::Url::parse(u).unwrap();
         let https = url("https://repo.example/a.jar");
         let http = url("http://repo.example:8080/a.jar");
-        assert!(redirect_refusal(std::slice::from_ref(&https), &http).unwrap().contains("HTTPS to plain HTTP"));
+        assert!(redirect_refusal(std::slice::from_ref(&https), &http, None).unwrap().contains("HTTPS to plain HTTP"));
         let chain = [https.clone(), url("https://cdn.example/a.jar")];
-        assert!(redirect_refusal(&chain, &http).is_some(), "not even later in the chain");
-        assert_eq!(redirect_refusal(std::slice::from_ref(&http), &https), None, "upgrades are fine");
-        assert_eq!(redirect_refusal(std::slice::from_ref(&https), &url("https://cdn.example/a.jar")), None);
-        assert_eq!(redirect_refusal(std::slice::from_ref(&http), &http), None);
-        assert!(redirect_refusal(&vec![http.clone(); 10], &http).unwrap().contains("too many"));
+        assert!(redirect_refusal(&chain, &http, None).is_some(), "not even later in the chain");
+        assert_eq!(redirect_refusal(std::slice::from_ref(&http), &https, None), None, "upgrades are fine");
+        assert_eq!(redirect_refusal(std::slice::from_ref(&https), &url("https://cdn.example/a.jar"), None), None);
+        assert_eq!(redirect_refusal(std::slice::from_ref(&http), &http, None), None);
+        assert!(redirect_refusal(&vec![http.clone(); 10], &http, None).unwrap().contains("too many"));
+
+        // A redirect to a host whose scheme's proxy is unusable is refused, not sent directly;
+        // a working route or a `noProxy` host is fine.
+        let proxy = ProxySettings {
+            https: None,
+            http: Some(crate::machine::ProxyServer { host: "proxy.example".into(), port: 3128 }),
+            no_proxy: vec!["cdn.internal".into()],
+            ignored_no_proxy: Vec::new(),
+            errors: [("https".to_string(), "HTTPS_PROXY: bad".to_string())].into(),
+            source: "test".into(),
+        };
+        let refused = redirect_refusal(std::slice::from_ref(&http), &https, Some(&proxy)).unwrap();
+        assert_eq!(refused, "refused a redirect (repo.example): HTTPS_PROXY: bad");
+        assert_eq!(
+            redirect_refusal(std::slice::from_ref(&http), &url("https://cdn.internal/a.jar"), Some(&proxy)),
+            None
+        );
+        assert_eq!(redirect_refusal(std::slice::from_ref(&http), &http, Some(&proxy)), None);
     }
 
     #[test]
