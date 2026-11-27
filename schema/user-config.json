@@ -65,6 +65,43 @@
         }
       },
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "title": "bearer token",
+          "properties": {
+            "password": {
+              "type": "null"
+            },
+            "token": {
+              "type": "string"
+            },
+            "user": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "token"
+          ]
+        },
+        {
+          "title": "user and password",
+          "properties": {
+            "password": {
+              "type": "string"
+            },
+            "token": {
+              "type": "null"
+            },
+            "user": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "user",
+            "password"
+          ]
+        }
+      ],
       "required": [
         "url"
       ]
@@ -77,7 +114,8 @@
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "minItems": 1
         },
         "url": {
           "type": "string"

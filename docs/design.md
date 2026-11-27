@@ -762,7 +762,7 @@ Some settings legitimately differ between a laptop and CI: a developer reaches A
 | Kind | Examples | Where it lives | Can it change the lock? |
 |---|---|---|---|
 | **Project**: *what* resolves | repositories, catalogs, BOMs, overrides, `lock.resolutionContext`, release-age policy | `scpm.yaml`, recorded in `scpm-lock.yaml` | Yes, and that is the point: it is reviewed and committed |
-| **Machine**: *how the bytes are reached* | credentials, mirrors, proxies, the cache directory | the environment and the user config (below) | **No.** The lock pins repository ids and sha256 values (§5.4), and mirrors are never recorded |
+| **Machine**: *how the bytes are reached* | credentials, mirrors, proxies, the cache directory | the environment and the user config (below) | **Not a fresh lock**: changing one never makes the lock stale, a frozen restore downloads exactly what the lock pins (repository ids and sha256 values, §5.4), and mirror URLs are never recorded. A re-lock that goes through a mirror can still pick different versions (below) |
 
 A machine setting therefore decides whether a download *succeeds*, not *what* a restore downloads: the lock's sha256 values settle that. A difference between a laptop and CI fails loudly (a 401 naming the repository) instead of silently building something else. One caveat for re-locking: a mirror is another server and may not hold exactly what the repository does. A mirror for one id that points at a Nexus group can serve artifacts the real repository lacks (the lock then names a repository that, reached directly, answers 404), and stale mirror metadata can change which version a range or `latest` picks. The re-lock is reviewed like any other lock change. sbt draws this line less firmly: `~/.sbt/1.0/global.sbt` can add plugins and change settings, so the same commit builds differently per machine. scpm has no user-level file that can do that.
 
@@ -793,7 +793,7 @@ The Rust fetcher gets the same resolved values: the same mirror URL, the same cr
 **Where machine settings come from**, highest precedence first:
 
 1. **The project declares the need; the machine supplies the secret.** A repository's `credentials: env:ACME_TOKEN` in `scpm.yaml` (§5.7). The requirement is reviewed and committed, only the value is local, and a missing value fails with the variable's name: `repository acme needs ACME_TOKEN, which is not set`. This is the preferred form for anything CI must reach.
-2. **The user config**, scpm's own file for machine settings: `<config dir>/scpm/config.yaml` (`~/.config/scpm` on Linux, `~/Library/Application Support/scpm` on macOS, `%APPDATA%\scpm` on Windows), or the file `SCPM_CONFIG` names. It holds only machine settings, never anything that could change the lock:
+2. **The user config**, scpm's own file for machine settings: `<config dir>/scpm/config.yaml` (`~/.config/scpm` on Linux, `~/Library/Application Support/scpm` on macOS, `%APPDATA%\scpm` on Windows), or the file `SCPM_CONFIG` names. It holds only machine settings, never anything that makes the lock stale or changes what a frozen restore downloads:
    ```yaml
    credentials:                       # matched by scheme, host and port, like §5.7; a path prefix narrows it
      - url: https://acme.jfrog.io

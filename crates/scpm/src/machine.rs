@@ -39,6 +39,7 @@ pub struct UserConfigFile {
 /// `file:PATH` (`~` is the home directory) or the value itself.
 #[derive(Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(transform = credential_forms)]
 pub struct CredentialEntry {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,11 +50,33 @@ pub struct CredentialEntry {
     pub password: Option<String>,
 }
 
+/// The two forms the loader accepts, exclusively; an explicit `null` counts as absent.
+fn credential_forms(schema: &mut schemars::Schema) {
+    let string = serde_json::json!({ "type": "string" });
+    let absent = serde_json::json!({ "type": "null" });
+    schema.insert(
+        "oneOf".to_string(),
+        serde_json::json!([
+            {
+                "title": "bearer token",
+                "properties": { "token": string, "user": absent, "password": absent },
+                "required": ["token"]
+            },
+            {
+                "title": "user and password",
+                "properties": { "token": absent, "user": string, "password": string },
+                "required": ["user", "password"]
+            }
+        ]),
+    );
+}
+
 #[derive(Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MirrorEntry {
     pub url: String,
     /// Repository ids, URL prefixes, or `*` for every repository.
+    #[schemars(length(min = 1))]
     pub mirror_of: Vec<String>,
 }
 

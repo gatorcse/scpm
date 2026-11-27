@@ -48,7 +48,8 @@ fn scpm(dir: &Path, cache: &Path) -> Command {
     cmd.arg("-C").arg(dir).env("COURSIER_CACHE", cache).env_remove("CI").env_remove("COURSIER_CREDENTIALS");
     // Never the developer's own machine settings: an empty user config.
     let config = Path::new(env!("CARGO_TARGET_TMPDIR")).join("empty-user-config.yaml");
-    if !config.exists() {
+    // Rewritten if anything else ever left content there; writing "" over "" is harmless.
+    if !fs::metadata(&config).is_ok_and(|m| m.len() == 0) {
         fs::write(&config, "").unwrap();
     }
     cmd.env("SCPM_CONFIG", config);
@@ -610,7 +611,8 @@ fn one_origin_shares_its_credentials_on_both_paths() {
     assert!(!err.contains("pass"), "{err}");
 
     // An anonymous mirror on that origin gets the private repository's credentials, from `cs`
-    // when re-locking and from the fetcher when restoring.
+    // when re-locking and from the fetcher when restoring. Over plain HTTP that needs the
+    // mirrored repository's own `allowInsecureCredentials`: the private one's covers only itself.
     java_workspace(ws.path(), &format!("repositories:\n{private}  - central\n"), deps);
     let config = ws.path().join("user-config.yaml");
     fs::write(&config, format!("mirrors:\n  - {{url: '{}', mirrorOf: [central]}}\n", server.url("/remote"))).unwrap();
@@ -620,6 +622,13 @@ fn one_origin_shares_its_credentials_on_both_paths() {
         cmd.env("SCPM_CONFIG", &config);
         cmd
     };
+    let out = with_config(tempfile::tempdir().unwrap().path()).arg("install").assert().code(2);
+    let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(err.contains("`central`") && err.contains("allowInsecureCredentials"), "{err}");
+    assert!(!err.contains("pass"), "{err}");
+    let central =
+        format!("  - {{id: central, url: '{}', allowInsecureCredentials: true}}\n", "https://repo1.maven.org/maven2/");
+    java_workspace(ws.path(), &format!("repositories:\n{private}{central}"), deps);
     with_config(tempfile::tempdir().unwrap().path()).arg("install").assert().success();
     assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "central");
     let empty = tempfile::tempdir().unwrap();

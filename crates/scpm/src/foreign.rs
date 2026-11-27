@@ -405,8 +405,7 @@ fn child(xml: &str, tag: &str) -> Option<String> {
 fn unescape_xml(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    loop {
-        let Some(at) = rest.find(['&', '<']) else { break };
+    while let Some(at) = rest.find(['&', '<']) {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
         if let Some(cdata) = rest.strip_prefix("<![CDATA[") {

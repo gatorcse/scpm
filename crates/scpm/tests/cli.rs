@@ -16,7 +16,8 @@ fn scpm(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("scpm").unwrap();
     // Never the developer's own machine settings: an empty user config.
     let config = Path::new(env!("CARGO_TARGET_TMPDIR")).join("empty-user-config.yaml");
-    if !config.exists() {
+    // Rewritten if anything else ever left content there; writing "" over "" is harmless.
+    if !std::fs::metadata(&config).is_ok_and(|m| m.len() == 0) {
         std::fs::write(&config, "").unwrap();
     }
     cmd.arg("-C").arg(dir).env("SCPM_CONFIG", config);
