@@ -281,7 +281,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let mut selectors = cli.filter.clone();
             selectors.extend(targets);
             let selected = filter::select(&ws, &graph, &selectors, &invocation_dir(&start)?)?;
-            let lock = ensure_installed(&ws, &graph, frozen)?;
+            let (lock, _) = ensure_installed(&ws, &graph, frozen)?;
             let _guard = compile::workspace_lock(&ws.root).map_err(|e| Failure::Command(e.to_string()))?;
             let started = std::time::Instant::now();
             let reporter = std::sync::Arc::new(Reporter::new(Mode::detect(cli.json), &ws.root, &run_id()));
