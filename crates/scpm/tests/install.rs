@@ -743,10 +743,31 @@ fn both_paths_use_exactly_the_resolved_proxy() {
     fs::write(&config, format!("proxy:\n  http: '127.0.0.1:{}'\n", proxy.port)).unwrap();
     let dead = "http://127.0.0.1:1";
     let jar = |cache: &Path| cache.join("http/repo.scpm-test.invalid/maven/com/example/hello/1.0/hello-1.0.jar");
+    // Every other way a proxy could reach `cs` points at the dead one: Maven's settings.xml
+    // (which coursier reads for proxies even with `COURSIER_MAVEN_SETTINGS=false`) and the JVM
+    // option variables (which only a JVM launcher reads; scpm sets `JAVA_TOOL_OPTIONS` itself
+    // for one).
+    let m2 = ws.path().join("hostile-m2");
+    fs::create_dir_all(&m2).unwrap();
+    fs::write(
+        m2.join("settings.xml"),
+        "<settings><proxies><proxy><active>true</active><protocol>http</protocol>\
+         <host>127.0.0.1</host><port>1</port></proxy></proxies></settings>",
+    )
+    .unwrap();
+    let dead_properties = "-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=1 -Dhttp.nonProxyHosts=nothing";
+    let hostile_jvm = |cmd: &mut Command| {
+        cmd.env("CS_MAVEN_HOME", &m2).env("MAVEN_HOME", &m2).env("HOME", ws.path());
+        for var in ["JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS", "JAVA_OPTS"] {
+            cmd.env(var, dead_properties);
+        }
+    };
 
     // The user config's proxy wins over the environment's, for `cs` and for the fetcher.
     let cache = tempfile::tempdir().unwrap();
-    scpm(ws.path(), cache.path()).env("SCPM_CONFIG", &config).env("HTTP_PROXY", dead).arg("install").assert().success();
+    let mut cmd = scpm(ws.path(), cache.path());
+    hostile_jvm(&mut cmd);
+    cmd.env("SCPM_CONFIG", &config).env("HTTP_PROXY", dead).arg("install").assert().success();
     let empty = tempfile::tempdir().unwrap();
     scpm(ws.path(), empty.path())
         .env("SCPM_CONFIG", &config)

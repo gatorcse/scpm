@@ -2,11 +2,13 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
 use serde::Deserialize;
 
@@ -718,16 +720,54 @@ impl CommonArgs {
 
 /// Environment variables through which coursier would pick up machine settings scpm doesn't
 /// apply itself (design §5.9): extra mirror files, default repositories and cache policy, and
-/// JVM options (proxy properties, say) when `SCPM_CS` is a JVM launcher.
+/// JVM options (proxy properties, say) when `SCPM_CS` is a JVM launcher. `JAVA_TOOL_OPTIONS`
+/// is then set again, to exactly scpm's resolved proxy, for a launcher that takes it.
 const UNSEALED_ENV: &[&str] = &[
     "COURSIER_EXTRA_MIRRORS",
     "COURSIER_REPOSITORIES",
     "COURSIER_TTL",
     "COURSIER_MODE",
     "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
     "JDK_JAVA_OPTIONS",
     "JAVA_OPTS",
 ];
+
+/// How a `cs` launcher takes JVM options, which carry the resolved proxy (`cs` ignores
+/// `HTTPS_PROXY`). Coursier 2.1.27 ships two kinds of launcher, and neither accepts the other's
+/// form:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JvmOptions {
+    /// `-J-Dname=value` arguments. The native launcher sets these properties itself and reads no
+    /// Java option variable; coursier's `sh` launcher hands them to `java`.
+    Args,
+    /// `JAVA_TOOL_OPTIONS`, which the JVM itself reads. The JVM launcher (a jpackage image, what
+    /// `cs-x86_64-pc-linux-jvm` is) passes every argument to coursier, which rejects `-J…`.
+    ToolOptions,
+}
+
+/// How `bin` takes JVM options: `-J` arguments if `cs version -J-D…` succeeds (the native
+/// launcher drops `-J` arguments wherever they are), else `JAVA_TOOL_OPTIONS`. Asked once per
+/// launcher and process, and only when a proxy applies. A launcher that can't be run counts as
+/// [`JvmOptions::Args`]; running it for real then reports why.
+fn launcher_jvm_options(bin: &OsStr) -> JvmOptions {
+    static KNOWN: Mutex<Vec<(OsString, JvmOptions)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, style)) = known.iter().find(|(b, _)| b == bin) {
+        return *style;
+    }
+    let mut probe = Command::new(bin);
+    probe.args(["version", "-J-Dscpm.probe=true"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    for var in UNSEALED_ENV {
+        probe.env_remove(var);
+    }
+    let style = match probe.status() {
+        Ok(status) if !status.success() => JvmOptions::ToolOptions,
+        _ => JvmOptions::Args,
+    };
+    known.push((bin.to_os_string(), style));
+    style
+}
 
 /// Cache, repositories and credentials, with `cs` sealed off from every other source of machine
 /// settings (design §5.9). Secrets never go on the command line: every credential `cs` may use
@@ -737,21 +777,43 @@ const UNSEALED_ENV: &[&str] = &[
 /// CLI config's credentials and mirrors (coursier reads those even with `COURSIER_CREDENTIALS`
 /// set) and the mirror files (a `COURSIER_MIRRORS` naming a missing file also disables
 /// `mirror.properties` in coursier's config directory; `COURSIER_EXTRA_MIRRORS` is read
-/// regardless, so it is removed). `COURSIER_MAVEN_SETTINGS=false` turns off Maven `settings.xml`.
-/// The resolved proxy goes in as JVM properties (`cs` ignores `HTTPS_PROXY`).
+/// regardless, so it is removed). `COURSIER_MAVEN_SETTINGS=false` turns off Maven `settings.xml`
+/// mirrors and servers; its proxies coursier reads on its own from `$CS_MAVEN_HOME/settings.xml`,
+/// else `$MAVEN_HOME` or `~/.m2`, so `CS_MAVEN_HOME` names the empty directory.
+/// The resolved proxy goes in as JVM properties, in the form the launcher takes ([`JvmOptions`]).
 fn add_common_args(
     cmd: &mut Command,
     repos: &[Repo],
     proxy: &ProxyChoice,
     cache: &Path,
 ) -> Result<CommonArgs, CoursierError> {
+    add_common_args_for(cmd, repos, proxy, cache, &launcher_jvm_options)
+}
+
+/// [`add_common_args`], asking `jvm_options` how the launcher takes JVM options.
+fn add_common_args_for(
+    cmd: &mut Command,
+    repos: &[Repo],
+    proxy: &ProxyChoice,
+    cache: &Path,
+    jvm_options: &dyn Fn(&OsStr) -> JvmOptions,
+) -> Result<CommonArgs, CoursierError> {
     cmd.arg("--cache").arg(cache).arg("--no-default").arg("--user-agent").arg(user_agent());
+    let mut tool_options = None;
     if let Some(p) = proxy {
         // An unusable environment proxy fails only if a repository needs that scheme's proxy.
         for repo in repos {
             p.route(repo.fetch_url()).map_err(CoursierError::Config)?;
         }
-        cmd.args(p.jvm_args());
+        let properties = p.jvm_properties();
+        if !properties.is_empty() {
+            match jvm_options(cmd.get_program()) {
+                JvmOptions::Args => {
+                    cmd.args(properties.iter().map(|d| format!("-J{d}")));
+                }
+                JvmOptions::ToolOptions => tool_options = Some(properties.join(" ")),
+            }
+        }
     }
     // Mirrors already applied, so `cs` asks the mirror directly; once per URL.
     let mut urls: Vec<&str> = Vec::new();
@@ -785,8 +847,12 @@ fn add_common_args(
     cmd.env("SCALA_CLI_CONFIG", sealed.path().join("config.json"));
     cmd.env("COURSIER_MIRRORS", sealed.path().join("mirror.properties"));
     cmd.env("COURSIER_MAVEN_SETTINGS", "false");
+    cmd.env("CS_MAVEN_HOME", sealed.path());
     for var in UNSEALED_ENV {
         cmd.env_remove(var);
+    }
+    if let Some(options) = tool_options {
+        cmd.env("JAVA_TOOL_OPTIONS", options);
     }
     Ok(CommonArgs { _credential_file: Some(file), _sealed_dir: Some(sealed), missing_credentials })
 }
@@ -948,9 +1014,14 @@ fn escape_property(value: &str) -> String {
     out
 }
 
-/// Drops JVM/native-image noise (e.g. `sun.misc.Unsafe` warnings) from coursier's stderr.
+/// Drops JVM/native-image noise (e.g. `sun.misc.Unsafe` warnings, and the JVM's note that it
+/// read the `JAVA_TOOL_OPTIONS` scpm set) from coursier's stderr.
 fn clean_stderr(stderr: &[u8]) -> String {
-    String::from_utf8_lossy(stderr).lines().filter(|l| !l.starts_with("WARNING:")).collect::<Vec<_>>().join("\n")
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|l| !l.starts_with("WARNING:") && !l.starts_with("Picked up JAVA_TOOL_OPTIONS:"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn unique_suffix() -> String {
@@ -1355,6 +1426,9 @@ mod tests {
             assert_eq!(envs.get(*var), Some(&None), "{var} is removed");
         }
         assert!(envs["SCALA_CLI_CONFIG"].is_some() && envs["COURSIER_CREDENTIALS"].is_some());
+        // Coursier reads `settings.xml` proxies from here, whatever `COURSIER_MAVEN_SETTINGS` says.
+        let maven_home = PathBuf::from(envs["CS_MAVEN_HOME"].as_deref().unwrap());
+        assert!(maven_home.starts_with(sealed) && !maven_home.join("settings.xml").exists());
         let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(args.iter().any(|a| a == "--no-default"));
         assert_eq!(args.iter().filter(|a| *a == "--repository").count(), 1);
@@ -1372,24 +1446,66 @@ mod tests {
             errors: BTreeMap::new(),
             source: "test".into(),
         };
-        let mut cmd = Command::new("cs");
-        add_common_args(&mut cmd, &repos, &Some(proxy.clone()), Path::new("/c")).unwrap();
-        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        for expected in [
-            "-J-Dhttps.proxyHost=proxy.example",
-            "-J-Dhttps.proxyPort=3128",
-            "-J-Dhttp.nonProxyHosts=localhost|*.localhost",
-        ] {
-            assert!(args.iter().any(|a| a == expected), "{expected} in {args:?}");
+        let properties =
+            ["-Dhttps.proxyHost=proxy.example", "-Dhttps.proxyPort=3128", "-Dhttp.nonProxyHosts=localhost|*.localhost"];
+        let run = |style: JvmOptions| {
+            let mut cmd = Command::new("cs");
+            add_common_args_for(&mut cmd, &repos, &Some(proxy.clone()), Path::new("/c"), &|_| style).unwrap();
+            let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+            let tool_options = cmd
+                .get_envs()
+                .find(|(k, _)| *k == "JAVA_TOOL_OPTIONS")
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()));
+            (args, tool_options)
+        };
+        // Native launcher: `-J` arguments, and no Java option variable at all.
+        let (args, tool_options) = run(JvmOptions::Args);
+        for expected in properties {
+            assert!(args.iter().any(|a| *a == format!("-J{expected}")), "{expected} in {args:?}");
         }
+        assert_eq!(tool_options, None);
+        // JVM launcher: exactly the resolved properties in `JAVA_TOOL_OPTIONS`, no `-J` argument.
+        let (args, tool_options) = run(JvmOptions::ToolOptions);
+        assert!(!args.iter().any(|a| a.starts_with("-J")), "{args:?}");
+        assert_eq!(tool_options.as_deref(), Some(properties.join(" ").as_str()));
         // An unusable proxy for the other scheme doesn't matter; one for this scheme does.
         let mut broken = proxy;
         broken.errors.insert("http".into(), "HTTP_PROXY: bad".into());
-        add_common_args(&mut Command::new("cs"), &repos, &Some(broken.clone()), Path::new("/c")).unwrap();
+        add_common_args_for(&mut Command::new("cs"), &repos, &Some(broken.clone()), Path::new("/c"), &|_| {
+            JvmOptions::Args
+        })
+        .unwrap();
         broken.errors.insert("https".into(), "HTTPS_PROXY: bad".into());
         let err =
-            add_common_args(&mut Command::new("cs"), &repos, &Some(broken), Path::new("/c")).err().unwrap().to_string();
+            add_common_args_for(&mut Command::new("cs"), &repos, &Some(broken), Path::new("/c"), &|_| JvmOptions::Args)
+                .err()
+                .unwrap()
+                .to_string();
         assert_eq!(err, "HTTPS_PROXY: bad");
+        assert!(!clean_stderr(b"Picked up JAVA_TOOL_OPTIONS: -Dx=y\nerror: boom\n").contains("Picked up"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launchers_are_asked_how_they_take_jvm_options() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = |name: &str, script: &str| {
+            let path = dir.path().join(name);
+            fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        // Like the native launcher: `-J` arguments are fine.
+        let native = launcher("native", "exit 0");
+        // Like the JVM launcher: `Unrecognized argument: -J-D…`.
+        let jvm = launcher("jvm", r#"for a in "$@"; do case $a in -J*) exit 1;; esac; done; exit 0"#);
+        assert_eq!(launcher_jvm_options(native.as_os_str()), JvmOptions::Args);
+        assert_eq!(launcher_jvm_options(jvm.as_os_str()), JvmOptions::ToolOptions);
+        assert_eq!(launcher_jvm_options(dir.path().join("missing").as_os_str()), JvmOptions::Args);
+        // Asked once: the answer stays even if the launcher changes.
+        fs::write(&jvm, "#!/bin/sh\nexit 0\n").unwrap();
+        assert_eq!(launcher_jvm_options(jvm.as_os_str()), JvmOptions::ToolOptions);
     }
 
     #[test]

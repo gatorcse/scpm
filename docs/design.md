@@ -772,12 +772,12 @@ A machine setting therefore decides whether a download *succeeds*, not *what* a 
 |---|---|---|
 | `COURSIER_REPOSITORIES`, Scala CLI `repositories.default` | default repositories | ignored: scpm passes `--no-default` and its own `--repository` list |
 | `COURSIER_MIRRORS`, `COURSIER_EXTRA_MIRRORS`, `mirror.properties` in coursier's config directory (`COURSIER_CONFIG_DIR`) | mirrors | ignored: `cs` gets a `COURSIER_MIRRORS` naming no file (which also disables `mirror.properties`), and no `COURSIER_EXTRA_MIRRORS` (read even then) |
-| Maven `settings.xml` (`~/.m2`, `$CS_MAVEN_HOME/settings.xml`, `$MAVEN_HOME/settings.xml`, `COURSIER_MAVEN_SETTINGS`) | mirrors, `<server>` credentials for mirrors, proxies | ignored: `cs` gets `COURSIER_MAVEN_SETTINGS=false` |
+| Maven `settings.xml` (`~/.m2`, `$CS_MAVEN_HOME/settings.xml`, `$MAVEN_HOME/settings.xml`, `COURSIER_MAVEN_SETTINGS`) | mirrors, `<server>` credentials for mirrors, proxies | ignored: `cs` gets `COURSIER_MAVEN_SETTINGS=false`, which stops mirrors and servers but not proxies (coursier's proxy setup reads `settings.xml` on its own, from `$CS_MAVEN_HOME`, else `$MAVEN_HOME` or `~/.m2`), so `cs` also gets a `CS_MAVEN_HOME` naming an empty directory |
 | Scala CLI config (`SCALA_CLI_CONFIG`) | credentials, mirrors, default repositories | ignored since M2: `cs` gets a `SCALA_CLI_CONFIG` that names no file |
 | `COURSIER_CREDENTIALS`, `credentials.properties` | credentials | read by scpm and passed on, one policy for both paths (§5.7) |
-| JVM properties (`https.proxyHost`, …) | proxies | replaced: `cs` ignores `HTTPS_PROXY`, so scpm passes its resolved proxy as `-J-D` properties, and the Rust fetcher gets the same proxy explicitly with reqwest's environment lookup off |
+| JVM properties (`https.proxyHost`, …) | proxies | replaced: `cs` ignores `HTTPS_PROXY`, so scpm passes its resolved proxy as JVM properties (below), and the Rust fetcher gets the same proxy explicitly with reqwest's environment lookup off |
 | `COURSIER_TTL`, `COURSIER_MODE` | cache policy | ignored: removed from `cs`'s environment |
-| `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `JAVA_OPTS` (when `SCPM_CS` is a JVM launcher) | proxies and other JVM properties | ignored: removed from `cs`'s environment |
+| `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, `JDK_JAVA_OPTIONS`, `JAVA_OPTS` (read by a JVM launcher, not the native one) | proxies and other JVM properties | ignored: removed from `cs`'s environment; for the JVM launcher `JAVA_TOOL_OPTIONS` is set again, to exactly scpm's resolved proxy |
 
 A mirror from `settings.xml` with `<mirrorOf>*</mirrorOf>`, common in companies, used to break re-locking: `cs` downloads from the mirror, the URL matches no configured repository, and the lock refuses it (§5.4). The error was loud but baffling.
 
@@ -785,8 +785,8 @@ A mirror from `settings.xml` with `<mirrorOf>*</mirrorOf>`, common in companies,
 
 - `--no-default` and one `--repository` per configured repository, with mirrors already applied (so `cs` asks the mirror directly);
 - `COURSIER_CREDENTIALS` naming scpm's private credentials file (§5.7);
-- `SCALA_CLI_CONFIG` and `COURSIER_MIRRORS` naming files that don't exist, `COURSIER_MAVEN_SETTINGS=false`, and `COURSIER_EXTRA_MIRRORS`, `COURSIER_REPOSITORIES`, `COURSIER_TTL`, `COURSIER_MODE` and the JVM option variables removed;
-- the resolved proxy as JVM properties (`-J-Dhttps.proxyHost=…`, `-J-Dhttp.nonProxyHosts=…`).
+- `SCALA_CLI_CONFIG` and `COURSIER_MIRRORS` naming files that don't exist, `CS_MAVEN_HOME` naming an empty directory, `COURSIER_MAVEN_SETTINGS=false`, and `COURSIER_EXTRA_MIRRORS`, `COURSIER_REPOSITORIES`, `COURSIER_TTL`, `COURSIER_MODE` and the JVM option variables removed;
+- the resolved proxy as JVM properties (`https.proxyHost`, `http.nonProxyHosts`, …), in the one form the launcher takes. Coursier ships two kinds of `cs`, and neither takes the other's: the native launcher sets `-J-Dname=value` arguments itself and reads no Java option variable, while the JVM launcher (a jpackage image, e.g. `cs-x86_64-pc-linux-jvm`, which is what mise installs on Linux) hands every argument to coursier, which rejects `-J…`, but its JVM reads `JAVA_TOOL_OPTIONS`. scpm asks once per run, only when a proxy applies: if `cs version -J-Dscpm.probe=true` succeeds, the properties go in as `-J-D…` arguments (coursier's `sh` launcher passes those to `java` too); otherwise `JAVA_TOOL_OPTIONS` is set to exactly them, and the JVM's `Picked up JAVA_TOOL_OPTIONS` line is dropped from `cs` errors.
 
 The Rust fetcher gets the same resolved values: the same mirror URL, the same credentials and an explicit proxy, instead of reqwest's own environment lookup. Both paths see identical inputs by construction. The compatibility suite (§5.2) runs a re-lock and a restore under a hostile environment (every source above set to something wrong) and checks they still agree.
 

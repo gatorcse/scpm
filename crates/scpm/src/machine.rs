@@ -416,18 +416,20 @@ impl ProxySettings {
         self.route(url).ok().flatten()
     }
 
-    /// The settings as `cs` JVM options. `http.nonProxyHosts` covers both schemes; a
-    /// `noProxy` domain becomes `domain|*.domain`.
-    pub fn jvm_args(&self) -> Vec<String> {
+    /// The settings as JVM system properties (`-Dname=value`) for `cs`. `http.nonProxyHosts`
+    /// covers both schemes; a `noProxy` domain becomes `domain|*.domain`. No value holds
+    /// whitespace or quotes (hosts and `noProxy` entries are checked when read), so the flags
+    /// can be joined with spaces into `JAVA_TOOL_OPTIONS`.
+    pub fn jvm_properties(&self) -> Vec<String> {
         let mut args = Vec::new();
         for (scheme, server) in [("https", &self.https), ("http", &self.http)] {
             if let Some(s) = server {
-                args.push(format!("-J-D{scheme}.proxyHost={}", s.host));
-                args.push(format!("-J-D{scheme}.proxyPort={}", s.port));
+                args.push(format!("-D{scheme}.proxyHost={}", s.host));
+                args.push(format!("-D{scheme}.proxyPort={}", s.port));
             }
         }
         if !args.is_empty() {
-            args.push(format!("-J-Dhttp.nonProxyHosts={}", self.non_proxy_hosts()));
+            args.push(format!("-Dhttp.nonProxyHosts={}", self.non_proxy_hosts()));
         }
         args
     }
@@ -919,12 +921,12 @@ mod tests {
         );
         assert!(p.route("http://repo.example/m/").unwrap_err().contains("HTTP_PROXY"));
         assert_eq!(p.route("http://plain.example/m/"), Ok(None), "noProxy hosts need no proxy");
-        assert_eq!(p.jvm_args()[..2], ["-J-Dhttps.proxyHost=proxy.example", "-J-Dhttps.proxyPort=3128"]);
-        assert!(!p.jvm_args().iter().any(|a| a.contains("http.proxyHost")));
+        assert_eq!(p.jvm_properties()[..2], ["-Dhttps.proxyHost=proxy.example", "-Dhttps.proxyPort=3128"]);
+        assert!(!p.jvm_properties().iter().any(|a| a.contains("http.proxyHost")));
         // Both unusable: still nothing fails until a URL of either scheme is asked for.
         let p = proxy_from_env(&env(&[("HTTPS_PROXY", "socks5://p:1"), ("HTTP_PROXY", "socks5://p:1")])).unwrap();
         assert_eq!(p.errors.len(), 2);
-        assert!(p.jvm_args().is_empty());
+        assert!(p.jvm_properties().is_empty());
     }
 
     #[test]
@@ -1080,11 +1082,11 @@ mod tests {
         }
         assert!(p.for_url("https://notcorp.example/m/").is_some());
         assert_eq!(
-            p.jvm_args(),
+            p.jvm_properties(),
             [
-                "-J-Dhttps.proxyHost=proxy.example",
-                "-J-Dhttps.proxyPort=3128",
-                "-J-Dhttp.nonProxyHosts=corp.example|*.corp.example|internal|*.internal|10.1.2.3|localhost|*.localhost|127.0.0.1|::1|[::1]",
+                "-Dhttps.proxyHost=proxy.example",
+                "-Dhttps.proxyPort=3128",
+                "-Dhttp.nonProxyHosts=corp.example|*.corp.example|internal|*.internal|10.1.2.3|localhost|*.localhost|127.0.0.1|::1|[::1]",
             ]
         );
     }
