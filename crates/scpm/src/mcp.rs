@@ -47,6 +47,8 @@ pub struct Server {
     current: Mutex<Option<(Value, Arc<AtomicBool>)>>,
     /// Requests cancelled while waiting for the build lock.
     cancelled_ids: Mutex<std::collections::HashSet<String>>,
+    /// Set when stdin closes: build calls still waiting for the lock never start.
+    closing: AtomicBool,
 }
 
 /// A request's progress token and its cancellation flag.
@@ -83,6 +85,7 @@ impl Server {
             build_lock: Mutex::new(()),
             current: Mutex::new(None),
             cancelled_ids: Mutex::new(std::collections::HashSet::new()),
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -130,7 +133,9 @@ impl Server {
                     server.send(&reply);
                 }
             }
-            // stdin closed: the client is gone; stop in-flight work instead of finishing it.
+            // stdin closed: the client is gone; stop in-flight work instead of finishing it, and
+            // skip the build calls queued behind it.
+            server.closing.store(true, Ordering::SeqCst);
             server.cancel_current();
             Ok(())
         })?;
@@ -238,8 +243,14 @@ impl Server {
             *lock(&self.current) = Some((id.clone(), cancelled.clone()));
             guard
         });
-        if lock(&self.cancelled_ids).remove(&id.to_string()) {
-            *lock(&self.current) = None;
+        // `closing` is checked after publishing `current`: either this sees it, or the EOF
+        // handler's `cancel_current` sees this call.
+        let closing = builds && self.closing.load(Ordering::SeqCst);
+        if lock(&self.cancelled_ids).remove(&id.to_string()) || closing {
+            // Only a build call published itself; a read-only one must not clear a running build.
+            if builds {
+                *lock(&self.current) = None;
+            }
             return None;
         }
         // A panic in a tool must not leave the client waiting (or poison the build lock).
@@ -361,7 +372,10 @@ impl Server {
         }
         reporter.emit(Event::RunStart { run, command: command.into() });
         let started = Instant::now();
-        let result = Toolchain::new(&ws, &lock).map_err(|e| e.to_string()).and_then(|tc| {
+        // Like the CLI, hold the workspace lock while building, so another scpm command (or
+        // server) doesn't write the same outputs; released before the next call.
+        let result = compile::workspace_lock(&ws.root).map_err(|e| e.to_string()).and_then(|_guard| {
+            let tc = Toolchain::new(&ws, &lock).map_err(|e| e.to_string())?;
             let handle = WorkerHandle::shared(&tc, reporter.clone(), self.slot.clone(), false);
             let result = body(&tc, &graph, &selected, &handle, &reporter);
             handle.shutdown();
@@ -398,6 +412,10 @@ impl Server {
                 .filter(|d| !d.is_zero()),
         };
         self.build(args, "test", progress, |tc, graph, selected, handle, reporter| {
+            // As in the CLI: clear every selected variant's report first, so a run that fails
+            // before its tests start can't leave a stale passing one.
+            let all: Vec<_> = selected.iter().filter_map(|id| tc.ws.variant(id)).collect();
+            testing::clear_reports(tc, &all);
             let variants = testing::with_tests(tc, selected).map_err(|e| e.to_string())?;
             let runner_cp = if variants.is_empty() {
                 Vec::new()
@@ -412,7 +430,7 @@ impl Server {
                 return Err("no test sources in the selected modules".into());
             }
             let ok = testing::run_tests(tc, &variants, &runner_cp, &opts, reporter);
-            if filtered && reporter.test_count() == 0 {
+            if filtered && reporter.tests_run() == 0 {
                 return Err("no tests matched `suites` / `tests`".into());
             }
             Ok(ok)
@@ -709,6 +727,25 @@ mod tests {
         testing::reset_cancel();
         assert!(finished, "cancel_current deadlocked");
         assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn queued_build_calls_do_not_start_after_stdin_closes() {
+        let server = Server::new(PathBuf::from("/nonexistent-scpm-workspace"));
+        server.closing.store(true, Ordering::SeqCst);
+        let call = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "compile"}});
+        assert!(server.handle(&call).is_none(), "a queued build ran after stdin closed");
+        assert!(lock(&server.current).is_none());
+    }
+
+    #[test]
+    fn a_cancelled_read_only_call_keeps_the_running_build_current() {
+        let server = Server::new(PathBuf::from("/nonexistent-scpm-workspace"));
+        *lock(&server.current) = Some((json!(7), Arc::new(AtomicBool::new(false))));
+        lock(&server.cancelled_ids).insert(json!(9).to_string());
+        let call = json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "diagnostics"}});
+        assert!(server.handle(&call).is_none(), "a cancelled call was answered");
+        assert_eq!(lock(&server.current).as_ref().map(|(id, _)| id.clone()), Some(json!(7)));
     }
 
     #[test]

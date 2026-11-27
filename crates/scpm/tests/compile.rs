@@ -516,7 +516,11 @@ fn mcp_server_compiles_and_reports() {
     let r = &ok["result"]["structuredContent"];
     assert_eq!(r["ok"], true, "{ok:#}");
     assert_eq!(r["tasks"]["problems"], serde_json::json!([]), "a green compile lists no tasks");
-    assert!(progress.iter().any(|m| m["method"] == "notifications/progress"), "{progress:?}");
+    // Progress comes from the compile thread, so some may arrive before the ping's reply.
+    assert!(
+        before.iter().chain(&progress).any(|m| m["method"] == "notifications/progress"),
+        "before: {before:?}; after: {progress:?}"
+    );
 
     fs::write(
         ws.path().join("modules/app/src/main/scala/app/Broken.scala"),
@@ -543,6 +547,17 @@ fn mcp_server_compiles_and_reports() {
         t["structuredContent"]["tests"]["failures"][0]["failure"]["file"],
         "modules/app/src/test/scala/app/LoudSuite.scala"
     );
+
+    // A test call whose compile fails clears the old report, as `scpm test` does.
+    let junit = ws.path().join(".scpm/out/app@jvm-3/test-reports/junit.xml");
+    assert!(junit.is_file());
+    fs::write(ws.path().join("modules/app/src/test/scala/app/Bad.scala"), "package app\n\nval bad: Int = \"x\"\n")
+        .unwrap();
+    send(call(16, "test", serde_json::json!({"targets": ["app"]})));
+    let t = read_until(16).0["result"]["structuredContent"].clone();
+    assert_eq!(t["ok"], false, "{t:#}");
+    assert!(!junit.exists(), "a stale report survived a failed test compile");
+    fs::remove_file(ws.path().join("modules/app/src/test/scala/app/Bad.scala")).unwrap();
 
     // Every tool returns an object as structuredContent; bad arguments are tool errors.
     for (id, name, args) in [
