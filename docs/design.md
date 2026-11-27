@@ -662,7 +662,7 @@ This is what makes the **universal lock** (§5.4, "Systems") possible and cheap.
   - the canonical merge gives the same bytes whatever order the per-system results arrive in;
   - a fixture with a cycle produces `bySystem` for the whole classpath;
   - built-in and overridden native mappings, on direct and transitive nodes;
-  - a mapping-table change: M > N re-locks only the variants holding a changed or tombstoned module inside the entry's range, and raises the header whenever the lock is written; M < N stops any re-lock; a frozen run only notes it;
+  - a mapping-table change: M > N re-locks only the variants holding a module inside a touched range of a change or tombstone (including a range an entry was narrowed away from), and raises the header whenever the lock is written; M < N stops any re-lock; a frozen run only notes it;
   - a `cs`-written variant (no `fullContext`) next to sidecar-written ones: the sidecar re-locks only the unmarked one;
   - a jar-only fixture has no `systems` entry;
   - a host outside the set, with and without system-specific entries;
@@ -685,7 +685,7 @@ This is what makes the **universal lock** (§5.4, "Systems") possible and cheap.
   - release-age data from the sidecar;
   - `size` in results;
   - the AOT cache;
-  - `graph`: `why` stays on `cs` in M1, so it explains the host system's classpath.
+  - `graph`: `why` stays on `cs` in M1, so it explains only the host system's classpath. `why --system <s>` for any other system is an error in M1 that names the sidecar's `graph` method (M2); it never prints the host's graph as if it were another system's.
 
   All of these follow in M2. Multi-system resolution is in M1, so projects can opt into universal locks before M2 makes them the default.
 - **M1 prerequisites.** The implementation lands after #14 (machine settings) and #5 (the compile worker launcher and `detect_java`) have merged, so its branch has both. The Rust CLI on `machine-config` doesn't start any JVM yet. In M1 the sidecar runs on the JDK the compile worker detects: no JDK download, and no `cs java-home`.
@@ -835,7 +835,7 @@ Each variant locks four ordered classpaths:
 - **The system set** is `lock.systems`. For a new lock the default is the standard set: `linux-aarch64`, `linux-x86_64`, `macos-aarch64`, `macos-x86_64` and `windows-x86_64`. A project can narrow it (`lock.systems: [linux-x86_64, macos-aarch64]`), or extend it with any other system scpm knows the JVM properties for (§5.2.1's table, e.g. `windows-aarch64`).
 - **The JDK** is `lock.jdk`, by default the project JDK's major version.
 - **Sorting.** The lock's header, every entry's system list and the default set are all sorted, so the same set always serializes the same way.
-- **Only JVM variants are resolved per system.** Scala.js and Scala Native variants depend on artifacts for their platform, not for an OS, so each is resolved once and never has system-specific entries.
+- **Every variant is resolved per system**, Scala.js and Scala Native ones too. Their artifacts depend on the platform rather than the OS, but an OS-activated POM profile anywhere in the graph still applies, and one resolution would hand some systems the wrong dependencies. In practice their per-system results are identical, so the merge writes plain strings and the lock looks as if they were resolved once; the cost is a few warm resolves on metadata already in memory. Native mappings apply only to JVM variants.
 
 This is the *universal lock* other ecosystems settled on:
 - npm, pnpm and Yarn platform packages with `os`/`cpu`: installs skip the other systems, and `supportedArchitectures` fetches them;
@@ -846,7 +846,7 @@ scpm needs no change from library authors: the system-specific jars and profiles
 
 | What differs by system | How scpm handles it | Config |
 |---|---|---|
-| A dependency a POM switches on with an OS/arch profile (e.g. JavaFX: OS-activated profiles set `javafx.platform`, which picks the classifier jar) | Every JVM classpath is resolved once per system, with that system's OS and arch (§5.2.1) | None |
+| A dependency a POM switches on with an OS/arch profile (e.g. JavaFX: OS-activated profiles set `javafx.platform`, which picks the classifier jar) | Every classpath is resolved once per system, with that system's OS and arch (§5.2.1) | None |
 | A native published as a classifier (Netty's `netty-transport-native-epoll`/`-kqueue`, LWJGL's `natives-*`) | A system → classifier mapping per module adds that system's jar | scpm's built-in mappings; a `natives:` entry overrides one |
 | One jar with every native inside (sqlite-jdbc, JNA) | Nothing to do | None |
 
@@ -862,7 +862,8 @@ dependencies:
 ```
 
 - **Built-in mappings.** scpm ships a mapping table keyed by module, with a version range where a library renamed its classifiers: for example Netty's epoll, kqueue and io_uring transports, and LWJGL's modules. A mapping applies wherever its module appears in a JVM variant's graph, direct or transitive. The sidecar then adds the mapped classifier jar at the resolved version, from the repository that served the module. Most projects never write a mapping.
-- **Versioned table.** The table has a version number. Each entry records the table version in which it last changed, and a deleted entry leaves a tombstone with the version of its deletion and the entry's version range. So the binary can list the entries changed in any range (N, M] without shipping old tables.
+- **Versioned table.** The table has a version number. Each entry keeps a short change log: for every table version that changed it, the **touched range**, the union of the entry's version range before and after that change. A deleted entry leaves a tombstone whose touched range is its last range. So the binary can list, for any (N, M], every version range whose mapping changed, including the parts a newer range dropped (an entry narrowed from 1–3 to 2–3 has touched range 1–3), without shipping old tables.
+- **Mapped modules contribute a jar.** A mapping applies only to a module that has an entry on the variant's locked classpaths; the native jar is added next to that entry. A module that is only a POM in the graph (a parent, a BOM, a `type: pom` dependency) gets no native jar. Every library in the built-in table publishes its natives next to a regular jar, so this costs nothing, and it is what makes "affected" decidable from the lock alone.
 - **Overrides.**
   - A `natives:` map on a direct dependency replaces the built-in mapping for that module.
   - `lock.nativeClassifiers` in the workspace does the same for a module that only arrives transitively, as `[{module: org:name, natives: {…}}]`.
@@ -880,7 +881,7 @@ dependencies:
   | Run | N vs M | What happens |
   |---|---|---|
   | Frozen | any difference | Never stale because of mappings. The lock is used as it is, with a note: "lock uses mapping table N, this scpm has M" |
-  | Non-frozen | M > N | Re-lock, in this same run, every **affected** variant: one whose locked classpath has a module at a version inside the range of an entry (or tombstone) that changed in (N, M]. A change to the Netty 4.2 entry doesn't re-lock 4.1 users. **Whenever the install writes the lock at all**, the header becomes M: every affected variant was re-locked in the same run, so all variants match M. An install that writes nothing leaves the header alone, so jar-only projects see no churn |
+  | Non-frozen | M > N | Re-lock, in this same run, every **affected** variant: one whose locked classpaths have a module at a version inside a **touched range** of a change in (N, M] (entries and tombstones alike). A change to the Netty 4.2 entry doesn't re-lock 4.1 users; narrowing an entry from 1–3 to 2–3 does re-lock 1.x users, so they lose the old mapping. **Whenever the install writes the lock at all**, the header becomes M: every affected variant was re-locked in the same run, so all variants match M. An install that writes nothing leaves the header alone, so jar-only projects see no churn |
   | Non-frozen | M < N | Never downgrade. An install that would re-lock anything (a manifest edit, a variant without `fullContext`, …) stops with "lock uses mapping table N; upgrade scpm". One with nothing to re-lock only restores |
 
   So every variant marked `fullContext` matches the header's table; unmarked variants have no mappings, and the next sidecar run re-locks them. A mapping for a module that first arrives in a re-lock is applied by that re-lock. A lock without `nativeMappings` holds no sidecar-written variants (below), so the first sidecar re-lock sets it.
@@ -928,9 +929,9 @@ artifacts:                           # every system's files, one entry each, all
 - **A host outside the set** (default; user may revisit) is an error only when the lock has system-specific entries. The error names the host and suggests adding it to `lock.systems`; scpm doesn't guess a nearby system. When the lock has no system-specific entries, scpm uses the common projection and prints a note. `install --frozen` makes this check before downloading anything.
 - **Restores.** A frozen restore downloads only the host system's files: the projection of every variant and boot entry. CI therefore downloads what it runs and no more. `scpm install --system <s>[,…]` or `--all-systems` also fetches others. The `setup-scpm` cache key includes the host system, computed by the same rule (the JDK's `release` file, else scpm's own OS and arch), so the JDK must be set up before that step.
 - **Packaging** (Phase 4) uses the target system's projection.
-- **`why`** explains the host system's classpath, or the one `--system` names.
+- **`why`** explains the host system's classpath, or the one `--system` names (from M2; in M1 only the host's, §5.2.1).
 - **Cost.**
-  - A re-lock resolves every JVM classpath once per system, concurrently, in one sidecar call (§5.2.1). Each extra system costs about one warm resolve: ≈10–25 ms for the spike's graph, still to be measured on a large workspace.
+  - A re-lock resolves every classpath once per system, concurrently, in one sidecar call (§5.2.1). Each extra system costs about one warm resolve: ≈10–25 ms for the spike's graph, still to be measured on a large workspace.
   - A re-lock also **downloads every system's files**, because Rust hashes them for the lock. JavaFX or LWJGL natives are then fetched five times over (once per system), on a re-lock only. Restores still fetch only the host's.
 
 **This needs the resolver sidecar.** `cs` takes only `--jdk-version`. OS and arch profile activation follow the machine running it, so it can't resolve for another system. The native mappings also need per-node control over artifacts that its flags don't offer.
