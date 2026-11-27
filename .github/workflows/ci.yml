@@ -57,16 +57,26 @@ jobs:
           restore-keys: |
             coursier-${{ matrix.shard }}-
             coursier-
-      # The worker jars depend only on worker/, so a cache hit lets the shards skip sbt.
+      # The worker jars depend only on worker/'s sources, so a cache hit lets the shards skip
+      # sbt. The hash leaves out build output: the cache's post step hashes again after the
+      # build, and must get the same key.
       - id: worker-jars
         uses: actions/cache@v4
         with:
           path: worker/target/out/jvm
-          key: worker-jars-${{ hashFiles('worker/**') }}
+          key: worker-jars-v2-${{ hashFiles('worker/**', '!worker/**/target/**', '!worker/.bsp/**') }}
       - name: Build the JVM helpers
         if: steps.worker-jars.outputs.cache-hit != 'true'
         working-directory: worker
-        run: sbt -batch package
+        # sbt 2 leaves the jars as symlinks into its own cache, which the cache step would save
+        # as dangling links: replace them with the files they point to.
+        run: |
+          sbt -batch package
+          find target/out/jvm -type l -print0 | while IFS= read -r -d '' link; do
+            cp --remove-destination "$(readlink -f "$link")" "$link"
+          done
+          test -z "$(find target/out/jvm -type l)"
+          find target/out/jvm -name '*.jar' | grep -q .
       - run: cargo nextest run --no-fail-fast --partition hash:${{ matrix.shard }}/4
       - run: cargo test --doc
         if: matrix.shard == 1
