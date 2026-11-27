@@ -4,22 +4,80 @@ import sbt.internal.inc.consistent.ConsistentFileAnalysisStore
 import xsbti.compile.AnalysisContents
 import xsbti.compile.analysis.ReadWriteMappers
 
+import java.io.IOException
 import java.nio.file.attribute.{ BasicFileAttributes, FileTime }
-import java.nio.file.{ Files, NoSuchFileException, Path }
+import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.{ FileAlreadyExistsException, Files, NoSuchFileException, Path }
+import java.security.MessageDigest
+import java.util.HexFormat
+import java.util.concurrent.ConcurrentHashMap
 import scala.jdk.OptionConverters.*
 
-/** Zinc analysis files, read through a [[FileCache]] so a warm worker does not deserialize them again. */
-final class AnalysisCache(capacity: Int = 64):
+/**
+ * Zinc analysis files, read through a [[FileCache]] so a warm worker does not deserialize them again.
+ * `delete` is replaceable for tests.
+ */
+final class AnalysisCache(capacity: Int = 64, delete: Path => Unit = Files.deleteIfExists(_)):
   private val cache = FileCache[AnalysisContents](capacity, file => store(file).get.toScala)
+  // Files whose last write failed, until a write succeeds; whatever is still there is stale.
+  private val invalid = ConcurrentHashMap.newKeySet[Path]()
 
-  def read(file: Path): Option[AnalysisContents] = cache.read(file)
+  /** The analysis in `file`; none while its last write failed, or while its invalid marker exists. */
+  def read(file: Path): Option[AnalysisContents] =
+    val canonical = key(file)
+    if invalid.contains(canonical) || Files.exists(AnalysisCache.marker(canonical)) then None
+    else cache.read(file)
 
+  /**
+   * Writes `contents` to `file`. If that fails, the class files are already in place, so an older
+   * analysis in `file` would not match them: [[read]] returns none for `file` until a write
+   * succeeds. `file` is deleted, or, if it cannot be, an invalid marker is left for it (see
+   * [[AnalysisCache.marker]]), so a restarted worker does not read it either. The next compile
+   * starts from an empty classes directory. A successful write removes only its own marker, never
+   * the marker directory, which other analysis files in the same directory may be creating
+   * markers in.
+   */
   def write(file: Path, contents: AnalysisContents): Unit =
-    store(file).set(contents)
+    val canonical = key(file)
+    val marker = AnalysisCache.marker(canonical)
+    try store(file).set(contents)
+    catch
+      case e: Throwable =>
+        invalid.add(canonical)
+        try delete(file)
+        catch
+          case d: IOException =>
+            e.addSuppressed(d)
+            try
+              Files.createDirectories(marker.getParent)
+              Files.createFile(marker)
+            catch
+              case _: FileAlreadyExistsException => ()
+              case m: IOException                => e.addSuppressed(m)
+        throw e
+    // If the marker cannot go, reads keep returning none: the next compile is a full one.
+    try Files.deleteIfExists(marker)
+    catch case _: IOException => ()
+    invalid.remove(canonical)
     cache.put(file, contents)
+
+  private def key(file: Path) = Validation.canonical(file)
 
   private def store(file: Path) =
     ConsistentFileAnalysisStore.binary(file.toFile, ReadWriteMappers.getEmptyMappers)
+
+object AnalysisCache:
+  /** The directory of invalid markers, next to the analysis files they mark. Clients must not use it. */
+  val MarkerDir = ".scpm-invalid"
+
+  /**
+   * Marks the analysis file at `canonical` (a [[Validation.canonical]] path) as stale when it
+   * could not be deleted after a failed write: `.scpm-invalid/<sha-256 of the path>` in its
+   * directory, a name no analysis file of another target can have by accident.
+   */
+  private[worker] def marker(canonical: Path): Path =
+    val digest = MessageDigest.getInstance("SHA-256").digest(canonical.toString.getBytes(UTF_8))
+    canonical.resolveSibling(MarkerDir).resolve(HexFormat.of.formatHex(digest))
 
 /**
  * The parsed contents of up to `maxEntries` files, least recently used first out. An entry is

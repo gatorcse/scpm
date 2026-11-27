@@ -123,11 +123,35 @@ public final class Main {
               if (answered.get()) return;
               parentGone.set(true);
               ProcessHandle.current().descendants().forEach(ProcessHandle::destroyForcibly);
+              // System.exit waits for every shutdown hook, the tests' included, and blocks for good
+              // if a test's System.exit is already shutting down. Nothing else will end this JVM.
+              haltAfter(PARENT_GONE_GRACE_MS, 4);
               System.exit(4);
             },
             "scpm-stdin-watcher");
     watcher.setDaemon(true);
     watcher.start();
+  }
+
+  /** How long shutdown hooks get to finish once the parent is gone. */
+  private static final long PARENT_GONE_GRACE_MS = 5_000;
+
+  /** Halts the JVM with {@code status} after {@code millis}, unless it has exited by then. */
+  private static void haltAfter(long millis, int status) {
+    Thread halter =
+        new Thread(
+            () -> {
+              try {
+                Thread.sleep(millis);
+              } catch (InterruptedException e) {
+                // halt now
+              }
+              Runtime.getRuntime().halt(status);
+            },
+            "scpm-halt");
+    // Daemon threads keep running while shutdown hooks do, and do not keep the JVM alive.
+    halter.setDaemon(true);
+    halter.start();
   }
 
   private static void badRequest(PrintStream protocol, Object id, String message) {
