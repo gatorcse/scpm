@@ -361,7 +361,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 // Clear every selected variant's report, including ones that no longer have tests.
                 let all: Vec<_> = selected.iter().filter_map(|id| ws.variant(id)).collect();
                 testing::clear_reports(&tc, &all);
-                let variants = testing::with_tests(&tc, &selected);
+                let variants = testing::with_tests(&tc, &selected)?;
                 // Check the runner before compiling anything.
                 let runner_cp = if variants.is_empty() { Vec::new() } else { testing::runner_classpath(&tc)? };
                 let handle = compile::WorkerHandle::new(&tc, reporter.clone());

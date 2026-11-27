@@ -83,12 +83,14 @@ pub fn runner_classpath(tc: &Toolchain) -> Result<Vec<PathBuf>, CompileError> {
 }
 
 /// Variants among `targets` that have test sources.
-pub fn with_tests<'a>(tc: &'a Toolchain, targets: &BTreeSet<String>) -> Vec<&'a Variant> {
-    targets
-        .iter()
-        .filter_map(|id| tc.ws.variant(id))
-        .filter(|v| !crate::compile::source_files(&tc.ws.root, &v.test_sources).is_empty())
-        .collect()
+pub fn with_tests<'a>(tc: &'a Toolchain, targets: &BTreeSet<String>) -> Result<Vec<&'a Variant>, CompileError> {
+    let mut found = Vec::new();
+    for v in targets.iter().filter_map(|id| tc.ws.variant(id)) {
+        if !crate::compile::source_files(&tc.ws.root, &v.test_sources)?.is_empty() {
+            found.push(v);
+        }
+    }
+    Ok(found)
 }
 
 /// Removes old JUnit reports of `variants`, so a run that fails before tests start (e.g. a
