@@ -1,3 +1,5 @@
+> **Not ready for use.** scpm is an early work in progress. Please do not use it for anything yet.
+
 # scpm
 
 A fast, package-manager-first workspace tool for Scala. It is shaped like pnpm and aube,
