@@ -72,9 +72,12 @@ pub struct Toolchain<'a> {
 
 impl<'a> Toolchain<'a> {
     pub fn new(ws: &'a Workspace, lock: &'a Lockfile) -> Result<Toolchain<'a>, CompileError> {
-        let repos = coursier::repositories(&ws.repositories()).map_err(InstallError::from)?;
+        // The same repositories, mirrors and credentials as the install that just ran (design
+        // §5.9); its warnings were printed there, so they aren't repeated here.
+        let (repos, _) = install::repositories(ws)?;
         let cache = coursier::cache_dir();
-        let files = install::fetch_items(lock, &repos, &crate::credentials::CoursierCredentials::load(), &cache)?
+        let creds = crate::credentials::CoursierCredentials::load();
+        let files = install::fetch_items(lock, &repos, &creds, &cache, &mut Vec::new())?
             .into_iter()
             .map(|i| (i.key, i.dest))
             .collect();
