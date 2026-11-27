@@ -267,8 +267,16 @@ fn upstream_inputs(v: &Variant) -> UpstreamInputs<'_> {
     }
 }
 
-fn repo_inputs(repos: &[Repo]) -> Vec<(&str, &str)> {
-    repos.iter().map(|r| (r.id.as_str(), r.url.as_str())).collect()
+/// Each repository's id and URL, and its `groups` when it has any (left out otherwise, so
+/// locks written before `groups` existed stay fresh).
+fn repo_inputs(repos: &[Repo]) -> Vec<serde_json::Value> {
+    repos
+        .iter()
+        .map(|r| match r.groups.as_slice() {
+            [] => serde_json::json!([r.id, r.url]),
+            groups => serde_json::json!([r.id, r.url, groups]),
+        })
+        .collect()
 }
 
 fn sha256_json(doc: &serde_json::Value) -> String {
@@ -341,8 +349,19 @@ impl Selector<'_> {
             match cached {
                 Some(v) => v,
                 None => {
+                    // Only the repositories its group comes from are asked (design §5.4).
+                    let allowed: Vec<Repo> =
+                        coursier::allowed_repos(self.repos, &dep.coord.org).into_iter().cloned().collect();
+                    if allowed.is_empty() {
+                        return Err(InstallError::Resolve(format!(
+                            "{}: {}: {}",
+                            variant.id,
+                            dep.coord,
+                            coursier::no_repository_for(&dep.coord.org)
+                        )));
+                    }
                     // Contacting the repositories: an ignored setting of another tool may be why it fails.
-                    let v = coursier::list_versions(&dep.coord.org, &artifact, self.repos, self.proxy, self.cache)
+                    let v = coursier::list_versions(&dep.coord.org, &artifact, &allowed, self.proxy, self.cache)
                         .map_err(|e| with_notice(e.into(), self.repos, true))?;
                     self.listed.lock().expect("listed").insert(list_key.clone(), v.clone());
                     v
@@ -638,7 +657,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     let results = resolve_concurrently(&all, &labels, &repos, &machine.proxy, &cache, scratch.path())
         .map_err(|e| with_notice(e, &repos, true))?;
 
-    record_artifacts(&mut lock, all.iter().flat_map(|req| &results[*req]), &repos, &locate_by_probing(ws, machine))?;
+    record_artifacts(&mut lock, all.iter().flat_map(|req| &results[*req]), &repos)?;
     for (name, req) in &boot_requests {
         lock.boot.insert(name.clone(), results[req].iter().map(|a| a.key.clone()).collect());
     }
@@ -817,75 +836,41 @@ fn resolve_concurrently<'a>(
     Ok(out)
 }
 
-/// Adds artifacts from this run's resolutions to the lock. The repository id is re-derived
-/// from where coursier downloaded the file (repositories may have changed since the entry was
-/// written); only between repositories sharing a mirror does an existing entry keep its id. An existing entry keeps its sha256 and size (artifacts are immutable)
-/// only if the resolved file has them: the lock doesn't record repository URLs, so a
-/// repository whose URL changed under the same id must be checked like one with a new id.
-/// A new artifact downloaded through a mirror that several repositories share: which of them
-/// it belongs to can't be read from the URL ([`record_artifacts`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Ambiguous {
-    pub key: String,
-    /// The mirror URL it came from.
-    pub url: String,
-    /// The repository ids behind that mirror, in resolution order.
-    pub candidates: Vec<String>,
-}
-
-/// Picks, for each ambiguous artifact, the id of a candidate that has it without the mirror.
-pub(crate) type LocateOrigins<'a> = dyn Fn(&[Ambiguous]) -> Result<Vec<String>, InstallError> + 'a;
-
+/// Adds artifacts from this run's resolutions to the lock. An artifact's identity is its key and
+/// sha256; its `repo` is a hint for restores (design §5.4), derived from where coursier
+/// downloaded the file among the repositories allowed for its group: an existing entry keeps
+/// its id if that is still one of them (repositories sharing a mirror can't be told apart by
+/// URL), else the first of them in declared order, else (the file came from a repository its
+/// group isn't restored from) the first repository allowed for the group. An existing entry
+/// keeps its sha256 and size (artifacts are immutable) only if the resolved file has them: the
+/// lock doesn't record repository URLs, so a repository whose URL changed under the same id
+/// must be checked like one with a new id.
 fn record_artifacts<'a>(
     lock: &mut Lockfile,
     resolved: impl IntoIterator<Item = &'a ResolvedArtifact>,
     repos: &[Repo],
-    locate: &LocateOrigins,
 ) -> Result<(), InstallError> {
     let mut seen: HashSet<(&str, &str)> = HashSet::new();
-    let mut decided: Vec<(&ResolvedArtifact, Option<&Repo>)> = Vec::new();
-    let mut ambiguous: Vec<Ambiguous> = Vec::new();
     for a in resolved {
         if !seen.insert((&a.key, &a.url)) {
             continue;
         }
-        let candidates = repos_for_url(repos, &a.url);
-        // Repositories sharing a mirror can't be told apart by URL: an existing entry keeps
-        // its id if that is one of them, so re-locking through a catch-all mirror doesn't
-        // re-label artifacts the first sharer may lack. A new one is looked up behind the
-        // mirror: a machine setting must never decide the id in the lock (design §5.9).
+        let by_url = repos_for_url(repos, &a.url);
+        let source = by_url.first().copied().ok_or_else(|| {
+            InstallError::Resolve(format!(
+                "{} was downloaded from {}, which matches no configured repository or mirror",
+                a.key, a.url
+            ))
+        })?;
+        let allowed = coursier::allowed_repos(repos, coursier::group_of(&a.key));
+        let candidates: Vec<&Repo> = by_url.iter().copied().filter(|r| allowed.iter().any(|x| x.id == r.id)).collect();
         let kept = lock.artifacts.get(&a.key).and_then(|e| candidates.iter().find(|r| r.id == e.repo));
-        match (kept, candidates.as_slice()) {
-            (Some(repo), _) => decided.push((a, Some(*repo))),
-            (None, [_, _, ..]) => {
-                ambiguous.push(Ambiguous {
-                    key: a.key.clone(),
-                    url: a.url.clone(),
-                    candidates: candidates.iter().map(|r| r.id.clone()).collect(),
-                });
-                decided.push((a, None));
-            }
-            (None, _) => decided.push((a, candidates.first().copied())),
-        }
-    }
-    let mut located = locate(&ambiguous)?.into_iter();
-    for (a, repo) in decided {
-        let repo = match repo {
-            Some(repo) => repo,
-            None if repos_for_url(repos, &a.url).len() > 1 => {
-                let id = located.next().expect("one origin per ambiguous artifact");
-                repos.iter().find(|r| r.id == id).expect("located among the candidates")
-            }
-            None => {
-                return Err(InstallError::Resolve(format!(
-                    "{} was downloaded from {}, which matches no configured repository or mirror",
-                    a.key, a.url
-                )));
-            }
-        };
+        let repo = kept.or(candidates.first()).or(allowed.first()).copied().ok_or_else(|| {
+            InstallError::Resolve(format!("{}: {}", a.key, coursier::no_repository_for(coursier::group_of(&a.key))))
+        })?;
         let path = coursier::maven_path(&a.key)
             .ok_or_else(|| InstallError::Resolve(format!("coursier resolved an invalid artifact key `{}`", a.key)))?;
-        let expected = format!("{}{path}", repo.fetch_url());
+        let expected = format!("{}{path}", source.fetch_url());
         if expected != a.url {
             return Err(InstallError::Resolve(format!(
                 "{}: unexpected repository layout (got {}, expected {expected}); snapshots and non-Maven layouts are not supported yet",
@@ -927,79 +912,6 @@ fn record_artifacts<'a>(
 /// The configured repositories serving `url`, matched against where they are downloaded from
 /// (their mirror, if any), so a mirror maps back to repository ids. The longest prefix wins;
 /// repositories sharing a mirror all match, in resolution order.
-/// [`LocateOrigins`] by asking the candidates directly, as a machine without the mirror would
-/// reach them: in resolution order, each with the credentials and proxy route it has without
-/// the mirror. The first that has the file wins; if none can be shown to have it (direct access
-/// is often blocked where a catch-all mirror exists), that is an error, never a guess.
-fn locate_by_probing<'a>(
-    ws: &'a Workspace,
-    machine: &'a Machine,
-) -> impl Fn(&[Ambiguous]) -> Result<Vec<String>, InstallError> + 'a {
-    move |ambiguous: &[Ambiguous]| {
-        if ambiguous.is_empty() {
-            return Ok(Vec::new());
-        }
-        let unmirrored = Machine { mirrors: Vec::new(), ..machine.clone() };
-        let originals = unmirrored.apply(coursier::repositories(&ws.repositories())?);
-        let creds = CoursierCredentials::load().restricted(&coursier::insecure_credential_origins(&originals));
-        let shared = coursier::credential_sources(&originals, &|var| std::env::var(var).ok(), &mut Vec::new()).sources;
-        // One probe per candidate: (ambiguous artifact, candidate id), and its request.
-        let mut slots: Vec<(usize, &str)> = Vec::new();
-        let mut requests = Vec::new();
-        for (n, amb) in ambiguous.iter().enumerate() {
-            let path = coursier::maven_path(&amb.key).ok_or_else(|| {
-                InstallError::Resolve(format!("coursier resolved an invalid artifact key `{}`", amb.key))
-            })?;
-            for id in &amb.candidates {
-                let Some(i) = originals.iter().position(|r| &r.id == id) else { continue };
-                let access = repo_access(&originals[i], shared[i].clone().map(|(_, auth)| auth), &creds);
-                requests.push((format!("{}{path}", originals[i].fetch_url()), access.auth.ok().flatten()));
-                slots.push((n, id));
-            }
-        }
-        let probes = fetch::probe_all(requests, machine.proxy.as_ref());
-        let mut located = Vec::new();
-        let mut unlocated: Vec<String> = Vec::new();
-        for (n, amb) in ambiguous.iter().enumerate() {
-            let tried: Vec<(&str, &fetch::Probe)> =
-                slots.iter().zip(&probes).filter(|((m, _), _)| *m == n).map(|((_, id), p)| (*id, p)).collect();
-            match tried.iter().find(|(_, p)| **p == fetch::Probe::Found) {
-                Some((id, _)) => located.push(id.to_string()),
-                None => {
-                    let answers: Vec<String> = tried
-                        .iter()
-                        .map(|(id, p)| match p {
-                            fetch::Probe::Found => format!("`{id}`: found"),
-                            fetch::Probe::Missing => format!("`{id}`: not found"),
-                            fetch::Probe::Unreachable(why) => format!("`{id}`: {why}"),
-                        })
-                        .collect();
-                    unlocated.push(format!(
-                        "{} came through {}, a mirror that repositories {} share, and none of them could be shown to have \
-                         it without the mirror ({})",
-                        amb.key,
-                        amb.url,
-                        amb.candidates.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", "),
-                        answers.join("; ")
-                    ));
-                }
-            }
-        }
-        if let Some(first) = unlocated.first() {
-            let more = match unlocated.len() - 1 {
-                0 => String::new(),
-                n => format!(" (and {n} more artifact{})", if n == 1 { "" } else { "s" }),
-            };
-            return Err(InstallError::Resolve(format!(
-                "{first}{more}; the lock names the repository a machine without the mirror would use, so scpm won't guess\n  \
-                 help: scope the mirror with `mirrorOf` ids so that repositories don't share one mirror URL, or declare the \
-                 repository that has the artifact on its own, reachable directly or through a mirror of its own"
-            )));
-        }
-        Ok(located)
-    }
-}
-
 fn repos_for_url<'a>(repos: &'a [Repo], url: &str) -> Vec<&'a Repo> {
     let matching = repos.iter().filter(|r| url.starts_with(r.fetch_url()));
     let longest = matching.clone().map(|r| r.fetch_url().len()).max().unwrap_or(0);
@@ -1082,38 +994,59 @@ pub fn fetch_items(
                 crate::lockfile::LOCK_FILE
             ))
         })?;
-        let repo = repos.iter().find(|r| r.id == art.repo).ok_or_else(|| {
-            InstallError::Resolve(format!("{key} comes from repository `{}`, which is not configured", art.repo))
-        })?;
         let path = coursier::maven_path(key).ok_or_else(|| {
             InstallError::Resolve(format!("{} has an invalid artifact key `{key}`", crate::lockfile::LOCK_FILE))
         })?;
-        // The lock names the repository; a mirror only changes where the bytes come from.
-        let url = format!("{}{path}", repo.fetch_url());
-        let bad_url = || InstallError::Resolve(format!("{key}: {url} has no place in the coursier cache"));
-        let access = &access[repo.id.as_str()];
-        let mut verify_cached = false;
-        let dest = match &access.cache_user {
-            CacheUser::Anonymous => coursier::cache_path(cache, &url, None).ok_or_else(bad_url)?,
-            CacheUser::Known(user) => coursier::cache_path(cache, &url, Some(user)).ok_or_else(bad_url)?,
-            CacheUser::Unknown => match coursier::cached_with_any_user(cache, &url) {
-                Some(found) => {
-                    verify_cached = true;
-                    found
-                }
-                None => coursier::cache_path(cache, &url, None).ok_or_else(bad_url)?,
-            },
-        };
-        items.push(FetchItem {
-            key: key.to_string(),
-            url,
-            dest,
-            sha256: art.sha256.clone(),
-            size: art.size,
-            auth: access.auth.clone(),
-            challenge: access.challenge.clone(),
-            verify_cached,
-        });
+        // The recorded repository is a hint (design §5.4): asked first if the artifact's group may
+        // come from it, then the others allowed for the group, in declared order; the sha256
+        // decides. An id that is no longer configured just isn't asked.
+        let group = coursier::group_of(key);
+        let allowed = coursier::allowed_repos(repos, group);
+        if allowed.is_empty() {
+            return Err(InstallError::Resolve(format!("{key}: {}", coursier::no_repository_for(group))));
+        }
+        let order = allowed.iter().filter(|r| r.id == art.repo).chain(allowed.iter().filter(|r| r.id != art.repo));
+        let mut sources: Vec<FetchItem> = Vec::new();
+        for repo in order {
+            // A mirror only changes where the bytes come from; repositories sharing one are one source.
+            let url = format!("{}{path}", repo.fetch_url());
+            if sources.iter().any(|s| s.url == url) {
+                continue;
+            }
+            let bad_url = || InstallError::Resolve(format!("{key}: {url} has no place in the coursier cache"));
+            let access = &access[repo.id.as_str()];
+            let mut verify_cached = false;
+            let dest = match &access.cache_user {
+                CacheUser::Anonymous => coursier::cache_path(cache, &url, None).ok_or_else(bad_url)?,
+                CacheUser::Known(user) => coursier::cache_path(cache, &url, Some(user)).ok_or_else(bad_url)?,
+                CacheUser::Unknown => match coursier::cached_with_any_user(cache, &url) {
+                    Some(found) => {
+                        verify_cached = true;
+                        found
+                    }
+                    None => coursier::cache_path(cache, &url, None).ok_or_else(bad_url)?,
+                },
+            };
+            sources.push(FetchItem {
+                key: key.to_string(),
+                url,
+                dest,
+                sha256: art.sha256.clone(),
+                size: art.size,
+                auth: access.auth.clone(),
+                challenge: access.challenge.clone(),
+                verify_cached,
+                fallbacks: Vec::new(),
+            });
+        }
+        // A copy already cached from any of them is the one used, and the one classpaths name.
+        if let Some(i) = sources.iter().position(|s| std::fs::metadata(&s.dest).is_ok_and(|m| m.len() == art.size)) {
+            let cached = sources.remove(i);
+            sources.insert(0, cached);
+        }
+        let mut item = sources.remove(0);
+        item.fallbacks = sources;
+        items.push(item);
     }
     Ok(items)
 }
@@ -1147,12 +1080,6 @@ pub fn classpath_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A locator for resolutions without new artifacts behind a shared mirror.
-    fn unambiguous(found: &[Ambiguous]) -> Result<Vec<String>, InstallError> {
-        assert!(found.is_empty(), "{found:?}");
-        Ok(Vec::new())
-    }
 
     #[test]
     fn jdk_majors() {
@@ -1193,6 +1120,14 @@ mod tests {
         assert_eq!(base, boot_inputs_hash(&central, &ctx));
         assert_ne!(base, boot_inputs_hash(&other, &ctx));
         assert_ne!(base, boot_inputs_hash(&central, &ResolutionContextLock { jdk: "21".into(), ..ctx.clone() }));
+        // `groups` are an input; without them the hash is what it was before they existed.
+        let grouped = vec![Repo { groups: vec!["com.acme".into()], ..central[0].clone() }];
+        assert_ne!(base, boot_inputs_hash(&grouped, &ctx));
+        assert_eq!(
+            repo_inputs(&central),
+            [serde_json::json!(["central", coursier::CENTRAL_URL])],
+            "the shape locks without `groups` were hashed with"
+        );
     }
 
     /// Loads a workspace of `modules/<name>/scpm.yaml` files on Scala 3.9.0.
@@ -1279,24 +1214,84 @@ mod tests {
             url: format!("https://{repo}.example/g/x/1/x-1.jar"),
         };
         let mut lock = Lockfile::default();
-        record_artifacts(&mut lock, &[resolved("a")], &repos, &unambiguous).unwrap();
+        record_artifacts(&mut lock, &[resolved("a")], &repos).unwrap();
         let locked = lock.artifacts["g:x:1"].clone();
-        record_artifacts(&mut lock, &[resolved("b")], &repos, &unambiguous).unwrap();
+        record_artifacts(&mut lock, &[resolved("b")], &repos).unwrap();
         assert_eq!(lock.artifacts["g:x:1"], ArtifactLock { repo: "b".into(), ..locked.clone() });
 
         std::fs::write(&file, b"other").unwrap();
-        let err = record_artifacts(&mut lock, &[resolved("a")], &repos, &unambiguous).unwrap_err().to_string();
+        let err = record_artifacts(&mut lock, &[resolved("a")], &repos).unwrap_err().to_string();
         assert!(err.contains("serves different bytes"), "{err}");
         assert_eq!(lock.artifacts["g:x:1"].repo, "b", "the lock entry is unchanged");
 
         // `b` now points at another URL serving other bytes: the same id is no excuse.
         let moved = vec![Repo { url: "https://a.example/".into(), ..repos[1].clone() }];
         let resolved_from_a = ResolvedArtifact { url: "https://a.example/g/x/1/x-1.jar".into(), ..resolved("a") };
-        let err = record_artifacts(&mut lock, [&resolved_from_a], &moved, &unambiguous).unwrap_err().to_string();
+        let err = record_artifacts(&mut lock, [&resolved_from_a], &moved).unwrap_err().to_string();
         assert!(err.contains("serves different bytes") && err.contains("repository `b`"), "{err}");
         std::fs::write(&file, b"bytes").unwrap();
-        record_artifacts(&mut lock, &[resolved_from_a], &moved, &unambiguous).unwrap();
+        record_artifacts(&mut lock, &[resolved_from_a], &moved).unwrap();
         assert_eq!(lock.artifacts["g:x:1"], ArtifactLock { repo: "b".into(), ..locked });
+    }
+
+    #[test]
+    fn restores_try_the_hint_then_the_allowed_repositories() {
+        let repo = |id: &str, groups: &[&str]| Repo {
+            id: id.into(),
+            url: format!("https://{id}.example/m/"),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            ..Default::default()
+        };
+        let repos = vec![repo("central", &[]), repo("other", &[]), repo("acme", &["com.acme"])];
+        let mut lock = Lockfile::default();
+        let entry = |repo: &str| ArtifactLock { repo: repo.into(), sha256: "0".into(), size: 1 };
+        lock.boot.insert("x".into(), vec!["g:x:1".into(), "com.acme:y:1".into(), "g:z:1".into()]);
+        lock.artifacts.insert("g:x:1".into(), entry("other"));
+        lock.artifacts.insert("com.acme:y:1".into(), entry("central"));
+        lock.artifacts.insert("g:z:1".into(), entry("removed"));
+        let dir = tempfile::tempdir().unwrap();
+        let items = fetch_items(&lock, &repos, &CoursierCredentials::default(), dir.path(), &mut Vec::new()).unwrap();
+        let urls = |key: &str| -> Vec<String> {
+            let item = items.iter().find(|i| i.key == key).unwrap();
+            std::iter::once(item).chain(&item.fallbacks).map(|i| i.url.clone()).collect()
+        };
+        // The recorded repository first, then the others in declared order; never `acme`, whose
+        // `groups` don't cover `g`.
+        assert_eq!(urls("g:x:1"), ["https://other.example/m/g/x/1/x-1.jar", "https://central.example/m/g/x/1/x-1.jar"]);
+        // An internal artifact is restored only from the repository its group belongs to, whatever
+        // the hint says.
+        assert_eq!(urls("com.acme:y:1"), ["https://acme.example/m/com/acme/y/1/y-1.jar"]);
+        // A repository that is no longer configured is simply not asked.
+        assert_eq!(urls("g:z:1"), ["https://central.example/m/g/z/1/z-1.jar", "https://other.example/m/g/z/1/z-1.jar"]);
+        // Every repository restricted, none covering the group: an error.
+        let err =
+            fetch_items(&lock, &repos[2..], &CoursierCredentials::default(), dir.path(), &mut Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("no repository serves group `g`"), "{err}");
+    }
+
+    #[test]
+    fn groups_pick_repositories_by_longest_prefix() {
+        let repo = |id: &str, groups: &[&str]| Repo {
+            id: id.into(),
+            url: format!("https://{id}.example/"),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            ..Default::default()
+        };
+        let repos = vec![
+            repo("central", &[]),
+            repo("acme", &["com.acme"]),
+            repo("internal", &["com.acme.internal"]),
+            repo("mirror-of-internal", &["com.acme.internal", "org.x"]),
+        ];
+        let ids = |group: &str| -> Vec<String> {
+            coursier::allowed_repos(&repos, group).into_iter().map(|r| r.id.clone()).collect()
+        };
+        assert_eq!(ids("com.acme"), ["acme"]);
+        assert_eq!(ids("com.acme.util"), ["acme"]);
+        assert_eq!(ids("com.acme.internal.db"), ["internal", "mirror-of-internal"], "longest prefix; ties keep order");
+        assert_eq!(ids("com.acmes"), ["central"], "prefixes end at a dot");
+        assert_eq!(ids("org.x"), ["mirror-of-internal"]);
+        assert_eq!(ids("org.typelevel"), ["central"]);
     }
 
     #[test]
@@ -1372,7 +1367,7 @@ mod tests {
         let file = dir.path().join("a-1.jar");
         std::fs::write(&file, b"jar").unwrap();
         let resolved = ResolvedArtifact { key: "g:a:1".into(), file, url: "https://m/all/own/g/a/1/a-1.jar".into() };
-        record_artifacts(&mut lock, [&resolved], &repos, &unambiguous).unwrap();
+        record_artifacts(&mut lock, [&resolved], &repos).unwrap();
         assert_eq!(lock.artifacts["g:a:1"].repo, "own");
         lock.boot.insert("b".into(), vec!["g:a:1".into()]);
         let items =
@@ -1447,34 +1442,25 @@ mod tests {
             url: format!("https://m/all/{path}"),
         };
         let resolved = [via_mirror("g:x:1", "g/x/1/x-1.jar"), via_mirror("g:y:1", "g/y/1/y-1.jar")];
-        record_artifacts(&mut lock, &resolved, &repos, &unambiguous).unwrap();
+        record_artifacts(&mut lock, &resolved, &repos).unwrap();
         assert_eq!(lock.artifacts["g:x:1"].repo, "acme", "a restore without the mirror still finds it");
         assert_eq!(lock.artifacts["g:y:1"].repo, "central");
-        // A new artifact is looked up behind the mirror, among the sharers in resolution order,
-        // and gets the one that has it: here the second.
-        let asked = Mutex::new(Vec::new());
-        let locate = |found: &[Ambiguous]| -> Result<Vec<String>, InstallError> {
-            asked.lock().unwrap().extend_from_slice(found);
-            Ok(vec!["acme".to_string()])
-        };
-        record_artifacts(&mut lock, &[via_mirror("g:z:1", "g/z/1/z-1.jar")], &repos, &locate).unwrap();
-        assert_eq!(lock.artifacts["g:z:1"], ArtifactLock { repo: "acme".into(), sha256: sha256.clone(), size });
-        assert_eq!(
-            asked.into_inner().unwrap(),
-            [Ambiguous {
-                key: "g:z:1".into(),
-                url: "https://m/all/g/z/1/z-1.jar".into(),
-                candidates: vec!["central".into(), "acme".into()],
-            }]
-        );
-        // Nowhere to be found: the locator's error, and nothing recorded.
-        let nowhere =
-            |_: &[Ambiguous]| -> Result<Vec<String>, InstallError> { Err(InstallError::Resolve("no".into())) };
-        assert!(record_artifacts(&mut lock, &[via_mirror("g:w:1", "g/w/1/w-1.jar")], &repos, &nowhere).is_err());
-        assert!(!lock.artifacts.contains_key("g:w:1"));
+        // A new artifact gets the first sharer: the id is a hint, and a restore without the
+        // mirror that misses there asks the others (no lookup, no error).
+        record_artifacts(&mut lock, &[via_mirror("g:z:1", "g/z/1/z-1.jar")], &repos).unwrap();
+        assert_eq!(lock.artifacts["g:z:1"], ArtifactLock { repo: "central".into(), sha256: sha256.clone(), size });
+        // `groups` decide among the sharers, and over where the bytes came from.
+        let grouped = vec![repos[0].clone(), Repo { groups: vec!["com.acme".into()], ..repos[1].clone() }];
+        record_artifacts(&mut lock, &[via_mirror("com.acme:w:1", "com/acme/w/1/w-1.jar")], &grouped).unwrap();
+        assert_eq!(lock.artifacts["com.acme:w:1"].repo, "acme");
+        record_artifacts(&mut lock, &[via_mirror("g:v:1", "g/v/1/v-1.jar")], &grouped).unwrap();
+        assert_eq!(lock.artifacts["g:v:1"].repo, "central");
+        let only_acme = vec![Repo { groups: vec!["com.acme".into()], ..repos[1].clone() }];
+        let err = record_artifacts(&mut lock, &[via_mirror("g:u:1", "g/u/1/u-1.jar")], &only_acme).unwrap_err();
+        assert!(err.to_string().contains("no repository serves group `g`"), "{err}");
         // An id that no longer shares the mirror is re-derived.
         let unshared = vec![repos[0].clone(), Repo { mirror: None, ..repos[1].clone() }];
-        record_artifacts(&mut lock, &[via_mirror("g:x:1", "g/x/1/x-1.jar")], &unshared, &unambiguous).unwrap();
+        record_artifacts(&mut lock, &[via_mirror("g:x:1", "g/x/1/x-1.jar")], &unshared).unwrap();
         assert_eq!(lock.artifacts["g:x:1"].repo, "central");
     }
 }

@@ -33,6 +33,7 @@ fn item(url: String, dest: &Path, body: &[u8]) -> FetchItem {
         auth: Ok(None),
         challenge: Vec::new(),
         verify_cached: false,
+        fallbacks: Vec::new(),
     }
 }
 

@@ -58,6 +58,38 @@ pub struct Repo {
     /// `allowInsecureCredentials`: credentials may go to this `http://` repository's origin
     /// (its mirror's, when mirrored).
     pub allow_insecure_credentials: bool,
+    /// `groups`: the group-id prefixes this repository is restricted to ([`allowed_repos`]).
+    pub groups: Vec<String>,
+}
+
+/// The group id of a lock key or coordinate (`g:a:v…`).
+pub fn group_of(key: &str) -> &str {
+    key.split(':').next().unwrap_or(key)
+}
+
+/// Whether the group-id prefix `prefix` covers `group`: equal, or `group` continues it after a
+/// dot (`com.acme` covers `com.acme.util`, not `com.acmes`).
+fn covers_group(prefix: &str, group: &str) -> bool {
+    group.strip_prefix(prefix).is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+/// The repositories `group`'s artifacts come from, in declared order (design §5.4): those whose
+/// `groups` has the longest prefix covering it (several on a tie), else every repository without
+/// `groups`. Empty when every repository has `groups` and none covers it.
+pub fn allowed_repos<'a>(repos: &'a [Repo], group: &str) -> Vec<&'a Repo> {
+    let longest = |r: &Repo| r.groups.iter().filter(|p| covers_group(p, group)).map(String::len).max();
+    match repos.iter().filter_map(longest).max() {
+        Some(len) => repos.iter().filter(|r| longest(r) == Some(len)).collect(),
+        None => repos.iter().filter(|r| r.groups.is_empty()).collect(),
+    }
+}
+
+/// Why `group` has no repository, for an error.
+pub fn no_repository_for(group: &str) -> String {
+    format!(
+        "no repository serves group `{group}`: every repository has `groups` and none covers it; \
+         add a repository without `groups` (such as `central`), or a prefix that covers it"
+    )
 }
 
 /// A mirror applied to a repository.
@@ -290,11 +322,27 @@ pub fn repositories(config: &[Repository]) -> Result<Vec<Repo>, CoursierError> {
                     )));
                 }
                 let url = if def.url.ends_with('/') { def.url.clone() } else { format!("{}/", def.url) };
+                // `com.acme`: dot-separated segments of what a Maven group id may hold.
+                let segment = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_".contains(c));
+                let groups = def.groups.clone().unwrap_or_default();
+                if def.groups.as_ref().is_some_and(Vec::is_empty) {
+                    return Err(CoursierError::Config(format!(
+                        "repository `{}`: `groups` is empty; list group-id prefixes such as `com.acme`, or leave it out",
+                        def.id
+                    )));
+                }
+                if let Some(bad) = groups.iter().find(|g| !g.split('.').all(segment)) {
+                    return Err(CoursierError::Config(format!(
+                        "repository `{}`: `groups` entry `{bad}` is not a group-id prefix; write dot-separated names such as `com.acme`",
+                        def.id
+                    )));
+                }
                 Ok(Repo {
                     id: def.id.clone(),
                     url,
                     credentials,
                     allow_insecure_credentials: def.allow_insecure_credentials,
+                    groups,
                     ..Default::default()
                 })
             }
@@ -869,9 +917,13 @@ fn add_common_args_for(
             }
         }
     }
-    // Mirrors already applied, so `cs` asks the mirror directly; once per URL.
+    // Mirrors already applied, so `cs` asks the mirror directly; once per URL. `cs` 2.1.27 has no
+    // per-repository group filter and asks repositories in order, taking the first that has a
+    // module, so repositories with `groups` go first: an internal artifact is found there before
+    // any other repository is asked about it (design §5.4 says what still can be).
     let mut urls: Vec<&str> = Vec::new();
-    for repo in repos {
+    let (grouped, open): (Vec<&Repo>, Vec<&Repo>) = repos.iter().partition(|r| !r.groups.is_empty());
+    for repo in grouped.into_iter().chain(open) {
         if !urls.contains(&repo.fetch_url()) {
             urls.push(repo.fetch_url());
             cmd.arg("--repository").arg(repo.fetch_url());
@@ -1285,6 +1337,26 @@ mod tests {
     }
 
     #[test]
+    fn groups_are_group_id_prefixes() {
+        let def = |groups: Option<Vec<&str>>| {
+            repositories(&[Repository::Full(crate::config::RepositoryDef {
+                id: "acme".into(),
+                url: "https://acme.example/maven".into(),
+                credentials: None,
+                allow_insecure_credentials: false,
+                groups: groups.map(|g| g.into_iter().map(String::from).collect()),
+            })])
+        };
+        assert_eq!(def(Some(vec!["com.acme", "org.acme-x.internal_2"])).unwrap()[0].groups.len(), 2);
+        assert!(def(None).unwrap()[0].groups.is_empty());
+        assert!(def(Some(vec![])).unwrap_err().to_string().contains("`groups` is empty"));
+        for bad in ["com.", ".com", "com..acme", "com.*", "com acme", ""] {
+            let err = def(Some(vec![bad])).unwrap_err().to_string();
+            assert!(err.contains("is not a group-id prefix"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn repository_urls_must_not_carry_credentials() {
         let repo = |url: &str| {
             repositories(&[Repository::Full(crate::config::RepositoryDef {
@@ -1292,6 +1364,7 @@ mod tests {
                 url: url.into(),
                 credentials: None,
                 allow_insecure_credentials: false,
+                groups: None,
             })])
         };
         let err = repo("https://alice:hunter2@acme.example/maven").unwrap_err().to_string();
@@ -1464,6 +1537,7 @@ mod tests {
             url: "https://acme.example/maven".into(),
             credentials: Some(credentials),
             allow_insecure_credentials: false,
+            groups: None,
         })])
     }
 
@@ -1475,6 +1549,7 @@ mod tests {
                 url: url.into(),
                 credentials: Some(Credentials::Bearer("env:NEXUS_TOKEN".into())),
                 allow_insecure_credentials: allow,
+                groups: None,
             })])
         };
         let err = def("http://nexus.local:8081/repo?token=s3cret", false).unwrap_err().to_string();

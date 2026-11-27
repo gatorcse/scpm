@@ -656,7 +656,6 @@ fn relocking_through_a_catch_all_mirror_keeps_repository_ids() {
     let acme = Server::maven(acme_files, None);
     let mut mirrored = moved(hello_repo_files(b"hello jar"), "mirror");
     mirrored.extend(moved(renamed("world"), "mirror"));
-    mirrored.extend(moved(renamed("lonely"), "mirror"));
     let mirror = Server::maven(mirrored, None);
     let ws = tempfile::tempdir().unwrap();
     let repos = format!(
@@ -669,9 +668,9 @@ fn relocking_through_a_catch_all_mirror_keeps_repository_ids() {
     scpm(ws.path(), cache.path()).arg("install").assert().success();
     assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
 
-    // Re-locked through one mirror for both repositories: hello stays acme's, so a restore
-    // without the mirror still finds it. world, new and only in acme (the second repository),
-    // is looked up behind the mirror and recorded as acme's, as it would be without the mirror.
+    // Re-locked through one mirror for both repositories, without error: hello keeps acme. world
+    // is new and only in acme, but which sharer served it can't be told, so the hint is the
+    // first one, main.
     let deps = "dependencies:\n  com.example:hello: '1.0'\n  com.example:world: '1.0'\n";
     java_workspace(ws.path(), &repos, deps);
     let config = ws.path().join("user-config.yaml");
@@ -680,17 +679,56 @@ fn relocking_through_a_catch_all_mirror_keeps_repository_ids() {
     assert!(mirror.count("/mirror/com/example/world/1.0/world-1.0.pom") > 0, "re-locked through the mirror");
     let locked = lock(ws.path());
     assert_eq!(locked["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
-    assert_eq!(locked["artifacts"]["com.example:world:1.0"]["repo"], "acme");
-    assert!(main.count("/maven/com/example/world/1.0/world-1.0.jar") >= 1, "main was asked first");
-    assert!(acme.count("/maven/com/example/world/1.0/world-1.0.jar") >= 1);
+    assert_eq!(locked["artifacts"]["com.example:world:1.0"]["repo"], "main");
 
-    // An artifact that only the mirror has can't be given any of their ids: an error, no guess.
-    java_workspace(ws.path(), &repos, &format!("{deps}  com.example:lonely: '1.0'\n"));
-    let err = stderr_of(scpm(ws.path(), cache.path()).env("SCPM_CONFIG", &config).arg("install"));
-    assert!(err.contains("com.example:lonely:1.0") && err.contains("`main`, `acme`"), "{err}");
-    assert!(err.contains("`main`: not found; `acme`: not found"), "{err}");
-    assert!(err.contains("scope the mirror with `mirrorOf` ids"), "{err}");
-    assert!(lock(ws.path())["artifacts"].get("com.example:lonely:1.0").is_none());
+    // A restore without the mirror follows the wrong hint, gets a 404 and asks acme next; the
+    // sha256 decides that it is the locked file.
+    let empty = tempfile::tempdir().unwrap();
+    scpm(ws.path(), empty.path()).args(["install", "--frozen"]).assert().success();
+    assert!(main.count("/maven/com/example/world/1.0/world-1.0.jar") >= 1, "the hint was asked first");
+    assert!(acme.count("/maven/com/example/world/1.0/world-1.0.jar") >= 1, "then the next repository");
+    let jar = empty.path().join(format!("http/127.0.0.1%3A{}/maven/com/example/world/1.0/world-1.0.jar", acme.port));
+    assert_eq!(fs::read(jar).unwrap(), b"world jar");
+    // The classpath names the copy that was found.
+    let out = scpm(ws.path(), empty.path()).args(["classpath", "lib", "--frozen"]).assert().success();
+    let classpath = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(classpath.contains(&format!("127.0.0.1%3A{}/maven/com/example/world", acme.port)), "{classpath}");
+}
+
+#[test]
+fn groups_keep_internal_artifacts_away_from_other_repositories() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    // `public` is declared first and has nothing; `com.example` belongs to `acme` alone.
+    let public = Server::maven(Default::default(), None);
+    let acme = Server::maven(hello_repo_files(b"hello jar"), None);
+    let ws = tempfile::tempdir().unwrap();
+    let repos = format!(
+        "repositories:\n  - {{id: public, url: '{}'}}\n  - {{id: acme, url: '{}', groups: [com.example]}}\n",
+        public.url("/maven"),
+        acme.url("/maven")
+    );
+    java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
+    let asked_public = || public.requests.lock().unwrap().iter().filter(|r| r.path.contains("com/example")).count();
+
+    // Re-locking: `cs` asks the repositories with `groups` first, so it finds hello in acme and
+    // never asks public about it.
+    scpm(ws.path(), tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
+    assert_eq!(asked_public(), 0, "re-lock");
+    // Restoring: only acme is ever a source for com.example.
+    let empty = tempfile::tempdir().unwrap();
+    scpm(ws.path(), empty.path()).args(["install", "--frozen"]).assert().success();
+    assert_eq!(asked_public(), 0, "restore");
+    assert!(acme.count(HELLO_JAR_PATH) >= 2);
+    // Even with a hint naming public (the lock's `repo` is only a hint), public isn't asked.
+    let lock_file = ws.path().join("scpm-lock.yaml");
+    let text = fs::read_to_string(&lock_file).unwrap();
+    assert!(text.contains("repo: acme"), "{text}");
+    fs::write(&lock_file, text.replace("repo: acme", "repo: public")).unwrap();
+    scpm(ws.path(), tempfile::tempdir().unwrap().path()).args(["install", "--frozen"]).assert().success();
+    assert_eq!(asked_public(), 0, "restore with a hint for public");
 }
 
 #[test]

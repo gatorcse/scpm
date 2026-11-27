@@ -42,6 +42,10 @@ pub struct FetchItem {
     /// `dest` may hold a file cached under another identity: trust it only if its sha256
     /// matches the lock.
     pub verify_cached: bool,
+    /// Other repositories the file may come from, tried in order when this one answers 404 or
+    /// 410 (design §5.4: the lock's repository is a hint). Each has its own URL, cache path and
+    /// credentials, and none has fallbacks of its own; the sha256 is checked either way.
+    pub fallbacks: Vec<FetchItem>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -214,7 +218,7 @@ pub fn fetch_all(items: Vec<FetchItem>, opts: FetchOptions) -> Result<FetchRepor
         }
     };
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-    let results = runtime.block_on(download_all(&client, downloads, opts.verify));
+    let results = runtime.block_on(download_all(&client, downloads, opts.verify, proxy));
     for (r, repair) in results {
         match r {
             Ok(Fetched { downloaded, rehashed }) => {
@@ -299,71 +303,11 @@ fn redirect_refusal(previous: &[reqwest::Url], next: &reqwest::Url, proxy: Optio
     }
 }
 
-/// What a direct request for a file found ([`probe_all`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Probe {
-    /// The server has it (2xx).
-    Found,
-    /// The server says it doesn't (404 or 410).
-    Missing,
-    /// No answer either way: no connection, an unusable proxy, 401/403, 5xx, …
-    Unreachable(String),
-}
-
-/// Asks each `(url, auth)` whether it serves the file, with a `GET` whose body is never read,
-/// through the same client, proxy routes and redirect rules as downloads. Concurrent; results in
-/// order.
-pub fn probe_all(requests: Vec<(String, Option<Auth>)>, proxy: Option<&ProxySettings>) -> Vec<Probe> {
-    if requests.is_empty() {
-        return Vec::new();
-    }
-    let client = match client(proxy) {
-        Ok(client) => client,
-        Err(e) => {
-            let message = format!("cannot use the proxy: {}", error_chain(&e));
-            return requests.iter().map(|_| Probe::Unreachable(message.clone())).collect();
-        }
-    };
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-    runtime.block_on(async {
-        let permits = Arc::new(Semaphore::new(CONCURRENCY));
-        let tasks: Vec<_> = requests
-            .into_iter()
-            .map(|(url, auth)| {
-                let (client, permits) = (client.clone(), permits.clone());
-                let route = proxy.map(|p| p.route(&url).map(|_| ()));
-                tokio::spawn(async move {
-                    if let Some(Err(e)) = route {
-                        return Probe::Unreachable(e);
-                    }
-                    let _permit = permits.acquire().await.expect("semaphore open");
-                    let mut req = client.get(&url);
-                    match &auth {
-                        Some(Auth::Bearer(token)) => req = req.bearer_auth(token),
-                        Some(Auth::Basic { user, password }) => req = req.basic_auth(user, Some(password)),
-                        None => {}
-                    }
-                    match req.send().await {
-                        Ok(resp) if resp.status().is_success() => Probe::Found,
-                        Ok(resp) if matches!(resp.status().as_u16(), 404 | 410) => Probe::Missing,
-                        Ok(resp) => Probe::Unreachable(format!("HTTP {}", resp.status().as_u16())),
-                        Err(e) => Probe::Unreachable(error_chain(&e)),
-                    }
-                })
-            })
-            .collect();
-        let mut out = Vec::with_capacity(tasks.len());
-        for t in tasks {
-            out.push(t.await.expect("probe task panicked"));
-        }
-        out
-    })
-}
-
 async fn download_all(
     client: &reqwest::Client,
     items: Vec<(FetchItem, bool)>,
     verify: bool,
+    proxy: Option<&ProxySettings>,
 ) -> Vec<(Result<Fetched, FetchError>, bool)> {
     let permits = Arc::new(Semaphore::new(CONCURRENCY));
     let tasks: Vec<_> = items
@@ -371,9 +315,10 @@ async fn download_all(
         .map(|(item, repair)| {
             let client = client.clone();
             let permits = permits.clone();
+            let proxy = proxy.cloned();
             tokio::spawn(async move {
                 let _permit = permits.acquire().await.expect("semaphore open");
-                (fetch_one(&client, &item, repair, verify).await, repair)
+                (fetch_with_fallbacks(&client, &item, repair, verify, proxy.as_ref()).await, repair)
             })
         })
         .collect();
@@ -382,6 +327,33 @@ async fn download_all(
         out.push(t.await.expect("download task panicked"));
     }
     out
+}
+
+/// [`fetch_one`] from `item`, then from each of its fallbacks while the answer is 404 or 410
+/// (design §5.4). A fallback whose credentials can't be read or whose scheme's proxy is unusable
+/// is skipped. If none has it, the first answer is the error.
+async fn fetch_with_fallbacks(
+    client: &reqwest::Client,
+    item: &FetchItem,
+    repair: bool,
+    verify: bool,
+    proxy: Option<&ProxySettings>,
+) -> Result<Fetched, FetchError> {
+    let not_found = |r: &Result<Fetched, FetchError>| matches!(r, Err(FetchError::Http { status: 404 | 410, .. }));
+    let first = fetch_one(client, item, repair, verify).await;
+    if !not_found(&first) {
+        return first;
+    }
+    for fallback in &item.fallbacks {
+        if fallback.auth.is_err() || proxy.is_some_and(|p| p.route(&fallback.url).is_err()) {
+            continue;
+        }
+        let next = fetch_one(client, fallback, repair, verify).await;
+        if !not_found(&next) {
+            return next;
+        }
+    }
+    first
 }
 
 /// What [`fetch_one`] did with a file.
