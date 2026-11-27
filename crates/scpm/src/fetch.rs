@@ -194,7 +194,12 @@ pub fn fetch_all(items: Vec<FetchItem>, opts: FetchOptions) -> Result<FetchRepor
     let mut downloads = Vec::new();
     let proxy = opts.proxy.as_ref();
     for (item, repair) in missing {
-        if let Err(message) = &item.auth {
+        // With fallbacks, a source that can't be asked is skipped like one answering 404
+        // ([`fetch_with_fallbacks`]); its problem is reported only if no source has the file.
+        if !item.fallbacks.is_empty() {
+            *attempted.entry(host_of(&item.url)).or_default() += 1;
+            downloads.push((item, repair));
+        } else if let Err(message) = &item.auth {
             errors.push(FetchError::Credentials { key: item.key.clone(), message: message.clone() });
         } else if let Some(Err(message)) = proxy.map(|p| p.route(&item.url)) {
             // The environment's proxy for this URL's scheme is unusable; other schemes go on.
@@ -330,8 +335,10 @@ async fn download_all(
 }
 
 /// [`fetch_one`] from `item`, then from each of its fallbacks while the answer is 404 or 410
-/// (design §5.4). A fallback whose credentials can't be read or whose scheme's proxy is unusable
-/// is skipped. If none has it, the first answer is the error.
+/// (design §5.4). A source whose credentials can't be read or whose scheme's proxy is unusable
+/// can't be asked, and counts like a 404; any other answer (a 401 or 403, a transport error, a
+/// checksum mismatch) ends the search. If no source has the file, the first one's answer is the
+/// error.
 async fn fetch_with_fallbacks(
     client: &reqwest::Client,
     item: &FetchItem,
@@ -339,13 +346,25 @@ async fn fetch_with_fallbacks(
     verify: bool,
     proxy: Option<&ProxySettings>,
 ) -> Result<Fetched, FetchError> {
+    let unusable = |source: &FetchItem| -> Option<FetchError> {
+        if let Err(message) = &source.auth {
+            return Some(FetchError::Credentials { key: source.key.clone(), message: message.clone() });
+        }
+        proxy.and_then(|p| p.route(&source.url).err()).map(FetchError::Proxy)
+    };
     let not_found = |r: &Result<Fetched, FetchError>| matches!(r, Err(FetchError::Http { status: 404 | 410, .. }));
-    let first = fetch_one(client, item, repair, verify).await;
-    if !not_found(&first) {
-        return first;
-    }
+    let first = match unusable(item) {
+        Some(problem) => Err(problem),
+        None => {
+            let first = fetch_one(client, item, repair, verify).await;
+            if !not_found(&first) {
+                return first;
+            }
+            first
+        }
+    };
     for fallback in &item.fallbacks {
-        if fallback.auth.is_err() || proxy.is_some_and(|p| p.route(&fallback.url).is_err()) {
+        if unusable(fallback).is_some() {
             continue;
         }
         let next = fetch_one(client, fallback, repair, verify).await;

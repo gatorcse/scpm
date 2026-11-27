@@ -696,6 +696,28 @@ fn relocking_through_a_catch_all_mirror_keeps_repository_ids() {
 }
 
 #[test]
+fn an_internal_name_found_in_a_public_repository_is_not_locked() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    // Dependency confusion: com.example belongs to acme, which lacks hello; public has a copy.
+    let acme = Server::maven(Default::default(), None);
+    let public = Server::maven(hello_repo_files(b"someone else's jar"), None);
+    let ws = tempfile::tempdir().unwrap();
+    let repos = format!(
+        "repositories:\n  - {{id: public, url: '{}'}}\n  - {{id: acme, url: '{}', groups: [com.example]}}\n",
+        public.url("/maven"),
+        acme.url("/maven")
+    );
+    java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
+    let err = stderr_of(scpm(ws.path(), tempfile::tempdir().unwrap().path()).arg("install"));
+    assert!(err.contains("com.example:hello:1.0 was found in repository `public`"), "{err}");
+    assert!(err.contains("may only come from `acme`") && err.contains("dependency confusion"), "{err}");
+    assert!(acme.count("/maven/com/example/hello/1.0/hello-1.0.pom") >= 1, "acme was asked first");
+    assert!(!ws.path().join("scpm-lock.yaml").exists(), "nothing was locked");
+}
+
+#[test]
 fn groups_keep_internal_artifacts_away_from_other_repositories() {
     if !cs_available() || cfg!(windows) {
         return;

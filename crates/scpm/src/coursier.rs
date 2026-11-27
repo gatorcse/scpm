@@ -84,6 +84,11 @@ pub fn allowed_repos<'a>(repos: &'a [Repo], group: &str) -> Vec<&'a Repo> {
     }
 }
 
+/// Whether some repository's `groups` covers `group`, restricting it to those repositories.
+pub fn group_is_restricted(repos: &[Repo], group: &str) -> bool {
+    repos.iter().any(|r| r.groups.iter().any(|p| covers_group(p, group)))
+}
+
 /// Why `group` has no repository, for an error.
 pub fn no_repository_for(group: &str) -> String {
     format!(

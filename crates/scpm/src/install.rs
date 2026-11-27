@@ -864,6 +864,22 @@ fn record_artifacts<'a>(
         })?;
         let allowed = coursier::allowed_repos(repos, coursier::group_of(&a.key));
         let candidates: Vec<&Repo> = by_url.iter().copied().filter(|r| allowed.iter().any(|x| x.id == r.id)).collect();
+        let group = coursier::group_of(&a.key);
+        // A group restricted by `groups` that `cs` found elsewhere (its own repository lacks it):
+        // locking those bytes would let a public repository supply an internal name.
+        if candidates.is_empty() && coursier::group_is_restricted(repos, group) {
+            let ids: Vec<String> = allowed.iter().map(|r| format!("`{}`", r.id)).collect();
+            return Err(InstallError::Resolve(format!(
+                "{key} was found in repository `{from}` ({url}), but group `{group}` may only come from {ids}, which \
+                 didn't have it; it is not locked, since a copy of an internal name in another repository may be \
+                 dependency confusion\n  help: publish it to {ids}, or check the version; if `{from}` is meant to serve \
+                 it, add the group to that repository's `groups`",
+                key = a.key,
+                from = source.id,
+                url = a.url,
+                ids = ids.join(", "),
+            )));
+        }
         let kept = lock.artifacts.get(&a.key).and_then(|e| candidates.iter().find(|r| r.id == e.repo));
         let repo = kept.or(candidates.first()).or(allowed.first()).copied().ok_or_else(|| {
             InstallError::Resolve(format!("{}: {}", a.key, coursier::no_repository_for(coursier::group_of(&a.key))))
@@ -1040,7 +1056,14 @@ pub fn fetch_items(
             });
         }
         // A copy already cached from any of them is the one used, and the one classpaths name.
-        if let Some(i) = sources.iter().position(|s| std::fs::metadata(&s.dest).is_ok_and(|m| m.len() == art.size)) {
+        // One from a repository other than the first is used only once its sha256 matches:
+        // another repository's file of the same name may differ, and a mismatching copy must
+        // not displace the first source (its repair would ask the wrong repository).
+        let usable = |i: usize, s: &FetchItem| {
+            std::fs::metadata(&s.dest).is_ok_and(|m| m.len() == art.size)
+                && (i == 0 || fetch::sha256_file(&s.dest).is_ok_and(|h| h == art.sha256))
+        };
+        if let Some(i) = sources.iter().enumerate().position(|(i, s)| usable(i, s)) {
             let cached = sources.remove(i);
             sources.insert(0, cached);
         }
@@ -1267,6 +1290,68 @@ mod tests {
         let err =
             fetch_items(&lock, &repos[2..], &CoursierCredentials::default(), dir.path(), &mut Vec::new()).unwrap_err();
         assert!(err.to_string().contains("no repository serves group `g`"), "{err}");
+    }
+
+    #[test]
+    fn another_repositorys_cached_copy_is_used_only_if_its_sha256_matches() {
+        let repos: Vec<Repo> = ["central", "other"]
+            .iter()
+            .map(|id| Repo { id: id.to_string(), url: format!("https://{id}.example/"), ..Default::default() })
+            .collect();
+        let cache = tempfile::tempdir().unwrap();
+        let good = cache.path().join("good");
+        std::fs::write(&good, b"right").unwrap();
+        let mut lock = Lockfile::default();
+        lock.boot.insert("x".into(), vec!["g:x:1".into()]);
+        lock.artifacts.insert(
+            "g:x:1".into(),
+            ArtifactLock { repo: "central".into(), sha256: fetch::sha256_file(&good).unwrap(), size: 5 },
+        );
+        let other_copy = coursier::cache_path(cache.path(), "https://other.example/g/x/1/x-1.jar", None).unwrap();
+        std::fs::create_dir_all(other_copy.parent().unwrap()).unwrap();
+        let first_url = |lock: &Lockfile| {
+            fetch_items(lock, &repos, &CoursierCredentials::default(), cache.path(), &mut Vec::new()).unwrap()[0]
+                .url
+                .clone()
+        };
+        // Same size, other bytes: not used; the hint stays first (and is what a download asks).
+        std::fs::write(&other_copy, b"wrong").unwrap();
+        assert_eq!(first_url(&lock), "https://central.example/g/x/1/x-1.jar");
+        std::fs::write(&other_copy, b"right").unwrap();
+        assert_eq!(first_url(&lock), "https://other.example/g/x/1/x-1.jar");
+    }
+
+    #[test]
+    fn an_internal_artifact_found_elsewhere_is_refused() {
+        let repos = vec![
+            Repo { id: "public".into(), url: "https://public.example/".into(), ..Default::default() },
+            Repo {
+                id: "acme".into(),
+                url: "https://acme.example/".into(),
+                groups: vec!["com.acme".into()],
+                ..Default::default()
+            },
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.jar");
+        std::fs::write(&file, b"jar").unwrap();
+        let from = |host: &str, key: &str, path: &str| ResolvedArtifact {
+            key: key.into(),
+            file: file.clone(),
+            url: format!("https://{host}.example/{path}"),
+        };
+        let mut lock = Lockfile::default();
+        // `cs` missed at acme and took com.acme:x from public: refused, not locked.
+        let err = record_artifacts(&mut lock, &[from("public", "com.acme:x:1", "com/acme/x/1/x-1.jar")], &repos)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("com.acme:x:1 was found in repository `public`"), "{err}");
+        assert!(err.contains("may only come from `acme`") && err.contains("dependency confusion"), "{err}");
+        assert!(lock.artifacts.is_empty());
+        // An uncovered group served by a repository with `groups` (one proxying Central) is
+        // recorded as the repository it may come from.
+        record_artifacts(&mut lock, &[from("acme", "org.x:y:1", "org/x/y/1/y-1.jar")], &repos).unwrap();
+        assert_eq!(lock.artifacts["org.x:y:1"].repo, "public");
     }
 
     #[test]

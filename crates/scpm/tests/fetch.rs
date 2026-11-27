@@ -38,6 +38,50 @@ fn item(url: String, dest: &Path, body: &[u8]) -> FetchItem {
 }
 
 #[test]
+fn fallbacks_are_asked_only_after_a_not_found_each_with_its_own_credentials() {
+    let basic = |user: &str, password: &str| Ok(Some(Auth::Basic { user: user.into(), password: password.into() }));
+    let source = |server: &Server, cache: &Path, auth: Result<Option<Auth>, String>| FetchItem {
+        auth,
+        ..item(server.url(HELLO_JAR_PATH), &cache.join(format!("{}/hello-1.0.jar", server.port)), JAR)
+    };
+
+    // The hint answers 404 for its own token; the fallback must get its own token, not the hint's.
+    let hint = Server::maven(Default::default(), Some(("a", "token-a")));
+    let other = Server::maven(hello_repo_files(JAR), Some(("b", "token-b")));
+    let cache = tempfile::tempdir().unwrap();
+    let mut first = source(&hint, cache.path(), basic("a", "token-a"));
+    first.fallbacks = vec![source(&other, cache.path(), basic("b", "token-b"))];
+    assert_eq!(fetch_all(vec![first], FetchOptions::default()).unwrap().downloaded, 1);
+    assert_eq!(hint.count(HELLO_JAR_PATH), 1);
+    let sent: Vec<Option<String>> = other.requests.lock().unwrap().iter().map(|r| r.authorization.clone()).collect();
+    assert_eq!(sent.len(), 1);
+    assert!(sent.iter().all(|a| a.as_deref() == Some("Basic Yjp0b2tlbi1i")), "token B only: {sent:?}");
+
+    // A 401 (or 403) from the hint is an answer, not a miss: no fallback is asked.
+    let locked = Server::maven(hello_repo_files(JAR), Some(("alice", "s3cret")));
+    let open = Server::maven(hello_repo_files(JAR), None);
+    let cache = tempfile::tempdir().unwrap();
+    let mut first = source(&locked, cache.path(), Ok(None));
+    first.fallbacks = vec![source(&open, cache.path(), Ok(None))];
+    let err = fetch_all(vec![first], FetchOptions::default()).unwrap_err().to_string();
+    assert!(err.contains("HTTP 401"), "{err}");
+    assert_eq!(open.requests.lock().unwrap().len(), 0);
+
+    // A hint that can't be asked (an unset credential variable) is skipped like a 404; its
+    // problem is the error only when no source has the file.
+    let cache = tempfile::tempdir().unwrap();
+    let mut first = source(&locked, cache.path(), Err("repository `a` needs `UNSET`, which is not set".into()));
+    first.fallbacks = vec![source(&open, cache.path(), Ok(None))];
+    assert_eq!(fetch_all(vec![first], FetchOptions::default()).unwrap().downloaded, 1);
+    let empty = Server::maven(Default::default(), None);
+    let mut first = source(&locked, cache.path(), Err("repository `a` needs `UNSET`, which is not set".into()));
+    first.fallbacks = vec![source(&empty, cache.path(), Ok(None))];
+    first.dest = cache.path().join("elsewhere/hello-1.0.jar");
+    let err = fetch_all(vec![first], FetchOptions::default()).unwrap_err().to_string();
+    assert!(err.contains("`UNSET`"), "{err}");
+}
+
+#[test]
 fn oversized_bodies_are_rejected_before_they_are_written() {
     let big = vec![b'x'; 4 << 20];
     let server = Server::start(move |_, _| Reply::Ok(big.clone()));
