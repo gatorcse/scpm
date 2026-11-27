@@ -559,6 +559,16 @@ fn mcp_server_compiles_and_reports() {
     assert!(!junit.exists(), "a stale report survived a failed test compile");
     fs::remove_file(ws.path().join("modules/app/src/test/scala/app/Bad.scala")).unwrap();
 
+    // As in the CLI, a module without tests passes unless filters asked for tests.
+    send(call(17, "test", serde_json::json!({"targets": ["javalib"]})));
+    let t = read_until(17).0["result"].clone();
+    assert_eq!(t["isError"], false, "{t:#}");
+    assert_eq!(t["structuredContent"]["ok"], true, "{t:#}");
+    send(call(18, "test", serde_json::json!({"targets": ["javalib"], "suites": ["*"]})));
+    let t = read_until(18).0["result"].clone();
+    assert_eq!(t["isError"], true, "{t:#}");
+    assert!(t["structuredContent"]["error"].as_str().unwrap_or_default().contains("no tests matched"), "{t:#}");
+
     // Every tool returns an object as structuredContent; bad arguments are tool errors.
     for (id, name, args) in [
         (7, "ls", serde_json::json!({})),

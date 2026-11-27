@@ -426,8 +426,9 @@ impl Server {
             if !compile::compile(tc, graph, selected, scope, handle).map_err(|e| e.to_string())? {
                 return Ok(false);
             }
+            // As in the CLI: nothing to run is fine unless filters asked for tests.
             if variants.is_empty() {
-                return Err("no test sources in the selected modules".into());
+                return if filtered { Err("no tests matched `suites` / `tests`".into()) } else { Ok(true) };
             }
             let ok = testing::run_tests(tc, &variants, &runner_cp, &opts, reporter);
             if filtered && reporter.tests_run() == 0 {

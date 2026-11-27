@@ -361,18 +361,26 @@ pub struct WorkerSlot {
 
 impl WorkerSlot {
     /// The running worker for `classpath`, starting (or restarting) it if needed.
+    ///
+    /// The slot's lock is never held while waiting on a worker, so [`WorkerSlot::cancel`] (run
+    /// on the MCP reader thread) can't block behind a worker that hangs starting up.
     fn get(&self, classpath: Vec<PathBuf>, log: &Path) -> Result<Arc<Worker>, CompileError> {
-        if self.cancelled.load(Ordering::SeqCst) {
-            return Err(CompileError::Setup("cancelled".into()));
-        }
-        let mut slot = self.worker.lock().expect("worker slot");
-        if let Some((cp, w)) = slot.as_ref()
-            && *cp == classpath
-            && w.is_alive()
-        {
-            return Ok(w.clone());
-        }
-        if let Some((_, old)) = slot.take()
+        let cancelled = || Err(CompileError::Setup("cancelled".into()));
+        let old = {
+            let mut slot = self.worker.lock().expect("worker slot");
+            // Checked under the lock: `cancel` sets the flag before it takes the lock.
+            if self.cancelled.load(Ordering::SeqCst) {
+                return cancelled();
+            }
+            if let Some((cp, w)) = slot.as_ref()
+                && *cp == classpath
+                && w.is_alive()
+            {
+                return Ok(w.clone());
+            }
+            slot.take()
+        };
+        if let Some((_, old)) = old
             && let Ok(old) = Arc::try_unwrap(old)
         {
             old.shutdown();
@@ -386,7 +394,8 @@ impl WorkerSlot {
             env: Vec::new(),
             cwd: None,
             log_file: Some(log),
-            initialize: true,
+            // The handshake runs below, once a cancel can reach the worker.
+            initialize: false,
             own_process_group: false,
         };
         let w = Arc::new(Worker::spawn(spec, move |event| {
@@ -399,7 +408,24 @@ impl WorkerSlot {
                 reporter.emit(Event::Diagnostic(diagnostic(&route.root, task, &event)));
             }
         })?);
-        *slot = Some((classpath, w.clone()));
+        {
+            let mut slot = self.worker.lock().expect("worker slot");
+            *slot = Some((classpath, w.clone()));
+            // A cancel that ran before the worker was published couldn't kill it.
+            if self.cancelled.load(Ordering::SeqCst) {
+                w.kill("was stopped (request cancelled)");
+                return cancelled();
+            }
+        }
+        if let Err(e) = w.handshake() {
+            // Don't keep a worker that failed its handshake (it may still be running).
+            let mut slot = self.worker.lock().expect("worker slot");
+            if slot.as_ref().is_some_and(|(_, s)| Arc::ptr_eq(s, &w)) {
+                slot.take();
+            }
+            w.kill("failed to start");
+            return Err(e.into());
+        }
         Ok(w)
     }
 
@@ -685,6 +711,15 @@ fn compile_plan(plan: &Plan, worker: &WorkerHandle) -> Result<Option<String>, Co
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cancelled_slot_starts_no_worker() {
+        let slot = WorkerSlot::default();
+        slot.cancel("was stopped");
+        let started = slot.get(vec![PathBuf::from("/nonexistent.jar")], Path::new("/nonexistent/worker.log"));
+        assert!(matches!(started, Err(CompileError::Setup(m)) if m == "cancelled"));
+        assert!(slot.worker.lock().unwrap().is_none());
+    }
 
     #[test]
     fn source_files_skips_absent_roots_and_reports_unreadable_ones() {

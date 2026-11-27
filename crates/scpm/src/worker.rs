@@ -391,15 +391,22 @@ impl Worker {
             stderr_tail,
         };
         if spec.initialize {
-            let init = worker.request("initialize", json!({"protocolVersion": PROTOCOL_VERSION}))?;
-            if init["protocolVersion"].as_u64() != Some(PROTOCOL_VERSION) {
-                return Err(WorkerError::Setup(format!(
-                    "worker speaks protocol {}, expected {PROTOCOL_VERSION}",
-                    init["protocolVersion"]
-                )));
-            }
+            worker.handshake()?;
         }
         Ok(worker)
+    }
+
+    /// Sends `initialize` and checks the protocol version (what `Spawn::initialize` does, for
+    /// callers that need the worker before the handshake, e.g. to be able to kill it).
+    pub fn handshake(&self) -> Result<(), WorkerError> {
+        let init = self.request("initialize", json!({"protocolVersion": PROTOCOL_VERSION}))?;
+        if init["protocolVersion"].as_u64() != Some(PROTOCOL_VERSION) {
+            return Err(WorkerError::Setup(format!(
+                "worker speaks protocol {}, expected {PROTOCOL_VERSION}",
+                init["protocolVersion"]
+            )));
+        }
+        Ok(())
     }
 
     /// Sends a request and blocks until its response.
