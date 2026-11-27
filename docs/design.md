@@ -662,7 +662,7 @@ This is what makes the **universal lock** (§5.4, "Systems") possible and cheap.
   - the canonical merge gives the same bytes whatever order the per-system results arrive in;
   - a fixture with a cycle produces `bySystem` for the whole classpath;
   - built-in and overridden native mappings, on direct and transitive nodes;
-  - a mapping-table change: M > N re-locks only the variants holding a changed or tombstoned module and raises the header only then; M < N never downgrades; a frozen run only notes it;
+  - a mapping-table change: M > N re-locks only the variants holding a changed or tombstoned module inside the entry's range, and raises the header whenever the lock is written; M < N stops any re-lock; a frozen run only notes it;
   - a `cs`-written variant (no `fullContext`) next to sidecar-written ones: the sidecar re-locks only the unmarked one;
   - a jar-only fixture has no `systems` entry;
   - a host outside the set, with and without system-specific entries;
@@ -862,7 +862,7 @@ dependencies:
 ```
 
 - **Built-in mappings.** scpm ships a mapping table keyed by module, with a version range where a library renamed its classifiers: for example Netty's epoll, kqueue and io_uring transports, and LWJGL's modules. A mapping applies wherever its module appears in a JVM variant's graph, direct or transitive. The sidecar then adds the mapped classifier jar at the resolved version, from the repository that served the module. Most projects never write a mapping.
-- **Versioned table.** The table has a version number. Each entry records the table version in which it last changed, and a deleted entry leaves a tombstone with the version of its deletion. So the binary can list the entries changed in any range (N, M] without shipping old tables.
+- **Versioned table.** The table has a version number. Each entry records the table version in which it last changed, and a deleted entry leaves a tombstone with the version of its deletion and the entry's version range. So the binary can list the entries changed in any range (N, M] without shipping old tables.
 - **Overrides.**
   - A `natives:` map on a direct dependency replaces the built-in mapping for that module.
   - `lock.nativeClassifiers` in the workspace does the same for a module that only arrives transitively, as `[{module: org:name, natives: {…}}]`.
@@ -880,11 +880,11 @@ dependencies:
   | Run | N vs M | What happens |
   |---|---|---|
   | Frozen | any difference | Never stale because of mappings. The lock is used as it is, with a note: "lock uses mapping table N, this scpm has M" |
-  | Non-frozen | M > N | Re-lock only the variants whose locked classpaths contain a module whose entry changed in (N, M]. The header is raised to M only if at least one variant was re-locked that way; otherwise it is left alone, so jar-only projects see no churn |
-  | Non-frozen | M < N | Never downgrade: nothing is re-locked for mappings, and scpm notes "lock uses mapping table N; upgrade scpm" |
+  | Non-frozen | M > N | Re-lock, in this same run, every **affected** variant: one whose locked classpath has a module at a version inside the range of an entry (or tombstone) that changed in (N, M]. A change to the Netty 4.2 entry doesn't re-lock 4.1 users. **Whenever the install writes the lock at all**, the header becomes M: every affected variant was re-locked in the same run, so all variants match M. An install that writes nothing leaves the header alone, so jar-only projects see no churn |
+  | Non-frozen | M < N | Never downgrade. An install that would re-lock anything (a manifest edit, a variant without `fullContext`, …) stops with "lock uses mapping table N; upgrade scpm". One with nothing to re-lock only restores. This applies to sidecar re-locks; a `cs` re-lock applies no mappings and keeps the header, and the variants it writes are unmarked, so a sidecar re-locks them later |
 
-  A variant re-locked for any other reason gets the binary's current mappings, which is never older than N. A mapping for a module that first arrives in a re-lock is applied by that re-lock. A lock without `nativeMappings` holds no sidecar-written variants (below), so the first sidecar re-lock sets it.
-- **`inputsHash`** covers the system set and `lock.jdk`, and the configured overrides (`natives:`, `lock.nativeClassifiers`), which live in the manifest like any other dependency setting. Absent overrides hash as they did before the keys existed. Nothing in it depends on the lock or on the binary's table, so it can be computed before resolving.
+  So every variant in a lock always matches the header's table: a re-lock never mixes tables, and never moves one back. A mapping for a module that first arrives in a re-lock is applied by that re-lock. A lock without `nativeMappings` holds no sidecar-written variants (below), so the first sidecar re-lock sets it.
+- **`inputsHash`** covers the system set and `lock.jdk`, and the configured overrides (`natives:`, `lock.nativeClassifiers`), which live in the manifest like any other dependency setting. Absent overrides hash as they did before the keys existed. The **whole** workspace-level `lock.nativeClassifiers` list is in every JVM variant's hash, not just the entries that apply to it, so any edit to it re-locks every JVM variant. Nothing in it depends on the lock or on the binary's table, so it can be computed before resolving.
 - **`bootInputs`** covers the repositories, the system set and the JDK. No mappings apply to boot closures.
 
 **Lock format.** An entry that is on every system stays a plain string. Only an entry that isn't carries `systems`:
@@ -937,7 +937,7 @@ artifacts:                           # every system's files, one entry each, all
 
 - **Both resolvers write lockfile version 2 from M1.**
   - `cs` writes only a single-system set. With `cs`, a set of more than one system is an error that names the sidecar.
-  - **`cs` applies no native mappings and writes neither `fullContext` nor `nativeMappings`.**
+  - **`cs` applies no native mappings and writes neither `fullContext` nor `nativeMappings`.** It doesn't strip them either: a `cs` re-lock keeps the existing `nativeMappings` header, and the markers on the variants (and the boot section) it didn't re-lock.
 - **`fullContext: true` is per variant**, and written only by the sidecar, which applies the declared OS and arch. The boot section carries one such flag for all its entries, because `bootInputs` re-resolves them together.
   - A `cs` re-lock writes its variants without the marker, because under `cs` OS and arch profile activation follow the host (the Phase 1 limit below).
   - The next non-frozen sidecar run re-locks **only the variants without the marker** and sets it on them. That covers a single-system workspace whose profiles followed the host under `cs` and follow the declared system under the sidecar. It is also how native mappings first come into a lock that `cs` wrote.
