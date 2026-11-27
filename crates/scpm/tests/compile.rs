@@ -252,3 +252,203 @@ fn json_output_is_one_document_when_the_worker_cannot_start() {
     assert_eq!(doc["ok"], false);
     assert!(doc["error"].as_str().unwrap().contains("SCPM_WORKER_JAR points to /nonexistent/worker.jar"), "{doc:#}");
 }
+
+#[test]
+fn runs_tests_and_mains() {
+    if !prerequisites() {
+        return;
+    }
+    let ws = workspace();
+    let out = scpm(ws.path()).args(["run", "app", "--", "Ann", "Bob"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "HELLO, ANN; HELLO, BOB!\n", "build output stays off stdout");
+    // `run` intersects its target with the global --filter.
+    for filter in ["!app", "util"] {
+        let out = scpm(ws.path()).args(["-F", filter, "run", "app"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "-F {filter}: {out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("`app` is excluded by --filter"), "{out:?}");
+    }
+    for filter in ["!util", "app"] {
+        let out = scpm(ws.path()).args(["-F", filter, "run", "app", "--", "Ann"]).output().unwrap();
+        assert!(out.status.success(), "-F {filter}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "HELLO, ANN!\n");
+    }
+
+    let out = scpm(ws.path()).args(["--json", "test", "app"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["tests"]["passed"], 2);
+
+    fs::write(
+        ws.path().join("modules/app/src/test/scala/app/FailSuite.scala"),
+        "package app\n\nclass FailSuite extends munit.FunSuite:\n  test(\"fails\") {\n    assertEquals(1 + 1, 3)\n  }\n",
+    )
+    .unwrap();
+    let out = scpm(ws.path()).args(["--json", "test", "app", "--suite", "app.Fail*"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["tests"]["passed"], 0, "--suite filters suites");
+    let f = &doc["tests"]["failures"][0];
+    assert_eq!(f["suite"], "app.FailSuite");
+    assert_eq!(f["failure"]["file"], "modules/app/src/test/scala/app/FailSuite.scala");
+    assert_eq!(f["failure"]["line"], 5);
+    assert!(!f["failure"]["message"].as_str().unwrap().contains('\u{1b}'), "no ANSI in JSON");
+    let junit = fs::read_to_string(ws.path().join(".scpm/out/app@jvm-3/test-reports/junit.xml")).unwrap();
+    assert!(junit.contains(r#"<testsuite name="app.FailSuite" tests="1" failures="1""#), "{junit}");
+    assert!(!junit.contains('\u{1b}'));
+
+    // A program's exit code passes through.
+    fs::write(
+        ws.path().join("modules/app/src/main/scala/app/Exit.scala"),
+        "package app\n\n@main def Exit(): Unit = sys.exit(7)\n",
+    )
+    .unwrap();
+    let out = scpm(ws.path()).args(["run", "app", "--main", "app.Exit"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn run_compiles_runtime_only_dependencies() {
+    if !prerequisites() {
+        return;
+    }
+    let ws = workspace();
+    let rt = ws.path().join("modules/rt");
+    fs::create_dir_all(rt.join("src/main/java/rt")).unwrap();
+    fs::write(rt.join("scpm.yaml"), "scala: none\n").unwrap();
+    fs::write(
+        rt.join("src/main/java/rt/Impl.java"),
+        "package rt;\npublic class Impl { public String toString() { return \"rt!\"; } }\n",
+    )
+    .unwrap();
+    let app = ws.path().join("modules/app/scpm.yaml");
+    fs::write(&app, fs::read_to_string(&app).unwrap() + "runtimeDependencies:\n  rt: workspace:*\n").unwrap();
+    fs::write(
+        ws.path().join("modules/app/src/main/scala/app/Reflect.scala"),
+        "package app\n\n@main def Reflect(): Unit = println(Class.forName(\"rt.Impl\").getDeclaredConstructor().newInstance())\n",
+    )
+    .unwrap();
+    let out = scpm(ws.path()).args(["run", "app", "--main", "app.Reflect"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rt!\n");
+}
+
+#[test]
+fn test_failures_crashes_and_timeouts_are_reported() {
+    if !prerequisites() {
+        return;
+    }
+    let ws = workspace();
+    let tests = ws.path().join("modules/app/src/test/scala/app");
+    // A filter that matches nothing is an error, not a silent pass.
+    let out = scpm(ws.path()).args(["--json", "test", "app", "--suite", "app.NoSuch*"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(doc["error"].as_str().unwrap().contains("no tests matched"), "{doc:#}");
+
+    // System.exit in a test: crashed, and the JUnit report says so.
+    fs::write(
+        tests.join("ExitSuite.scala"),
+        "package app\n\nclass ExitSuite extends munit.FunSuite:\n  test(\"exits\") { sys.exit(3) }\n",
+    )
+    .unwrap();
+    let out = scpm(ws.path()).args(["--json", "test", "app", "--suite", "app.ExitSuite"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let task = doc["tasks"].as_array().unwrap().iter().find(|t| t["task"] == "app@jvm-3#test").unwrap().clone();
+    assert_eq!(task["status"], "crashed", "{doc:#}");
+    let junit = fs::read_to_string(ws.path().join(".scpm/out/app@jvm-3/test-reports/junit.xml")).unwrap();
+    assert!(junit.contains("<error message="), "{junit}");
+    fs::remove_file(tests.join("ExitSuite.scala")).unwrap();
+
+    // A JVM that reports success but then exits nonzero (here from a shutdown hook) crashed.
+    fs::write(
+        tests.join("HaltSuite.scala"),
+        "package app\n\nclass HaltSuite extends munit.FunSuite:\n  test(\"halts later\") { sys.addShutdownHook(Runtime.getRuntime.halt(7)) }\n",
+    )
+    .unwrap();
+    let out = scpm(ws.path()).args(["--json", "test", "app", "--suite", "app.HaltSuite"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let task = doc["tasks"].as_array().unwrap().iter().find(|t| t["task"] == "app@jvm-3#test").unwrap().clone();
+    assert_eq!(task["status"], "crashed", "{doc:#}");
+    assert!(task["message"].as_str().unwrap().contains("exited with code 7"), "{doc:#}");
+    let junit = fs::read_to_string(ws.path().join(".scpm/out/app@jvm-3/test-reports/junit.xml")).unwrap();
+    assert!(junit.contains("<error message="), "{junit}");
+    fs::remove_file(tests.join("HaltSuite.scala")).unwrap();
+
+    // A hanging test whose grandchild keeps stdout open is killed at the timeout, grandchild too.
+    let pid_file = ws.path().join("sleep.pid");
+    fs::write(
+        tests.join("HangSuite.scala"),
+        format!(
+            "package app\n\nclass HangSuite extends munit.FunSuite:\n  override def munitTimeout = scala.concurrent.duration.Duration.Inf\n  test(\"hangs\") {{\n    val p = new ProcessBuilder(\"sleep\", \"60\").inheritIO().start()\n    java.nio.file.Files.writeString(java.nio.file.Path.of({:?}), p.pid.toString)\n    Thread.sleep(60000)\n  }}\n",
+            pid_file.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let out = scpm(ws.path())
+        .args(["--json", "test", "app", "--suite", "app.HangSuite", "--timeout", "20"])
+        .output()
+        .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(75), "took {:?}", started.elapsed());
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let task = doc["tasks"].as_array().unwrap().iter().find(|t| t["task"] == "app@jvm-3#test").unwrap().clone();
+    assert!(task["message"].as_str().unwrap().contains("timed out after 20s"), "{doc:#}");
+    // The timeout must leave the test JVM time to start and reach the test body (slow CI runners
+    // took over 5 s), or there is no grandchild to check.
+    let pid = fs::read_to_string(&pid_file)
+        .unwrap_or_else(|e| panic!("the test body never started before the timeout ({e}): {doc:#}"));
+    let alive = || StdCommand::new("kill").args(["-0", pid.trim()]).status().is_ok_and(|s| s.success());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if alive() {
+        let _ = StdCommand::new("kill").args(["-9", pid.trim()]).status();
+        panic!("the test's `sleep` (pid {}) outlived the timeout", pid.trim());
+    }
+}
+
+#[test]
+fn a_test_compile_failure_leaves_no_stale_junit_report() {
+    if !prerequisites() {
+        return;
+    }
+    let ws = workspace();
+    let junit = ws.path().join(".scpm/out/app@jvm-3/test-reports/junit.xml");
+    assert!(scpm(ws.path()).args(["test", "app"]).output().unwrap().status.success());
+    assert!(junit.is_file());
+    fs::write(ws.path().join("modules/app/src/test/scala/app/Bad.scala"), "package app\n\nval bad: Int = \"x\"\n")
+        .unwrap();
+    let out = scpm(ws.path()).args(["test", "app"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!junit.exists(), "the previous run's passing report must not survive a failed build");
+
+    // A name filter that only skips cases is "no tests matched" too.
+    fs::remove_file(ws.path().join("modules/app/src/test/scala/app/Bad.scala")).unwrap();
+    let out = scpm(ws.path()).args(["--json", "test", "app", "-t", "no such test"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(doc["error"].as_str().unwrap_or_default().contains("no tests matched"), "{doc:#}");
+}
+
+#[test]
+fn removing_every_test_clears_the_report_and_filters_still_must_match() {
+    if !prerequisites() {
+        return;
+    }
+    let ws = workspace();
+    let junit = ws.path().join(".scpm/out/app@jvm-3/test-reports/junit.xml");
+    assert!(scpm(ws.path()).args(["test", "app"]).output().unwrap().status.success());
+    assert!(junit.is_file());
+    fs::remove_dir_all(ws.path().join("modules/app/src/test")).unwrap();
+    let out = scpm(ws.path()).args(["test", "app"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!junit.exists(), "a variant without tests keeps no old report");
+    let out = scpm(ws.path()).args(["--json", "test", "app", "--suite", "app.*"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(doc["error"].as_str().unwrap_or_default().contains("no tests matched"), "{doc:#}");
+}

@@ -25,6 +25,7 @@ pub mod platform;
 pub mod report;
 pub mod selector;
 pub mod semver;
+pub mod testing;
 pub mod version;
 pub mod why;
 pub mod worker;

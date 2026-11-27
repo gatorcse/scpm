@@ -27,7 +27,8 @@ pub enum WorkerError {
     Setup(String),
     #[error("cannot start {java}: {message}")]
     Spawn { java: String, message: String },
-    #[error("the compile worker exited unexpectedly{0}")]
+    /// The process ended before answering; the message names it and includes context.
+    #[error("{0}")]
     Exited(String),
     #[error("compile worker error ({code}): {message}")]
     Remote { code: String, message: String },
@@ -250,11 +251,30 @@ fn helper_jvm_flags(java: &Java) -> Vec<&'static str> {
 
 type Reply = Result<Value, WorkerError>;
 
+/// How to start a helper JVM.
+pub struct Spawn<'a> {
+    /// For messages: "the compile worker", "the test JVM".
+    pub name: &'a str,
+    pub classpath: &'a [PathBuf],
+    pub main: &'a str,
+    pub jvm_options: &'a [String],
+    pub env: Vec<(String, String)>,
+    pub cwd: Option<&'a Path>,
+    pub log_file: Option<&'a Path>,
+    /// Send `initialize` and check the protocol version (the compile worker does; the
+    /// one-shot test runner doesn't).
+    pub initialize: bool,
+    /// Start in a new process group so `kill` also stops processes the JVM started.
+    pub own_process_group: bool,
+}
+
 /// Requests waiting for a reply; `None` once the worker's stdout has closed.
 type Pending = Arc<Mutex<Option<HashMap<u64, Sender<Reply>>>>>;
 
 /// A running worker. Requests may be sent from several threads at once.
 pub struct Worker {
+    name: String,
+    own_group: bool,
     child: Mutex<Child>,
     stdin: Mutex<Option<ChildStdin>>,
     pending: Pending,
@@ -263,29 +283,32 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Starts `java -cp <classpath> <main>` and sends `initialize`. Events go to `on_event`.
-    pub fn spawn(
-        classpath: &[PathBuf],
-        main: &str,
-        log_file: Option<&Path>,
-        on_event: impl Fn(Value) + Send + 'static,
-    ) -> Result<Worker, WorkerError> {
+    /// Starts `java <flags> <options> -cp <classpath> <main>`. Events go to `on_event`.
+    pub fn spawn(spec: Spawn, on_event: impl Fn(Value) + Send + 'static) -> Result<Worker, WorkerError> {
         let java = java()?;
         let sep = if cfg!(windows) { ";" } else { ":" };
-        let cp = classpath.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(sep);
-        let mut child = Command::new(&java.path)
-            .args(helper_jvm_flags(&java))
-            .arg("-cp")
-            .arg(cp)
-            .arg(main)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| WorkerError::Spawn {
-                java: format!("{} (from {})", java.path.display(), java.source),
-                message: e.to_string(),
+        // Relative entries (e.g. a relative `SCPM_TEST_RUNNER_JAR`) must name files relative to
+        // where scpm runs, not to the child's `cwd`.
+        let cp = spec.classpath.iter().map(|p| absolute(p).display().to_string()).collect::<Vec<_>>().join(sep);
+        let mut cmd = Command::new(&java.path);
+        cmd.args(helper_jvm_flags(&java)).args(spec.jvm_options).arg("-cp").arg(cp).arg(spec.main).envs(spec.env);
+        if let Some(dir) = spec.cwd {
+            cmd.current_dir(dir);
+        }
+        #[cfg(unix)]
+        if spec.own_process_group {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let log_file = spec.log_file;
+        let mut child =
+            cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| {
+                WorkerError::Spawn {
+                    java: format!("{} for {} (from {})", java.path.display(), spec.name, java.source),
+                    message: e.to_string(),
+                }
             })?;
+        let name = spec.name.to_string();
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
         let stdin = child.stdin.take().expect("piped");
@@ -321,6 +344,7 @@ impl Worker {
         {
             let pending = pending.clone();
             let tail = stderr_tail.clone();
+            let name = name.clone();
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stdout);
                 let mut buf = Vec::new();
@@ -350,7 +374,7 @@ impl Worker {
                     buf.clear();
                 }
                 // EOF: fail everything still waiting, and refuse new requests.
-                let context = tail_context(&tail);
+                let context = format!("{name} exited unexpectedly{}", tail_context(&tail));
                 let waiting = pending.lock().expect("pending").take().unwrap_or_default();
                 for (_, tx) in waiting {
                     let _ = tx.send(Err(WorkerError::Exited(context.clone())));
@@ -358,18 +382,22 @@ impl Worker {
             });
         }
         let worker = Worker {
+            name,
+            own_group: spec.own_process_group,
             child: Mutex::new(child),
             stdin: Mutex::new(Some(stdin)),
             pending,
             next_id: AtomicU64::new(1),
             stderr_tail,
         };
-        let init = worker.request("initialize", json!({"protocolVersion": PROTOCOL_VERSION}))?;
-        if init["protocolVersion"].as_u64() != Some(PROTOCOL_VERSION) {
-            return Err(WorkerError::Setup(format!(
-                "worker speaks protocol {}, expected {PROTOCOL_VERSION}",
-                init["protocolVersion"]
-            )));
+        if spec.initialize {
+            let init = worker.request("initialize", json!({"protocolVersion": PROTOCOL_VERSION}))?;
+            if init["protocolVersion"].as_u64() != Some(PROTOCOL_VERSION) {
+                return Err(WorkerError::Setup(format!(
+                    "worker speaks protocol {}, expected {PROTOCOL_VERSION}",
+                    init["protocolVersion"]
+                )));
+            }
         }
         Ok(worker)
     }
@@ -394,7 +422,11 @@ impl Worker {
             }
         }
         match rx.recv() {
-            Ok(Err(WorkerError::Exited(_))) | Err(_) => Err(self.exited()),
+            // Closed stdout: add the exit status and stderr context. Other failures (a kill
+            // with its own reason) pass through.
+            Ok(Err(WorkerError::Exited(m))) if m.contains("exited unexpectedly") => Err(self.exited()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(self.exited()),
             Ok(reply) => reply,
         }
     }
@@ -412,7 +444,44 @@ impl Worker {
             None
         });
         let status = status.map(|s| format!(" ({s})")).unwrap_or_default();
-        WorkerError::Exited(format!("{status}{}", tail_context(&self.stderr_tail)))
+        WorkerError::Exited(format!("{} exited unexpectedly{status}{}", self.name, tail_context(&self.stderr_tail)))
+    }
+
+    /// Kills the process (and its process group, if it has its own) and fails pending
+    /// requests with `reason` right away, without waiting for stdout to close (a grandchild
+    /// may keep it open).
+    pub fn kill(&self, reason: &str) {
+        if let Ok(mut child) = self.child.lock() {
+            #[cfg(unix)]
+            if self.own_group {
+                // SAFETY: plain syscall on a pid we own; a negative pid targets its group.
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+            }
+            let _ = child.kill();
+        }
+        let waiting = self.pending.lock().expect("pending").take().unwrap_or_default();
+        for (_, tx) in waiting {
+            let _ = tx.send(Err(WorkerError::Exited(format!("{} {reason}", self.name))));
+        }
+    }
+
+    /// Closes stdin and waits up to `limit` for the process to exit, killing it (and its group)
+    /// after that. Returns the exit status if it exited by itself.
+    pub fn wait_timeout(self, limit: Option<std::time::Duration>) -> Option<std::process::ExitStatus> {
+        self.stdin.lock().expect("stdin").take();
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok(Some(status)) = self.child.lock().expect("child").try_wait() {
+                return Some(status);
+            }
+            if limit.is_some_and(|l| started.elapsed() >= l) {
+                self.kill("did not exit in time");
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// Asks the worker to exit and waits for it.
@@ -421,6 +490,11 @@ impl Worker {
         self.stdin.lock().expect("stdin").take();
         let _ = self.child.lock().expect("child").wait();
     }
+}
+
+/// `p` resolved against the current directory (unchanged if absolute or if that fails).
+fn absolute(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 fn tail_context(tail: &Mutex<VecDeque<String>>) -> String {
@@ -446,7 +520,7 @@ impl Drop for Worker {
 
 #[cfg(test)]
 mod version_tests {
-    use super::parse_java_version;
+    use super::{absolute, parse_java_version};
 
     #[test]
     fn java_versions_ignore_unrelated_quotes() {
@@ -533,5 +607,13 @@ mod version_tests {
         let env = |v: &str| (v == "JAVA_HOME").then(|| OsString::from(other.path()));
         let home = selected_java_home(env).unwrap();
         assert!(release_identity(&home).unwrap().ends_with("JAVA_VERSION=\"21.0.1\""));
+    }
+
+    #[test]
+    fn relative_classpath_entries_resolve_against_the_current_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(absolute(std::path::Path::new("tools/runner.jar")), cwd.join("tools/runner.jar"));
+        let abs = cwd.join("x.jar");
+        assert_eq!(absolute(&abs), abs);
     }
 }
