@@ -1147,6 +1147,14 @@ fn foreign_mirror_settings_do_not_redirect_cs() {
     assert!(stderr.contains("~/hostile-m2/settings.xml (CS_MAVEN_HOME): mirror \"corp\" for *"), "{stderr}");
     assert!(stderr.contains("is ignored for local (and 2 more settings)"), "{stderr}");
     assert!(stderr.contains("scpm config explain"), "{stderr}");
+    // `why --json` keeps the notice of the install it runs first.
+    let fresh = tempfile::tempdir().unwrap();
+    let mut cmd = scpm(ws.path(), fresh.path());
+    cmd.envs(hostile.iter().map(|(k, v)| (*k, v.as_os_str()))).env("HOME", ws.path());
+    let out = cmd.args(["--json", "why", "com.example:hello"]).assert().success();
+    let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(report["notices"].as_array().map(Vec::len), Some(1), "{report}");
+    assert!(report["notices"][0].as_str().unwrap().contains("settings.xml (CS_MAVEN_HOME)"), "{report}");
     // Nothing contacted, no notice.
     let out = hostile_scpm().arg("install").assert().success();
     assert!(!String::from_utf8_lossy(&out.get_output().stderr).contains("note:"));

@@ -761,7 +761,9 @@ enum JvmOptions {
 /// How `bin` takes JVM options: `-J` arguments if `cs version -J-D…` succeeds (the native
 /// launcher drops `-J` arguments wherever they are), else `JAVA_TOOL_OPTIONS`. Asked once per
 /// launcher and process, and only when a proxy applies. A launcher that can't be run counts as
-/// [`JvmOptions::Args`]; running it for real then reports why.
+/// [`JvmOptions::Args`]; running it for real then reports why. The probe runs sealed like the
+/// real run (coursier reads `settings.xml` even for `version`, and fails on a malformed one), so
+/// only the `-J` argument can make it fail.
 fn launcher_jvm_options(bin: &OsStr) -> JvmOptions {
     static KNOWN: Mutex<Vec<(OsString, JvmOptions)>> = Mutex::new(Vec::new());
     let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
@@ -770,13 +772,15 @@ fn launcher_jvm_options(bin: &OsStr) -> JvmOptions {
     }
     let mut probe = Command::new(bin);
     probe.args(["version", "-J-Dscpm.probe=true"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    for var in UNSEALED_ENV {
-        probe.env_remove(var);
-    }
+    // Can't seal: the real run fails the same way and says why; don't remember a guess.
+    let Ok(sealed) = seal(&mut probe) else { return JvmOptions::Args };
+    // No credentials: a file that doesn't exist, which coursier skips.
+    probe.env("COURSIER_CREDENTIALS", credentials_env_value(&sealed.path().join("credentials.properties")));
     let style = match probe.status() {
         Ok(status) if !status.success() => JvmOptions::ToolOptions,
         _ => JvmOptions::Args,
     };
+    drop(sealed);
     known.push((bin.to_os_string(), style));
     style
 }
@@ -854,6 +858,17 @@ fn add_common_args_for(
         .and_then(|()| file.flush())
         .map_err(|e| CoursierError::Config(format!("cannot write a credentials file: {e}")))?;
     cmd.env("COURSIER_CREDENTIALS", credentials_env_value(file.path()));
+    let sealed = seal(cmd)?;
+    if let Some(options) = tool_options {
+        cmd.env("JAVA_TOOL_OPTIONS", options);
+    }
+    Ok(CommonArgs { _credential_file: Some(file), _sealed_dir: Some(sealed), missing_credentials })
+}
+
+/// Points a `cs` run at an empty, private directory for every machine-settings file but the
+/// credentials ([`add_common_args`] says which), and removes [`UNSEALED_ENV`]. The directory
+/// must outlive the run.
+fn seal(cmd: &mut Command) -> Result<tempfile::TempDir, CoursierError> {
     // Owner-only: the files `cs` is pointed at must stay absent, so nobody else may create them.
     let mut sealed = tempfile::Builder::new();
     sealed.prefix("scpm-sealed-");
@@ -871,10 +886,7 @@ fn add_common_args_for(
     for var in UNSEALED_ENV {
         cmd.env_remove(var);
     }
-    if let Some(options) = tool_options {
-        cmd.env("JAVA_TOOL_OPTIONS", options);
-    }
-    Ok(CommonArgs { _credential_file: Some(file), _sealed_dir: Some(sealed), missing_credentials })
+    Ok(sealed)
 }
 
 /// `COURSIER_CREDENTIALS` naming a file: an absolute path, or (on Windows) a `file:` URL, which
@@ -1638,6 +1650,13 @@ mod tests {
         assert_eq!(launcher_jvm_options(native.as_os_str()), JvmOptions::Args);
         assert_eq!(launcher_jvm_options(jvm.as_os_str()), JvmOptions::ToolOptions);
         assert_eq!(launcher_jvm_options(dir.path().join("missing").as_os_str()), JvmOptions::Args);
+        // The probe runs sealed: like the native launcher with a malformed `settings.xml` in
+        // `~/.m2` or `$MAVEN_HOME`, this one fails unless pointed at the empty directory.
+        let picky = launcher(
+            "picky",
+            r#"[ -d "$CS_MAVEN_HOME" ] && [ -z "$(ls -A "$CS_MAVEN_HOME")" ] && [ -z "${JAVA_TOOL_OPTIONS+x}" ] || exit 1"#,
+        );
+        assert_eq!(launcher_jvm_options(picky.as_os_str()), JvmOptions::Args);
         // Asked once: the answer stays even if the launcher changes.
         fs::write(&jvm, "#!/bin/sh\nexit 0\n").unwrap();
         assert_eq!(launcher_jvm_options(jvm.as_os_str()), JvmOptions::ToolOptions);

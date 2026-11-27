@@ -263,11 +263,13 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Command::Why { artifact } => {
             let (ws, graph) = load(&start)?;
-            let lock = ensure_installed(&ws, &graph, false)?;
+            let (lock, install_notices) = ensure_installed(&ws, &graph, false)?;
             let selected: Vec<String> =
                 filter::select(&ws, &graph, &cli.filter, &invocation_dir(&start)?)?.into_iter().collect();
-            let report = crate::why::why(&ws, &graph, &lock, &artifact, &selected)?;
+            let mut report = crate::why::why(&ws, &graph, &lock, &artifact, &selected)?;
             if cli.json {
+                // The install before `why` may have taken the notice (printed on stderr); keep it here too.
+                report.notices.splice(0..0, install_notices);
                 print_json(&report)?;
             } else {
                 // `report.warnings` were printed by `ensure_installed` already.
@@ -314,7 +316,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                     selected.iter().cloned().collect::<Vec<_>>().join(", ")
                 )));
             };
-            let lock = ensure_installed(&ws, &graph, frozen)?;
+            let (lock, _) = ensure_installed(&ws, &graph, frozen)?;
             let files = install::classpath_files(&ws, &lock, id, kind)?;
             if cli.json {
                 print_json(&files)?;
@@ -394,7 +396,8 @@ fn load(start: &std::path::Path) -> Result<(Workspace, Graph), Failure> {
 }
 
 /// Install-before-run (design §5.4): re-lock and fetch as needed (frozen in CI), then read the lock.
-fn ensure_installed(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<Lockfile, Failure> {
+/// Warnings and notices are printed on stderr; the notices are returned too, for `--json` reports.
+fn ensure_installed(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<(Lockfile, Vec<String>), Failure> {
     let summary = install::install(ws, graph, InstallOptions { frozen: frozen || in_ci(), verify: false })?;
     for w in &summary.warnings {
         eprintln!("warning: {w}");
@@ -405,9 +408,10 @@ fn ensure_installed(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<Lockf
     if !summary.relocked.is_empty() || summary.fetch.downloaded > 0 {
         eprintln!("installed: {} re-locked, {} downloaded", summary.relocked.len(), summary.fetch.downloaded);
     }
-    Lockfile::read(&ws.root)
+    let lock = Lockfile::read(&ws.root)
         .map_err(|e| Failure::Command(e.to_string()))?
-        .ok_or_else(|| Failure::Command("no scpm-lock.yaml; run `scpm install`".into()))
+        .ok_or_else(|| Failure::Command("no scpm-lock.yaml; run `scpm install`".into()))?;
+    Ok((lock, summary.notices))
 }
 
 /// CI mode (implied `--frozen`) is `CI=true` (any case: AppVeyor sets `True`).

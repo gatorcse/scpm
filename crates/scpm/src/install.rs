@@ -341,7 +341,9 @@ impl Selector<'_> {
             match cached {
                 Some(v) => v,
                 None => {
-                    let v = coursier::list_versions(&dep.coord.org, &artifact, self.repos, self.proxy, self.cache)?;
+                    // Contacting the repositories: an ignored setting of another tool may be why it fails.
+                    let v = coursier::list_versions(&dep.coord.org, &artifact, self.repos, self.proxy, self.cache)
+                        .map_err(|e| with_notice(e.into(), self.repos))?;
                     self.listed.lock().expect("listed").insert(list_key.clone(), v.clone());
                     v
                 }
