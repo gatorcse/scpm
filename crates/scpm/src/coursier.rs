@@ -309,12 +309,24 @@ pub(crate) fn is_plain_http(url: &str) -> bool {
 /// The origins (`http://host[:port]`) of plain-HTTP repositories that opted in to receiving
 /// credentials (`allowInsecureCredentials`); credentials go over plain HTTP nowhere else. A
 /// mirrored repository is reached at its mirror's origin, so that is the one opted in.
+/// The opt-in is per repository, but coursier scopes credentials by origin only, so an origin
+/// counts only when every repository reached there opts in ([`closed_http_peer`]).
 pub fn insecure_credential_origins(repos: &[Repo]) -> Vec<String> {
     repos
         .iter()
         .filter(|r| r.allow_insecure_credentials && is_plain_http(r.fetch_url()))
+        .filter(|r| closed_http_peer(r, repos).is_none())
         .filter_map(|r| r.origin().map(str::to_string))
         .collect()
+}
+
+/// A repository reached at `repo`'s plain-HTTP origin without `allowInsecureCredentials`: it
+/// would get any credentials `cs` has for that origin.
+pub fn closed_http_peer<'a>(repo: &Repo, repos: &'a [Repo]) -> Option<&'a Repo> {
+    let origin = repo.origin().filter(|_| is_plain_http(repo.fetch_url())).map(crate::machine::comparable_url)?;
+    repos.iter().find(|r| {
+        !r.allow_insecure_credentials && r.origin().map(crate::machine::comparable_url).as_ref() == Some(&origin)
+    })
 }
 
 /// The coursier cache directory: `COURSIER_CACHE`, the legacy `~/.coursier/cache/v1` if it
@@ -959,6 +971,28 @@ pub fn credential_sources(
             None => origins.push((origin, i)),
         }
     }
+    // Over plain HTTP, credentials go only to repositories that opt in; `cs` would send an
+    // origin's to every repository there.
+    for (origin, first) in &origins {
+        let Some(peer) = closed_http_peer(&repos[*first], repos) else { continue };
+        if clashed.contains(origin) {
+            continue;
+        }
+        let repo = &repos[*first];
+        clashes.push(
+            crate::diag::Diagnostic::new(format!(
+                "repository `{}` ({}) sends credentials over plain HTTP to {origin}, and `{}` ({}) there doesn't set \
+                 `allowInsecureCredentials`; coursier scopes credentials by scheme, host and port only, so `{}` would get them too",
+                repo.id,
+                repo.fetch_url(),
+                peer.id,
+                peer.fetch_url(),
+                peer.id,
+            ))
+            .with_help(format!("set `allowInsecureCredentials: true` on `{}` as well, or use https:// URLs", peer.id)),
+        );
+        clashed.push(origin.clone());
+    }
     let sources = repos
         .iter()
         .enumerate()
@@ -1331,7 +1365,19 @@ mod tests {
         assert!(found.clashes[0].message.contains("`orgA`") && found.clashes[0].message.contains("`orgB`"));
         let a = Some(Auth::Bearer("secret-a".into()));
         let auths: Vec<Option<Auth>> = found.sources.into_iter().map(|s| s.map(|(_, auth)| auth)).collect();
-        assert_eq!(auths, [a.clone(), Some(Auth::Bearer("secret-b".into())), None, a.clone(), a]);
+        assert_eq!(auths, [a.clone(), Some(Auth::Bearer("secret-b".into())), None, a.clone(), a.clone()]);
+
+        // Over plain HTTP, a repository's opt-in covers only itself: a closed peer on its origin
+        // gets nothing from the fetcher, and `cs`, which can't tell them apart, is refused.
+        let repos = [
+            Repo { allow_insecure_credentials: true, ..repo("open", "http://nexus.local:8081/a/", token("TOKEN_A")) },
+            repo("closed", "http://nexus.local:8081/b/", None),
+        ];
+        let found = credential_sources(&repos, &lookup, &mut Vec::new());
+        let auths: Vec<Option<Auth>> = found.sources.into_iter().map(|s| s.map(|(_, auth)| auth)).collect();
+        assert_eq!(auths, [a, None]);
+        assert!(found.clashes[0].message.contains("`closed` would get them too"), "{:?}", found.clashes);
+        assert!(matches!(props(&repos).unwrap_err(), CoursierError::CredentialClash(_)));
 
         // A mirror without credentials on a private repository's origin gets the origin's,
         // from `cs` and from the fetcher alike.

@@ -192,6 +192,11 @@ impl Machine {
                 err(format!("{key}.url"), message);
                 continue;
             }
+            // Artifact paths are appended to the base, so a query or fragment would swallow them.
+            if m.url.contains(['?', '#']) {
+                err(format!("{key}.url"), "a mirror URL can't have a query or fragment (`?`, `#`)".to_string());
+                continue;
+            }
             if m.mirror_of.is_empty() || m.mirror_of.iter().any(|p| p.trim().is_empty()) {
                 err(format!("{key}.mirrorOf"), "list repository ids, URL prefixes, or `*`".to_string());
                 continue;
@@ -297,6 +302,12 @@ impl Machine {
         let insecure = coursier::insecure_credential_origins(repos);
         if self.user_credential(repo, &insecure).is_some() {
             return None;
+        }
+        if let Some(peer) = coursier::closed_http_peer(repo, repos).filter(|_| repo.allow_insecure_credentials) {
+            return Some(format!(
+                "the user config entry for {} is not sent over plain HTTP: repository `{}` shares the origin without `allowInsecureCredentials`, and coursier would send it there too",
+                c.url, peer.id
+            ));
         }
         Some(format!(
             "the user config entry for {} is not sent over plain HTTP without the repository's `allowInsecureCredentials`",
@@ -642,29 +653,44 @@ impl UrlParts {
         Some(UrlParts { scheme, host: host.to_ascii_lowercase(), port, path })
     }
 
-    /// Same scheme, host and port, and `other`'s path is under this one's.
+    /// Same scheme, host and port, and `other`'s path is under this one's. A path with a dot
+    /// segment (`..`, also as `%2e%2e`, or a `\`) is under nothing narrower than the origin: the
+    /// HTTP client resolves it, so the path requested isn't the one written.
     fn covers(&self, other: &UrlParts) -> bool {
         let other_path = if other.path.is_empty() { "/" } else { other.path.as_str() };
         self.scheme == other.scheme
             && self.host == other.host
             && self.port == other.port
-            && (self.path.is_empty() || other_path.starts_with(&self.path))
+            && (self.path.is_empty()
+                || (!has_dot_segment(&self.path) && !has_dot_segment(other_path) && other_path.starts_with(&self.path)))
     }
 }
 
-/// `url` lower-cased and without a default port (`:443` for `https`, `:80` for `http`), so
-/// `mirrorOf` URL prefixes match however the port is written.
+/// Whether a URL path has a `.` or `..` segment, written plainly or percent-encoded, or a `\`
+/// (which URL parsers treat as `/`).
+fn has_dot_segment(path: &str) -> bool {
+    path.contains('\\')
+        || path.split('/').any(|s| {
+            let s = s.to_ascii_lowercase().replace("%2e", ".");
+            s == "." || s == ".."
+        })
+}
+
+/// `url` with its scheme and host lower-cased and without a default port (`:443` for `https`,
+/// `:80` for `http`), so `mirrorOf` URL prefixes match however the origin is written. The path
+/// keeps its case: `/Releases/` and `/releases/` may be different repositories.
 pub(crate) fn comparable_url(url: &str) -> String {
-    let url = url.to_ascii_lowercase();
-    let Some((scheme, rest)) = url.split_once("://") else { return url };
+    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    let scheme = scheme.to_ascii_lowercase();
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(end);
-    let default = match scheme {
+    let authority = authority.to_ascii_lowercase();
+    let default = match scheme.as_str() {
         "https" => ":443",
         "http" => ":80",
-        _ => return url.clone(),
+        _ => "",
     };
-    let authority = authority.strip_suffix(default).unwrap_or(authority);
+    let authority = authority.strip_suffix(default).filter(|_| !default.is_empty()).unwrap_or(&authority);
     format!("{scheme}://{authority}{tail}")
 }
 
@@ -770,6 +796,14 @@ mod tests {
         assert_eq!(find("https://ACME.example:443/maven/"), Some("https://acme.example"));
         assert_eq!(find("https://acme.example/private/maven/"), Some("https://acme.example/private"));
         assert_eq!(find("https://acme.example/privateer/"), Some("https://acme.example"), "path segments");
+        for escaping in [
+            "https://acme.example/private/%2e%2e/public/",
+            "https://acme.example/private/%2E./public/",
+            "https://acme.example/private/../public/",
+            "https://acme.example/private\\..\\public/",
+        ] {
+            assert_eq!(find(escaping), Some("https://acme.example"), "the client resolves {escaping} out of /private/");
+        }
         assert_eq!(find("https://acme.example:8443/maven/"), None, "another port");
         assert_eq!(find("http://acme.example/maven/"), None, "another scheme");
         assert_eq!(find("http://nexus.local:8081/repo/m/"), Some("http://nexus.local:8081/repo/"));
@@ -810,9 +844,20 @@ mod tests {
         assert!(m.skipped_credential(&repos[2], &repos).unwrap().contains("allowInsecureCredentials"));
         let open = m.apply(vec![repo("open", "http://nexus.local:8081/m/", true)]);
         assert!(matches!(open[0].credentials, Some(RepoCredentials::Basic { .. })));
+        // The opt-in is per repository: one that opts in can't open its origin for a closed peer,
+        // and since `cs` scopes credentials by origin, neither gets the user config's.
+        let mixed = m.apply(vec![
+            repo("open", "http://nexus.local:8081/m/", true),
+            repo("closed", "http://nexus.local:8081/other/", false),
+        ]);
+        assert_eq!(mixed[0].credentials, None);
+        assert_eq!(mixed[1].credentials, None);
+        let note = m.skipped_credential(&mixed[0], &mixed).unwrap();
+        assert!(note.contains("`closed` shares the origin"), "{note}");
+        assert!(coursier::insecure_credential_origins(&mixed).is_empty());
 
         // Missing variables are reported with where they were configured.
-        let err = repos[0].auth().unwrap_err().to_string();
+        let err = repos[0].auth_with(&|_| None).unwrap_err().to_string();
         assert!(err.contains("`ACME`") && err.contains("user config entry for https://acme.example"), "{err}");
     }
 
@@ -873,6 +918,23 @@ mod tests {
         assert_eq!(mirror(repo("x", "https://acme.example:8443/maven/")), None, "another port");
         assert_eq!(mirror(repo("y", "http://acme.example:443/maven/")), None, "443 is no default for http");
         assert_eq!(comparable_url("HTTPS://H.example:443"), "https://h.example");
+        assert_eq!(comparable_url("HTTPS://H.example:443/Releases/"), "https://h.example/Releases/");
+        // Paths keep their case: `/Releases/` and `/releases/` can be different repositories.
+        let m = machine(
+            "mirrors:\n  - {url: 'https://h.example/releases/', mirrorOf: ['https://h.example/Releases/']}\n\
+             \x20 - {url: 'https://q.example/m?x=1', mirrorOf: ['*']}\n",
+        );
+        let err = m.unwrap_err().to_string();
+        assert!(err.contains("mirrors[1].url") && err.contains("query or fragment"), "{err}");
+        let m =
+            machine("mirrors:\n  - {url: 'https://h.example/releases/', mirrorOf: ['https://h.example/Releases/']}\n")
+                .unwrap();
+        let mirror = |r: Repo| m.mirror_for(&r).map(|m| m.url);
+        assert_eq!(
+            mirror(repo("upper", "https://H.example/Releases/")).as_deref(),
+            Some("https://h.example/releases/")
+        );
+        assert_eq!(mirror(repo("lower", "https://h.example/releases/")), None, "neither matched nor a self-mirror");
     }
 
     fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {

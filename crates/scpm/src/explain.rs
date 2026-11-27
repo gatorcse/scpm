@@ -330,11 +330,16 @@ mod tests {
     fn explains_sources_without_secrets() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.yaml");
+        // A secret file that is missing on purpose, shown under the test's "home".
+        let secret = dir.path().join(".secrets/nexus");
         std::fs::write(
             &config,
-            "credentials:\n  - {url: 'https://nexus.example.com/repository/', user: alice, password: 'file:~/.secrets/nexus'}\n\
-             mirrors:\n  - {url: 'https://nexus.example.com/repository/maven-public', mirrorOf: [central]}\n\
-             proxy:\n  https: 'http://proxy.example.com:3128'\n  noProxy: [nexus.example.com, 10.0.0.0/8]\n",
+            format!(
+                "credentials:\n  - {{url: 'https://nexus.example.com/repository/', user: alice, password: 'file:{}'}}\n\
+                 mirrors:\n  - {{url: 'https://nexus.example.com/repository/maven-public', mirrorOf: [central]}}\n\
+                 proxy:\n  https: 'http://proxy.example.com:3128'\n  noProxy: [nexus.example.com, 10.0.0.0/8]\n",
+                secret.display()
+            ),
         )
         .unwrap();
         let machine = Machine::from_file(&config).unwrap();
@@ -358,7 +363,7 @@ mod tests {
             "credentials.properties",
             Vec::new(),
             &|_| None,
-            dirs::home_dir().as_deref(),
+            Some(dir.path()),
         );
         let text = render(&e);
         let json = serde_json::to_string(&e).unwrap();
@@ -430,5 +435,42 @@ mod tests {
         assert_eq!(e.repositories[1].credentials.as_ref().unwrap().source, "credentials.properties");
         assert!(e.repositories[1].notes.is_empty(), "{:?}", e.repositories[1].notes);
         assert_eq!(e.repositories[2].credentials.as_ref().unwrap().source, "scpm-workspace.yaml");
+    }
+
+    #[test]
+    fn a_credential_clash_is_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.yaml");
+        std::fs::write(&config, "").unwrap();
+        let machine = Machine::from_file(&config).unwrap();
+        let token = |var: &str| Some(RepoCredentials::Bearer { token: Secret::Env(var.into()) });
+        let repos = vec![
+            Repo {
+                id: "orgA".into(),
+                url: "https://maven.pkg.github.com/orgA/".into(),
+                credentials: token("A"),
+                ..Default::default()
+            },
+            Repo {
+                id: "orgB".into(),
+                url: "https://maven.pkg.github.com/orgB/".into(),
+                credentials: token("B"),
+                ..Default::default()
+            },
+        ];
+        let e = build(
+            &repos,
+            &repos,
+            &machine,
+            &CoursierCredentials::default(),
+            "credentials.properties",
+            Vec::new(),
+            &|var| Some(format!("secret-{var}")),
+            None,
+        );
+        assert_eq!(e.warnings.len(), 1, "{:?}", e.warnings);
+        assert!(e.warnings[0].contains("`orgA`") && e.warnings[0].contains("`orgB`"), "{:?}", e.warnings);
+        assert!(e.warnings[0].contains("share the origin https://maven.pkg.github.com"), "{:?}", e.warnings);
+        assert!(render(&e).contains("warning: repositories `orgA`"));
     }
 }
