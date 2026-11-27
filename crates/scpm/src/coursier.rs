@@ -755,7 +755,7 @@ const KEPT_COURSIER_ENV: &[&str] = &["COURSIER_PROGRESS", "COURSIER_NO_TERM"];
 
 /// The inherited variables a sealed `cs` run must not see: every `COURSIER_*` and `CS_*` one
 /// but [`KEPT_COURSIER_ENV`], and [`JVM_OPTION_ENV`].
-fn unsealed_env(inherited: impl Iterator<Item = OsString>) -> Vec<OsString> {
+pub(crate) fn unsealed_env(inherited: impl Iterator<Item = OsString>) -> Vec<OsString> {
     let mut removed: Vec<OsString> = JVM_OPTION_ENV.iter().map(OsString::from).collect();
     for name in inherited {
         // Windows matches variable names case-insensitively.

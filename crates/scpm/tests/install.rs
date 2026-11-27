@@ -1157,8 +1157,16 @@ fn foreign_mirror_settings_do_not_redirect_cs() {
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
     assert_eq!(stderr.matches("note:").count(), 1, "{stderr}");
     assert!(stderr.contains("~/hostile-m2/settings.xml (CS_MAVEN_HOME): mirror \"corp\" for *"), "{stderr}");
-    assert!(stderr.contains("is ignored for local (and 2 more settings)"), "{stderr}");
+    // The other two files, and COURSIER_MODE, COURSIER_TTL and COURSIER_REPOSITORIES, which this
+    // re-lock's `cs` didn't get.
+    assert!(stderr.contains("is ignored for local (and 5 more settings)"), "{stderr}");
     assert!(stderr.contains("scpm config explain"), "{stderr}");
+    let explained = hostile_scpm().args(["config", "explain"]).assert().success();
+    let explained = String::from_utf8_lossy(&explained.get_output().stdout).into_owned();
+    for name in ["COURSIER_MODE", "COURSIER_TTL", "COURSIER_REPOSITORIES"] {
+        assert!(explained.contains(name), "{name}: {explained}");
+    }
+    assert!(!explained.contains("offline"), "names only, never values: {explained}");
     // `why --json` keeps the notice of the install it runs first.
     let fresh = tempfile::tempdir().unwrap();
     let mut cmd = scpm(ws.path(), fresh.path());

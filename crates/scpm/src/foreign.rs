@@ -1,7 +1,8 @@
 //! Machine settings that belong to other tools, which scpm ignores on purpose (design §5.9):
-//! Maven `settings.xml`, coursier's mirror files, and the Scala CLI config. `cs` is sealed off
-//! from them; this module only finds them, so `scpm config explain` and a one-line notice can
-//! say what would have applied. JVM proxy properties can't be detected and aren't looked for.
+//! Maven `settings.xml`, coursier's mirror files, the Scala CLI config, and coursier's own
+//! environment variables (by name only). `cs` is sealed off from them; this module only finds
+//! them, so `scpm config explain` and a one-line notice can say what would have applied. JVM
+//! proxy properties can't be detected and aren't looked for.
 //!
 //! The parsing is deliberately shallow: enough to name the setting and the repositories it
 //! would have touched, never to apply it.
@@ -22,6 +23,9 @@ pub struct ForeignSetting {
     pub setting: String,
     #[serde(skip)]
     applies: Applies,
+    /// Read by `cs` alone (an environment variable), so worth a notice only when `cs` ran.
+    #[serde(skip)]
+    cs_only: bool,
 }
 
 /// Which repositories a setting would have touched.
@@ -40,7 +44,7 @@ enum Applies {
 
 impl ForeignSetting {
     fn new(file: &str, setting: String, applies: Applies) -> ForeignSetting {
-        ForeignSetting { file: file.to_string(), setting, applies }
+        ForeignSetting { file: file.to_string(), setting, applies, cs_only: false }
     }
 
     /// The ids of the repositories in `repos` this setting would have applied to.
@@ -75,7 +79,22 @@ pub struct Locations {
     /// Coursier mirror files, each with the variable that named it (if any).
     pub coursier_mirrors: Vec<(String, PathBuf)>,
     pub scala_cli_config: Option<(String, PathBuf)>,
+    /// Inherited `COURSIER_*` and `CS_*` variables with a value that `cs` doesn't get (its
+    /// environment is an allowlist), other than those found as files above or read by scpm.
+    /// Names only: values may be passwords (`COURSIER_CACHE_SERVER_PASSWORD`).
+    pub coursier_env: Vec<String>,
 }
+
+/// Coursier variables scpm reads itself or that name a file looked at above.
+const ACCOUNTED_FOR: &[&str] = &[
+    "COURSIER_CACHE",
+    "COURSIER_CREDENTIALS",
+    "COURSIER_CONFIG_DIR",
+    "COURSIER_MIRRORS",
+    "COURSIER_EXTRA_MIRRORS",
+    "COURSIER_MAVEN_SETTINGS",
+    "CS_MAVEN_HOME",
+];
 
 impl Locations {
     /// The locations `cs` 2.1.27 reads, from the environment.
@@ -109,7 +128,16 @@ impl Locations {
             Some(file) => Some(("SCALA_CLI_CONFIG".to_string(), file)),
             None => scala_cli_default().map(|f| (String::new(), f)),
         };
-        Locations { home, maven_settings, coursier_mirrors, scala_cli_config }
+        let set = std::env::vars_os().filter(|(_, v)| !v.is_empty()).map(|(name, _)| name);
+        let coursier_env = crate::coursier::unsealed_env(set)
+            .into_iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| {
+                let upper = name.to_ascii_uppercase();
+                (upper.starts_with("COURSIER_") || upper.starts_with("CS_")) && !ACCOUNTED_FOR.contains(&upper.as_str())
+            })
+            .collect();
+        Locations { home, maven_settings, coursier_mirrors, scala_cli_config, coursier_env }
     }
 
     /// `path` for messages: `~/…` under the home directory, plus the variable that named it.
@@ -157,6 +185,9 @@ pub fn detect(locations: &Locations) -> Vec<ForeignSetting> {
     {
         found.extend(scala_cli(&locations.display(var, path), &text));
     }
+    for name in &locations.coursier_env {
+        found.push(ForeignSetting { cs_only: true, ..ForeignSetting::new("environment", name.clone(), Applies::All) });
+    }
     found
 }
 
@@ -172,13 +203,19 @@ pub fn applying(found: Vec<ForeignSetting>, repos: &[Repo]) -> Vec<(ForeignSetti
 }
 
 /// The one-line notice for foreign settings touching `repos`, at most once per process.
-pub fn take_notice(repos: &[Repo]) -> Option<String> {
+/// `ran_cs`: whether the command ran `cs`; settings only `cs` reads count only then.
+pub fn take_notice(repos: &[Repo], ran_cs: bool) -> Option<String> {
     static SHOWN: AtomicBool = AtomicBool::new(false);
     if SHOWN.load(Ordering::Relaxed) {
         return None;
     }
-    let notice = notice(&applying(detect(&Locations::from_env()), repos))?;
+    let notice = notice(&applying(relevant(detect(&Locations::from_env()), ran_cs), repos))?;
     (!SHOWN.swap(true, Ordering::Relaxed)).then_some(notice)
+}
+
+/// `found`, without the settings only `cs` reads unless it ran.
+fn relevant(found: Vec<ForeignSetting>, ran_cs: bool) -> Vec<ForeignSetting> {
+    found.into_iter().filter(|f| ran_cs || !f.cs_only).collect()
 }
 
 /// `<file>: <setting> is ignored (…)`, naming the first setting and counting the rest.
@@ -346,12 +383,14 @@ fn shown_origin(url: &str) -> String {
     let host = match authority.rsplit_once('@') {
         Some((_, host)) => host,
         None => {
-            let password_like = !authority.starts_with('[')
-                && authority
-                    .split_once(':')
-                    .is_some_and(|(_, p)| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()));
+            let after_colon = (!authority.starts_with('[')).then(|| authority.split_once(':')).flatten();
+            let password_like =
+                after_colon.is_some_and(|(_, p)| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()));
             match rest.rsplit_once('@') {
                 Some((_, host)) if password_like => host,
+                // `host:8081/m/@scope` or `user:12345/rest-of-password@host`: a numeric "port"
+                // may be the start of a password, so neither is shown.
+                Some(_) if after_colon.is_some() => return "(URL not shown)".to_string(),
                 _ => authority,
             }
         }
@@ -503,7 +542,9 @@ mod tests {
             ("https://user:t0#ken@nexus/m", "https://nexus"),
             ("https://user:t0/ken@nexus/m", "https://nexus"),
             ("https://nexus/m/@scope/x", "https://nexus"),
-            ("https://nexus:8081/m/@scope/x", "https://nexus:8081"),
+            ("https://nexus:8081/m/@scope/x", "(URL not shown)"),
+            ("https://alice:12345/abc@nexus/m", "(URL not shown)"),
+            ("https://nexus:8081/m/x", "https://nexus:8081"),
             ("https://user:t0?k/en@nexus/m", "https://nexus"),
             ("https://user:@nexus/m?x", "https://nexus"),
             ("user:t0ken@nexus/m", "nexus"),
@@ -580,9 +621,17 @@ mod tests {
             maven_settings: vec![(String::new(), home.join(".m2/settings.xml"))],
             coursier_mirrors: vec![("COURSIER_MIRRORS".into(), mirrors), (String::new(), home.join("missing"))],
             scala_cli_config: None,
+            coursier_env: Vec::new(),
         };
         let found = applying(detect(&locations), &repos()[..2]);
         assert_eq!(found.len(), 2);
+        // Coursier variables `cs` doesn't get count only when the command ran `cs`; never a value.
+        let with_env = Locations { coursier_env: vec!["COURSIER_CACHE_SERVER".into()], ..locations.clone() };
+        let all = applying(relevant(detect(&with_env), true), &repos()[..2]);
+        assert_eq!(all.len(), 3);
+        assert_eq!((all[2].0.file.as_str(), all[2].0.setting.as_str()), ("environment", "COURSIER_CACHE_SERVER"));
+        assert_eq!(all[2].1, ["central", "acme"]);
+        assert_eq!(applying(relevant(detect(&with_env), false), &repos()[..2]).len(), 2);
         assert_eq!(found[0].0.file, "~/.m2/settings.xml");
         assert_eq!(found[1].0.file, "~/mirrors.properties (COURSIER_MIRRORS)");
         let n = notice(&found).unwrap();

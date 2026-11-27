@@ -230,7 +230,12 @@ fn build(
             .map(|(f, ids)| IgnoredSetting { file: f.file, setting: f.setting, repositories: ids })
             .collect(),
         // A clash stops a re-lock, so the report must not look like a working configuration.
-        warnings: machine.warnings.iter().cloned().chain(clashes.iter().map(|c| c.message.clone())).collect(),
+        warnings: machine
+            .warnings
+            .iter()
+            .cloned()
+            .chain(clashes.iter().map(crate::diag::Diagnostic::with_help_inline))
+            .collect(),
     }
 }
 
@@ -471,6 +476,7 @@ mod tests {
         assert_eq!(e.warnings.len(), 1, "{:?}", e.warnings);
         assert!(e.warnings[0].contains("`orgA`") && e.warnings[0].contains("`orgB`"), "{:?}", e.warnings);
         assert!(e.warnings[0].contains("share the origin https://maven.pkg.github.com"), "{:?}", e.warnings);
+        assert!(e.warnings[0].contains("(help: give both the same credentials"), "{:?}", e.warnings);
         assert!(render(&e).contains("warning: repositories `orgA`"));
     }
 }

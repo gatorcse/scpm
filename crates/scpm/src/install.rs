@@ -343,7 +343,7 @@ impl Selector<'_> {
                 None => {
                     // Contacting the repositories: an ignored setting of another tool may be why it fails.
                     let v = coursier::list_versions(&dep.coord.org, &artifact, self.repos, self.proxy, self.cache)
-                        .map_err(|e| with_notice(e.into(), self.repos))?;
+                        .map_err(|e| with_notice(e.into(), self.repos, true))?;
                     self.listed.lock().expect("listed").insert(list_key.clone(), v.clone());
                     v
                 }
@@ -636,7 +636,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     let all: Vec<&ResolveRequest> =
         requests.values().chain(plugin_requests.values()).chain(boot_requests.values()).collect();
     let results = resolve_concurrently(&all, &labels, &repos, &machine.proxy, &cache, scratch.path())
-        .map_err(|e| with_notice(e, &repos))?;
+        .map_err(|e| with_notice(e, &repos, true))?;
 
     record_artifacts(&mut lock, all.iter().flat_map(|req| &results[*req]), &repos)?;
     for (name, req) in &boot_requests {
@@ -698,12 +698,15 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
         ));
     }
 
+    // Re-locking ran `cs`.
+    let ran_cs = !stale.is_empty() || !missing_boot.is_empty();
     let fetch_started = Instant::now();
     let items = fetch_items(&lock, &repos, &CoursierCredentials::load(), &cache, &mut warnings)?;
     let fetch = fetch::fetch_all(items, FetchOptions { verify: opts.verify, proxy: machine.proxy.clone() })
-        .map_err(|f| with_notice(InstallError::Fetch(f), &repos))?;
-    let contacted = !stale.is_empty() || !missing_boot.is_empty() || fetch.downloaded > 0;
-    let notices = if contacted { crate::foreign::take_notice(&repos).into_iter().collect() } else { Vec::new() };
+        .map_err(|f| with_notice(InstallError::Fetch(f), &repos, ran_cs))?;
+    let contacted = ran_cs || fetch.downloaded > 0;
+    let notices =
+        if contacted { crate::foreign::take_notice(&repos, ran_cs).into_iter().collect() } else { Vec::new() };
     if fetch.repaired > 0 {
         warnings.push(format!(
             "{} cached artifact{} did not match the lock and {} downloaded again",
@@ -728,13 +731,13 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
 }
 
 /// Adds the notice about ignored settings of other tools to an error from contacting the
-/// repositories: one of them may be why it failed (design §5.9).
-pub(crate) fn with_notice(e: InstallError, repos: &[Repo]) -> InstallError {
+/// repositories: one of them may be why it failed (design §5.9). `ran_cs`: whether the command ran `cs`.
+pub(crate) fn with_notice(e: InstallError, repos: &[Repo], ran_cs: bool) -> InstallError {
     // A configuration error was found before any repository was contacted.
     if matches!(e, InstallError::Coursier(coursier::CoursierError::CredentialClash(_))) {
         return e;
     }
-    match crate::foreign::take_notice(repos) {
+    match crate::foreign::take_notice(repos, ran_cs) {
         Some(notice) => InstallError::WithNotice { error: Box::new(e), notice },
         None => e,
     }
@@ -951,7 +954,7 @@ pub fn fetch_items(
     // keeps its own, and every other origin still shares its credentials.
     let found = coursier::credential_sources(repos, &|var| std::env::var(var).ok(), &mut Vec::new());
     for clash in &found.clashes {
-        warnings.push(format!("{}; each repository there gets its own when restoring", clash.message));
+        warnings.push(format!("{}; restoring sends each repository there its own", clash.with_help_inline()));
     }
     let access: HashMap<&str, RepoAccess> = repos
         .iter()

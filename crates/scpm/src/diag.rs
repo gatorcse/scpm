@@ -43,6 +43,14 @@ impl Diagnostic {
         self
     }
 
+    /// The message and its help on one line, for a warning.
+    pub fn with_help_inline(&self) -> String {
+        match &self.help {
+            Some(help) => format!("{} (help: {help})", self.message),
+            None => self.message.clone(),
+        }
+    }
+
     /// Builds a diagnostic from a YAML deserialization error, rewriting serde's
     /// "unknown field" messages into "did you mean" help.
     pub fn from_yaml(file: &Path, err: serde_path_to_error::Error<serde_yaml_ng::Error>) -> Self {

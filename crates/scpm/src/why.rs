@@ -115,7 +115,7 @@ pub fn why(
         let mut unexplained: Vec<String> = Vec::new();
         for module in &modules {
             let chains = coursier::what_depends_on(&req, module, &repos, &machine.proxy, &cache)
-                .map_err(|e| crate::install::with_notice(e.into(), &repos))?;
+                .map_err(|e| crate::install::with_notice(e.into(), &repos, true))?;
             ran_cs = true;
             if chains.is_empty() {
                 unexplained.extend(found.iter().filter(|k| module_of(k) == *module).map(|k| k.to_string()));
@@ -133,7 +133,7 @@ pub fn why(
         }
     }
     if ran_cs {
-        report.notices.extend(crate::foreign::take_notice(&repos));
+        report.notices.extend(crate::foreign::take_notice(&repos, true));
     }
     Ok(report)
 }
