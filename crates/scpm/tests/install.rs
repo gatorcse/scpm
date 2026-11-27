@@ -755,7 +755,8 @@ fn both_paths_use_exactly_the_resolved_proxy() {
     // Every other way a proxy could reach `cs` points at the dead one: Maven's settings.xml
     // (which coursier reads for proxies even with `COURSIER_MAVEN_SETTINGS=false`) and the JVM
     // option variables (which only a JVM launcher reads; scpm sets `JAVA_TOOL_OPTIONS` itself
-    // for one).
+    // for one). Coursier's cache server would take every download, and a checksum policy only
+    // SHA-512 satisfies fails on this repository, which serves no checksum files.
     let m2 = ws.path().join("hostile-m2");
     fs::create_dir_all(&m2).unwrap();
     fs::write(
@@ -767,6 +768,8 @@ fn both_paths_use_exactly_the_resolved_proxy() {
     let dead_properties = "-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=1 -Dhttp.nonProxyHosts=nothing";
     let hostile_jvm = |cmd: &mut Command| {
         cmd.env("CS_MAVEN_HOME", &m2).env("MAVEN_HOME", &m2).env("HOME", ws.path());
+        cmd.env("COURSIER_CACHE_SERVER", dead).env("COURSIER_CACHE_SERVER_USER", "u");
+        cmd.env("COURSIER_CACHE_SERVER_PASSWORD", "p").env("COURSIER_CHECKSUMS", "SHA-512");
         for var in ["JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS", "JAVA_OPTS"] {
             cmd.env(var, dead_properties);
         }

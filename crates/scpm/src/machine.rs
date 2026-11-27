@@ -328,13 +328,16 @@ impl Machine {
         }
         if let Some(peer) = coursier::closed_http_peer(repo, repos).filter(|_| repo.allow_insecure_credentials) {
             return Some(format!(
-                "the user config entry for {} is not sent over plain HTTP: repository `{}` shares the origin without `allowInsecureCredentials`, and coursier would send it there too",
-                c.url, peer.id
+                "the user config entry for {} is not sent over plain HTTP: repository `{}` shares the origin without `allowInsecureCredentials`, and coursier would send it there too ({})",
+                c.url,
+                peer.id,
+                coursier::opt_in_help(peer)
             ));
         }
         Some(format!(
-            "the user config entry for {} is not sent over plain HTTP without the repository's `allowInsecureCredentials`",
-            c.url
+            "the user config entry for {} is not sent over plain HTTP without the repository's `allowInsecureCredentials` ({})",
+            c.url,
+            coursier::opt_in_help(repo)
         ))
     }
 }
@@ -381,6 +384,10 @@ pub struct ProxySettings {
     /// `user config`, or the environment variables it was read from.
     pub source: String,
 }
+
+/// The proxy `cs` gets for a scheme whose environment proxy is unusable: `.invalid` never
+/// resolves (RFC 6761), so every request through it fails.
+pub const UNUSABLE_PROXY_HOST: &str = "unusable-proxy.scpm.invalid";
 
 /// Loopback never goes through a proxy (Java's default `http.nonProxyHosts`, made explicit so
 /// both paths agree).
@@ -454,12 +461,19 @@ impl ProxySettings {
     /// covers both schemes; a `noProxy` domain becomes `domain|*.domain`. No value holds
     /// whitespace or quotes (hosts and `noProxy` entries are checked when read), so the flags
     /// can be joined with spaces into `JAVA_TOOL_OPTIONS`.
+    ///
+    /// A scheme whose environment proxy is unusable gets a proxy that can't be reached (a
+    /// `.invalid` host never resolves), so `cs` fails where the fetcher refuses, say on a redirect
+    /// to that scheme, instead of going out directly.
     pub fn jvm_properties(&self) -> Vec<String> {
         let mut args = Vec::new();
         for (scheme, server) in [("https", &self.https), ("http", &self.http)] {
             if let Some(s) = server {
                 args.push(format!("-D{scheme}.proxyHost={}", s.host));
                 args.push(format!("-D{scheme}.proxyPort={}", s.port));
+            } else if self.errors.contains_key(scheme) {
+                args.push(format!("-D{scheme}.proxyHost={UNUSABLE_PROXY_HOST}"));
+                args.push(format!("-D{scheme}.proxyPort=1"));
             }
         }
         if !args.is_empty() {
@@ -676,23 +690,25 @@ impl UrlParts {
         Some(UrlParts { scheme, host: host.to_ascii_lowercase(), port, path })
     }
 
-    /// Same scheme, host and port, and `other`'s path is under this one's. A path with a dot
-    /// segment (`..`, also as `%2e%2e`, or a `\`) is under nothing narrower than the origin: the
-    /// HTTP client resolves it, so the path requested isn't the one written.
+    /// Same scheme, host and port, and `other`'s path is under this one's. An ambiguous path (see
+    /// [`ambiguous_path`]) is under nothing narrower than the origin: the HTTP client rewrites it,
+    /// so the path requested isn't the one written.
     fn covers(&self, other: &UrlParts) -> bool {
         let other_path = if other.path.is_empty() { "/" } else { other.path.as_str() };
         self.scheme == other.scheme
             && self.host == other.host
             && self.port == other.port
             && (self.path.is_empty()
-                || (!has_dot_segment(&self.path) && !has_dot_segment(other_path) && other_path.starts_with(&self.path)))
+                || (!ambiguous_path(&self.path) && !ambiguous_path(other_path) && other_path.starts_with(&self.path)))
     }
 }
 
-/// Whether a URL path has a `.` or `..` segment, written plainly or percent-encoded, or a `\`
-/// (which URL parsers treat as `/`).
-fn has_dot_segment(path: &str) -> bool {
+/// Whether the HTTP client would request another path than the one written: one with a `.` or
+/// `..` segment, plain or percent-encoded, a `\` (which URL parsers treat as `/`), or any ASCII
+/// control character or whitespace (parsers drop tabs and line breaks, so `.\t.` is `..`).
+fn ambiguous_path(path: &str) -> bool {
     path.contains('\\')
+        || path.chars().any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
         || path.split('/').any(|s| {
             let s = s.to_ascii_lowercase().replace("%2e", ".");
             s == "." || s == ".."
@@ -824,6 +840,9 @@ mod tests {
             "https://acme.example/private/%2E./public/",
             "https://acme.example/private/../public/",
             "https://acme.example/private\\..\\public/",
+            "https://acme.example/private/.\t./public/",
+            "https://acme.example/private/.\n./public/",
+            "https://acme.example/private/\r../public/",
         ] {
             assert_eq!(find(escaping), Some("https://acme.example"), "the client resolves {escaping} out of /private/");
         }
@@ -1006,12 +1025,22 @@ mod tests {
         );
         assert!(p.route("http://repo.example/m/").unwrap_err().contains("HTTP_PROXY"));
         assert_eq!(p.route("http://plain.example/m/"), Ok(None), "noProxy hosts need no proxy");
-        assert_eq!(p.jvm_properties()[..2], ["-Dhttps.proxyHost=proxy.example", "-Dhttps.proxyPort=3128"]);
-        assert!(!p.jvm_properties().iter().any(|a| a.contains("http.proxyHost")));
+        // `cs` gets an unreachable proxy for the unusable scheme, so it never goes out directly
+        // where the fetcher refuses (a redirect to plain HTTP, say); `noProxy` hosts stay direct.
+        assert_eq!(
+            p.jvm_properties(),
+            [
+                "-Dhttps.proxyHost=proxy.example",
+                "-Dhttps.proxyPort=3128",
+                "-Dhttp.proxyHost=unusable-proxy.scpm.invalid",
+                "-Dhttp.proxyPort=1",
+                "-Dhttp.nonProxyHosts=plain.example|*.plain.example|localhost|*.localhost|127.0.0.1|::1|[::1]",
+            ]
+        );
         // Both unusable: still nothing fails until a URL of either scheme is asked for.
         let p = proxy_from_env(&env(&[("HTTPS_PROXY", "socks5://p:1"), ("HTTP_PROXY", "socks5://p:1")])).unwrap();
         assert_eq!(p.errors.len(), 2);
-        assert!(p.jvm_properties().is_empty());
+        assert!(p.jvm_properties().iter().filter(|a| a.contains(UNUSABLE_PROXY_HOST)).count() == 2);
     }
 
     #[test]

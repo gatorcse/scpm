@@ -329,6 +329,17 @@ pub fn closed_http_peer<'a>(repo: &Repo, repos: &'a [Repo]) -> Option<&'a Repo> 
     })
 }
 
+/// How to give `peer` its own opt-in. A built-in name like `central` has no place for the key,
+/// so the help shows the full form, with the repository's own URL (not its mirror's).
+pub fn opt_in_help(peer: &Repo) -> String {
+    format!(
+        "give `{id}` its own opt-in, written out in full in `repositories`: \
+         `- {{id: {id}, url: '{url}', allowInsecureCredentials: true}}`; or use https:// URLs",
+        id = peer.id,
+        url = peer.url
+    )
+}
+
 /// The coursier cache directory: `COURSIER_CACHE`, the legacy `~/.coursier/cache/v1` if it
 /// exists, then the platform default.
 pub fn cache_dir() -> PathBuf {
@@ -710,40 +721,54 @@ fn add_request_args(cmd: &mut Command, req: &ResolveRequest) {
     cmd.args(&req.dependencies);
 }
 
-/// State that must outlive a `cs` invocation: the credential file, and notes about
-/// credentials that could not be read (reported only if coursier then fails).
+/// State that must outlive a `cs` invocation: the credential file, and notes about credentials
+/// that could not be read or an unusable proxy (reported only if coursier then fails).
 struct CommonArgs {
     _credential_file: Option<tempfile::NamedTempFile>,
     /// A private, empty directory: the (absent) Scala CLI config and mirror file `cs` is
     /// pointed at live in it.
     _sealed_dir: Option<tempfile::TempDir>,
-    missing_credentials: Vec<String>,
+    notes: Vec<String>,
 }
 
 impl CommonArgs {
     fn failure(&self, stderr: &[u8]) -> CoursierError {
         let mut msg = clean_stderr(stderr);
-        for note in &self.missing_credentials {
+        for note in &self.notes {
             msg.push_str(&format!("\n  note: {note}"));
         }
         CoursierError::Failed(msg)
     }
 }
 
-/// Environment variables through which coursier would pick up machine settings scpm doesn't
-/// apply itself (design §5.9): extra mirror files, default repositories and cache policy, and
-/// JVM options (proxy properties, say) when `SCPM_CS` is a JVM launcher. `JAVA_TOOL_OPTIONS`
-/// is then set again, to exactly scpm's resolved proxy, for a launcher that takes it.
-const UNSEALED_ENV: &[&str] = &[
-    "COURSIER_EXTRA_MIRRORS",
-    "COURSIER_REPOSITORIES",
-    "COURSIER_TTL",
-    "COURSIER_MODE",
-    "JAVA_TOOL_OPTIONS",
-    "_JAVA_OPTIONS",
-    "JDK_JAVA_OPTIONS",
-    "JAVA_OPTS",
-];
+/// JVM option variables, through which a JVM launcher would pick up proxy properties and any
+/// other JVM option (design §5.9); removed from `cs`'s environment. `JAVA_TOOL_OPTIONS` is then
+/// set again, to exactly scpm's resolved proxy, for a launcher that takes it.
+const JVM_OPTION_ENV: &[&str] = &["JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS", "JAVA_OPTS"];
+
+/// The only inherited `COURSIER_*` and `CS_*` variables `cs` keeps: they change its output, not
+/// what it downloads or from where. Every other one is removed, whether or not scpm knows what
+/// coursier does with it (`COURSIER_CACHE_SERVER` sends every download through another server,
+/// `COURSIER_CHECKSUMS`, `COURSIER_TTL` and `COURSIER_MODE` change the cache policy, …); the
+/// ones scpm needs it sets itself.
+const KEPT_COURSIER_ENV: &[&str] = &["COURSIER_PROGRESS", "COURSIER_NO_TERM"];
+
+/// The inherited variables a sealed `cs` run must not see: every `COURSIER_*` and `CS_*` one
+/// but [`KEPT_COURSIER_ENV`], and [`JVM_OPTION_ENV`].
+fn unsealed_env(inherited: impl Iterator<Item = OsString>) -> Vec<OsString> {
+    let mut removed: Vec<OsString> = JVM_OPTION_ENV.iter().map(OsString::from).collect();
+    for name in inherited {
+        // Windows matches variable names case-insensitively.
+        let upper = name.to_string_lossy().to_ascii_uppercase();
+        if (upper.starts_with("COURSIER_") || upper.starts_with("CS_"))
+            && !KEPT_COURSIER_ENV.contains(&upper.as_str())
+            && !removed.contains(&name)
+        {
+            removed.push(name);
+        }
+    }
+    removed
+}
 
 /// How a `cs` launcher takes JVM options, which carry the resolved proxy (`cs` ignores
 /// `HTTPS_PROXY`). Coursier 2.1.27 ships two kinds of launcher, and neither accepts the other's
@@ -759,28 +784,34 @@ enum JvmOptions {
 }
 
 /// How `bin` takes JVM options: `-J` arguments if `cs version -J-D…` succeeds (the native
-/// launcher drops `-J` arguments wherever they are), else `JAVA_TOOL_OPTIONS`. Asked once per
-/// launcher and process, and only when a proxy applies. A launcher that can't be run counts as
-/// [`JvmOptions::Args`]; running it for real then reports why. The probe runs sealed like the
-/// real run (coursier reads `settings.xml` even for `version`, and fails on a malformed one), so
-/// only the `-J` argument can make it fail.
+/// launcher drops `-J` arguments wherever they are); `JAVA_TOOL_OPTIONS` only if that fails and
+/// a plain `cs version` succeeds, so the `-J` argument is what it refused. A launcher that fails
+/// either way, or can't be run, counts as [`JvmOptions::Args`]: running it for real then reports
+/// why. Asked once per launcher and process, and only when a proxy applies. The probes run
+/// sealed like the real run (coursier reads `settings.xml` even for `version`, and fails on a
+/// malformed one).
 fn launcher_jvm_options(bin: &OsStr) -> JvmOptions {
     static KNOWN: Mutex<Vec<(OsString, JvmOptions)>> = Mutex::new(Vec::new());
     let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, style)) = known.iter().find(|(b, _)| b == bin) {
         return *style;
     }
-    let mut probe = Command::new(bin);
-    probe.args(["version", "-J-Dscpm.probe=true"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    // Can't seal: the real run fails the same way and says why; don't remember a guess.
-    let Ok(sealed) = seal(&mut probe) else { return JvmOptions::Args };
-    // No credentials: a file that doesn't exist, which coursier skips.
-    probe.env("COURSIER_CREDENTIALS", credentials_env_value(&sealed.path().join("credentials.properties")));
-    let style = match probe.status() {
-        Ok(status) if !status.success() => JvmOptions::ToolOptions,
-        _ => JvmOptions::Args,
+    // `None` when the probe can't even be set up; the real run fails the same way and says why.
+    let succeeds = |args: &[&str]| -> Option<bool> {
+        let mut probe = Command::new(bin);
+        probe.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let sealed = seal(&mut probe).ok()?;
+        // No credentials: a file that doesn't exist, which coursier skips.
+        probe.env("COURSIER_CREDENTIALS", credentials_env_value(&sealed.path().join("credentials.properties")));
+        let status = probe.status();
+        drop(sealed);
+        Some(status.is_ok_and(|s| s.success()))
     };
-    drop(sealed);
+    let style = match succeeds(&["version", "-J-Dscpm.probe=true"]) {
+        None => return JvmOptions::Args,
+        Some(false) if succeeds(&["version"]) == Some(true) => JvmOptions::ToolOptions,
+        Some(_) => JvmOptions::Args,
+    };
     known.push((bin.to_os_string(), style));
     style
 }
@@ -816,12 +847,17 @@ fn add_common_args_for(
 ) -> Result<CommonArgs, CoursierError> {
     cmd.arg("--cache").arg(cache).arg("--no-default").arg("--user-agent").arg(user_agent());
     let mut tool_options = None;
+    let mut notes = Vec::new();
     if let Some(p) = proxy {
         // An unusable environment proxy fails only if a repository needs that scheme's proxy.
         // `cs`'s requests can't be checked one by one, so that fails the whole run up front,
         // even one `cs` could answer from its cache (design §5.9); the fetcher checks per download.
         for repo in repos {
             p.route(repo.fetch_url()).map_err(CoursierError::Config)?;
+        }
+        // Any other request of that scheme (a redirect) goes to an unreachable proxy; say why.
+        for e in p.errors.values() {
+            notes.push(format!("{e}, so requests of that scheme fail"));
         }
         let properties = p.jvm_properties();
         if !properties.is_empty() {
@@ -841,13 +877,7 @@ fn add_common_args_for(
             cmd.arg("--repository").arg(repo.fetch_url());
         }
     }
-    let mut missing_credentials = Vec::new();
-    let properties = credential_properties(
-        repos,
-        &|var| env::var(var).ok(),
-        &CoursierCredentials::load(),
-        &mut missing_credentials,
-    )?;
+    let properties = credential_properties(repos, &|var| env::var(var).ok(), &CoursierCredentials::load(), &mut notes)?;
     // NamedTempFile is created with mode 0600 on Unix.
     let mut file = tempfile::Builder::new()
         .prefix("scpm-credentials-")
@@ -857,18 +887,21 @@ fn add_common_args_for(
     file.write_all(properties.as_bytes())
         .and_then(|()| file.flush())
         .map_err(|e| CoursierError::Config(format!("cannot write a credentials file: {e}")))?;
-    cmd.env("COURSIER_CREDENTIALS", credentials_env_value(file.path()));
     let sealed = seal(cmd)?;
+    cmd.env("COURSIER_CREDENTIALS", credentials_env_value(file.path()));
     if let Some(options) = tool_options {
         cmd.env("JAVA_TOOL_OPTIONS", options);
     }
-    Ok(CommonArgs { _credential_file: Some(file), _sealed_dir: Some(sealed), missing_credentials })
+    Ok(CommonArgs { _credential_file: Some(file), _sealed_dir: Some(sealed), notes })
 }
 
-/// Points a `cs` run at an empty, private directory for every machine-settings file but the
-/// credentials ([`add_common_args`] says which), and removes [`UNSEALED_ENV`]. The directory
-/// must outlive the run.
+/// Removes [`unsealed_env`] from a `cs` run and points it at an empty, private directory for
+/// every machine-settings file but the credentials ([`add_common_args`] says which); callers set
+/// `COURSIER_CREDENTIALS` afterwards. The directory must outlive the run.
 fn seal(cmd: &mut Command) -> Result<tempfile::TempDir, CoursierError> {
+    for var in unsealed_env(env::vars_os().map(|(name, _)| name)) {
+        cmd.env_remove(var);
+    }
     // Owner-only: the files `cs` is pointed at must stay absent, so nobody else may create them.
     let mut sealed = tempfile::Builder::new();
     sealed.prefix("scpm-sealed-");
@@ -883,9 +916,6 @@ fn seal(cmd: &mut Command) -> Result<tempfile::TempDir, CoursierError> {
     cmd.env("COURSIER_MIRRORS", sealed.path().join("mirror.properties"));
     cmd.env("COURSIER_MAVEN_SETTINGS", "false");
     cmd.env("CS_MAVEN_HOME", sealed.path());
-    for var in UNSEALED_ENV {
-        cmd.env_remove(var);
-    }
     Ok(sealed)
 }
 
@@ -1001,7 +1031,7 @@ pub fn credential_sources(
                 peer.fetch_url(),
                 peer.id,
             ))
-            .with_help(format!("set `allowInsecureCredentials: true` on `{}` as well, or use https:// URLs", peer.id)),
+            .with_help(opt_in_help(peer)),
         );
         clashed.push(origin.clone());
     }
@@ -1541,6 +1571,34 @@ mod tests {
     }
 
     #[test]
+    fn every_inherited_coursier_variable_but_ui_ones_is_removed() {
+        let inherited = [
+            "COURSIER_CACHE_SERVER",
+            "COURSIER_CACHE_SERVER_USER",
+            "COURSIER_CACHE_SERVER_PASSWORD",
+            "COURSIER_CHECKSUMS",
+            "COURSIER_TTL",
+            "COURSIER_REPOSITORIES",
+            "COURSIER_SOMETHING_NEW",
+            "CS_MAVEN_HOME",
+            "coursier_lowercase",
+            "COURSIER_PROGRESS",
+            "COURSIER_NO_TERM",
+            "PATH",
+            "HOME",
+            "JAVA_HOME",
+            "SCALA_CLI_CONFIG",
+        ];
+        let removed: Vec<String> = unsealed_env(inherited.iter().map(OsString::from))
+            .into_iter()
+            .map(|v| v.to_string_lossy().into_owned())
+            .collect();
+        let mut expected: Vec<&str> = JVM_OPTION_ENV.to_vec();
+        expected.extend(&inherited[..9]);
+        assert_eq!(removed, expected);
+    }
+
+    #[test]
     fn cs_runs_sealed() {
         let mut cmd = Command::new("cs");
         let repos = vec![Repo {
@@ -1560,9 +1618,10 @@ mod tests {
         let mirrors = PathBuf::from(envs["COURSIER_MIRRORS"].as_deref().unwrap());
         assert!(mirrors.starts_with(sealed) && !mirrors.exists());
         assert_eq!(envs["COURSIER_MAVEN_SETTINGS"].as_deref(), Some("false"));
-        for var in UNSEALED_ENV {
+        for var in JVM_OPTION_ENV {
             assert_eq!(envs.get(*var), Some(&None), "{var} is removed");
         }
+        // Removing every inherited variable must not remove the ones scpm sets.
         assert!(envs["SCALA_CLI_CONFIG"].is_some() && envs["COURSIER_CREDENTIALS"].is_some());
         // Coursier reads `settings.xml` proxies from here, whatever `COURSIER_MAVEN_SETTINGS` says.
         let maven_home = PathBuf::from(envs["CS_MAVEN_HOME"].as_deref().unwrap());
@@ -1618,10 +1677,16 @@ mod tests {
         // An unusable proxy for the other scheme doesn't matter; one for this scheme does.
         let mut broken = proxy;
         broken.errors.insert("http".into(), "HTTP_PROXY: bad".into());
-        add_common_args_for(&mut Command::new("cs"), &repos, &Some(broken.clone()), Path::new("/c"), &|_| {
-            JvmOptions::Args
-        })
-        .unwrap();
+        let mut cmd = Command::new("cs");
+        let common =
+            add_common_args_for(&mut cmd, &repos, &Some(broken.clone()), Path::new("/c"), &|_| JvmOptions::Args)
+                .unwrap();
+        // A plain-HTTP request (a redirect) goes to an unreachable proxy, never out directly, and a
+        // failure says why.
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let dead = format!("-J-Dhttp.proxyHost={}", crate::machine::UNUSABLE_PROXY_HOST);
+        assert!(args.contains(&dead), "{args:?}");
+        assert!(common.failure(b"boom").to_string().contains("note: HTTP_PROXY: bad"));
         broken.errors.insert("https".into(), "HTTPS_PROXY: bad".into());
         let err =
             add_common_args_for(&mut Command::new("cs"), &repos, &Some(broken), Path::new("/c"), &|_| JvmOptions::Args)
@@ -1650,6 +1715,9 @@ mod tests {
         assert_eq!(launcher_jvm_options(native.as_os_str()), JvmOptions::Args);
         assert_eq!(launcher_jvm_options(jvm.as_os_str()), JvmOptions::ToolOptions);
         assert_eq!(launcher_jvm_options(dir.path().join("missing").as_os_str()), JvmOptions::Args);
+        // Failing for another reason (with or without `-J`) is no sign of the JVM launcher.
+        let broken = launcher("broken", "exit 1");
+        assert_eq!(launcher_jvm_options(broken.as_os_str()), JvmOptions::Args);
         // The probe runs sealed: like the native launcher with a malformed `settings.xml` in
         // `~/.m2` or `$MAVEN_HOME`, this one fails unless pointed at the empty directory.
         let picky = launcher(
