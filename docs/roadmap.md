@@ -85,7 +85,8 @@ Kill the riskiest assumptions with throwaway code before committing to the archi
 - Test sharding across matrix jobs, balanced by recorded duration; flaky retry reporting.
 - GitHub extras: Checks API reporter for more annotations than the workflow-command cap, SARIF output, Dependency Submission.
 - `scpm audit` (OSV querybatch), `minimumReleaseAge` with exact-version, expiring CVE exemptions, and `scpm audit --fix`.
-- Resolver sidecar (design §5.2.1): a JVM jar on the coursier API, distributed like the compile worker, giving structured errors, `groups` enforced inside resolution, the full resolution context, version listing, the dependency graph and the repository of every artifact; `cs` stays behind `SCPM_RESOLVER=cs` for one release. Native-image later, behind the same protocol.
+- Resolver sidecar (design §5.2.1): a JVM jar on the coursier API, its jars downloaded from GitHub Releases through a list built into scpm (Maven Central later), giving structured errors, `groups` enforced inside resolution, the full resolution context with several platforms per call, version listing, the dependency graph and the repository of every artifact; `cs` stays behind `SCPM_RESOLVER=cs` for one release, for single-platform workspaces.
+- Universal lock (design §5.4, "Platforms"): locked over the standard platform set by default once the sidecar is the default, with each machine using its own platform's classpath and restoring only its files; built-in classifier mappings for common native libraries. Native-image later, behind the same protocol.
 - Rust JDK fetcher from coursier's JVM index, replacing `cs java-home`; `boot.jdk` gains a URL and sha256 per `os-arch`.
 - Self-bootstrap: the workspace's `scpm:` version pin makes any `scpm` binary re-exec the pinned version.
 
