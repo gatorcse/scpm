@@ -388,13 +388,18 @@ fn test_failures_crashes_and_timeouts_are_reported() {
     )
     .unwrap();
     let started = std::time::Instant::now();
-    let out =
-        scpm(ws.path()).args(["--json", "test", "app", "--suite", "app.HangSuite", "--timeout", "5"]).output().unwrap();
-    assert!(started.elapsed() < std::time::Duration::from_secs(45), "took {:?}", started.elapsed());
+    let out = scpm(ws.path())
+        .args(["--json", "test", "app", "--suite", "app.HangSuite", "--timeout", "20"])
+        .output()
+        .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(75), "took {:?}", started.elapsed());
     let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
     let task = doc["tasks"].as_array().unwrap().iter().find(|t| t["task"] == "app@jvm-3#test").unwrap().clone();
-    assert!(task["message"].as_str().unwrap().contains("timed out after 5s"), "{doc:#}");
-    let pid = fs::read_to_string(&pid_file).unwrap();
+    assert!(task["message"].as_str().unwrap().contains("timed out after 20s"), "{doc:#}");
+    // The timeout must leave the test JVM time to start and reach the test body (slow CI runners
+    // took over 5 s), or there is no grandchild to check.
+    let pid = fs::read_to_string(&pid_file)
+        .unwrap_or_else(|e| panic!("the test body never started before the timeout ({e}): {doc:#}"));
     let alive = || StdCommand::new("kill").args(["-0", pid.trim()]).status().is_ok_and(|s| s.success());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while alive() && std::time::Instant::now() < deadline {
