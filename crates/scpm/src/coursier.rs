@@ -104,6 +104,9 @@ pub struct Mirror {
     pub url: String,
     /// The `mirrorOf` entry that matched: the repository id, a URL prefix, or `*`.
     pub matched: String,
+    /// The mirror entry's `allowInsecureCredentials`: credentials may go to its `http://` origin
+    /// (exactly its scheme, host and port) for the repositories reached through it.
+    pub allow_insecure_credentials: bool,
 }
 
 /// Where a repository's credentials are configured.
@@ -244,6 +247,24 @@ impl Repo {
         Some(&url[..scheme.len() + 3 + authority.len()])
     }
 
+    /// Whether credentials may go over plain HTTP to [`Self::fetch_url`]'s origin: the
+    /// repository's own `allowInsecureCredentials`, or, when it is reached through a mirror, the
+    /// mirror entry's (which covers only the mirror's origin, and only for repositories reached
+    /// through it). Coursier scopes credentials by origin, so the origin also needs every other
+    /// repository there to opt in ([`closed_http_peer`]).
+    pub fn opted_in(&self) -> bool {
+        self.allow_insecure_credentials || self.mirror.as_ref().is_some_and(|m| m.allow_insecure_credentials)
+    }
+
+    /// Where [`Self::opted_in`] comes from, for `scpm config explain`.
+    pub fn opt_in_source(&self) -> Option<String> {
+        if self.allow_insecure_credentials {
+            return Some("repository".to_string());
+        }
+        let mirror = self.mirror.as_ref().filter(|m| m.allow_insecure_credentials)?;
+        Some(format!("user config, mirror {}", mirror.url))
+    }
+
     /// The configured credentials, read from the environment. A missing or empty variable is
     /// an error, which callers raise only when the repository is actually contacted.
     pub fn auth(&self) -> Result<Option<Auth>, CoursierError> {
@@ -367,7 +388,7 @@ pub(crate) fn is_plain_http(url: &str) -> bool {
 pub fn insecure_credential_origins(repos: &[Repo]) -> Vec<String> {
     repos
         .iter()
-        .filter(|r| r.allow_insecure_credentials && is_plain_http(r.fetch_url()))
+        .filter(|r| r.opted_in() && is_plain_http(r.fetch_url()))
         .filter(|r| closed_http_peer(r, repos).is_none())
         .filter_map(|r| r.origin().map(str::to_string))
         .collect()
@@ -377,20 +398,27 @@ pub fn insecure_credential_origins(repos: &[Repo]) -> Vec<String> {
 /// would get any credentials `cs` has for that origin.
 pub fn closed_http_peer<'a>(repo: &Repo, repos: &'a [Repo]) -> Option<&'a Repo> {
     let origin = repo.origin().filter(|_| is_plain_http(repo.fetch_url())).map(crate::machine::comparable_url)?;
-    repos.iter().find(|r| {
-        !r.allow_insecure_credentials && r.origin().map(crate::machine::comparable_url).as_ref() == Some(&origin)
-    })
+    repos.iter().find(|r| !r.opted_in() && r.origin().map(crate::machine::comparable_url).as_ref() == Some(&origin))
 }
 
-/// How to give `peer` its own opt-in. A built-in name like `central` has no place for the key,
-/// so the help shows the full form, with the repository's own URL (not its mirror's).
+/// How to give `peer` an opt-in. Reached through a user config mirror, the mirror's own opt-in
+/// comes first (it is that machine's choice, and covers only the mirror's origin). Otherwise the
+/// repository's: a built-in name like `central` has no place for the key, so the help shows the
+/// full form, with the repository's own URL (not its mirror's).
 pub fn opt_in_help(peer: &Repo) -> String {
-    format!(
-        "give `{id}` its own opt-in, written out in full in `repositories`: \
-         `- {{id: {id}, url: '{url}', allowInsecureCredentials: true}}`; or use https:// URLs",
+    let own = format!(
+        "`- {{id: {id}, url: '{url}', allowInsecureCredentials: true}}` in `repositories`",
         id = peer.id,
         url = peer.url
-    )
+    );
+    match &peer.mirror {
+        Some(m) => format!(
+            "add `allowInsecureCredentials: true` to the user config mirror {} that `{}` is reached through (it covers \
+             only that mirror's scheme, host and port); or give `{}` its own opt-in, {own}; or use https:// URLs",
+            m.url, peer.id, peer.id
+        ),
+        None => format!("give `{}` its own opt-in, written out in full: {own}; or use https:// URLs", peer.id),
+    }
 }
 
 /// The coursier cache directory: `COURSIER_CACHE`, the legacy `~/.coursier/cache/v1` if it
@@ -1502,7 +1530,11 @@ mod tests {
         // A mirror without credentials on a private repository's origin gets the origin's,
         // from `cs` and from the fetcher alike.
         let mirrored = Repo {
-            mirror: Some(Mirror { url: "https://acme.jfrog.io/artifactory/maven-remote/".into(), matched: "*".into() }),
+            mirror: Some(Mirror {
+                url: "https://acme.jfrog.io/artifactory/maven-remote/".into(),
+                matched: "*".into(),
+                allow_insecure_credentials: false,
+            }),
             ..repo("central", CENTRAL_URL, None)
         };
         let repos = [repo("acme", "https://acme.jfrog.io/artifactory/libs-release/", token("TOKEN_A")), mirrored];

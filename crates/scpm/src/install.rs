@@ -1445,7 +1445,9 @@ mod tests {
 
     #[test]
     fn mirror_urls_map_back_to_repository_ids() {
-        let mirror = |url: &str| Some(coursier::Mirror { url: url.into(), matched: "*".into() });
+        let mirror = |url: &str| {
+            Some(coursier::Mirror { url: url.into(), matched: "*".into(), allow_insecure_credentials: false })
+        };
         let repos = vec![
             Repo {
                 id: "central".into(),
@@ -1498,7 +1500,11 @@ mod tests {
             Repo {
                 id: "central".into(),
                 url: coursier::CENTRAL_URL.into(),
-                mirror: Some(coursier::Mirror { url: "https://acme.example:443/remote/".into(), matched: "*".into() }),
+                mirror: Some(coursier::Mirror {
+                    url: "https://acme.example:443/remote/".into(),
+                    matched: "*".into(),
+                    allow_insecure_credentials: false,
+                }),
                 ..Default::default()
             },
         ];
@@ -1532,7 +1538,11 @@ mod tests {
 
     #[test]
     fn relocking_through_a_shared_mirror_keeps_existing_repository_ids() {
-        let mirror = Some(coursier::Mirror { url: "https://m/all/".into(), matched: "*".into() });
+        let mirror = Some(coursier::Mirror {
+            url: "https://m/all/".into(),
+            matched: "*".into(),
+            allow_insecure_credentials: false,
+        });
         let repos = vec![
             Repo { id: "central".into(), url: "https://c/".into(), mirror: mirror.clone(), ..Default::default() },
             Repo { id: "acme".into(), url: "https://a/".into(), mirror, ..Default::default() },

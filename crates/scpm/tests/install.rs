@@ -625,7 +625,43 @@ fn one_origin_shares_its_credentials_on_both_paths() {
     let out = with_config(tempfile::tempdir().unwrap().path()).arg("install").assert().code(2);
     let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
     assert!(err.contains("`central`") && err.contains("allowInsecureCredentials"), "{err}");
+    assert!(err.contains("to the user config mirror"), "the mirror's opt-in is suggested first: {err}");
     assert!(!err.contains("pass"), "{err}");
+
+    // The mirror's own opt-in (a machine choice) covers central reached through it: both paths.
+    let opted_in = |allow: bool| {
+        fs::write(
+            &config,
+            format!(
+                "mirrors:\n  - {{url: '{}', mirrorOf: [central], allowInsecureCredentials: {allow}}}\n",
+                server.url("/remote")
+            ),
+        )
+        .unwrap();
+    };
+    opted_in(true);
+    with_config(tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "central");
+    let empty = tempfile::tempdir().unwrap();
+    with_config(empty.path()).args(["install", "--frozen"]).assert().success();
+    let jar = empty
+        .path()
+        .join(format!("http/alice%40127.0.0.1%3A{}/remote/com/example/hello/1.0/hello-1.0.jar", server.port));
+    assert_eq!(fs::read(&jar).unwrap(), b"hello jar");
+    let explained = with_config(tempfile::tempdir().unwrap().path()).args(["config", "explain"]).assert().success();
+    let explained = String::from_utf8_lossy(&explained.get_output().stdout).into_owned();
+    assert!(
+        explained.contains("credentials over plain HTTP: allowed  (user config, mirror http://127.0.0.1:"),
+        "{explained}"
+    );
+    // With `false`, nothing goes over plain HTTP: the (fresh) lock restores without credentials.
+    opted_in(false);
+    let err = stderr_of(with_config(tempfile::tempdir().unwrap().path()).arg("install"));
+    assert!(err.contains("HTTP 401") && !err.contains("pass"), "{err}");
+    fs::remove_file(ws.path().join("scpm-lock.yaml")).unwrap();
+    fs::write(&config, format!("mirrors:\n  - {{url: '{}', mirrorOf: [central]}}\n", server.url("/remote"))).unwrap();
+
+    // Or central's own opt-in, written in full.
     let central =
         format!("  - {{id: central, url: '{}', allowInsecureCredentials: true}}\n", "https://repo1.maven.org/maven2/");
     java_workspace(ws.path(), &format!("repositories:\n{private}{central}"), deps);

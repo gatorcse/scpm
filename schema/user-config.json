@@ -109,6 +109,10 @@
     "MirrorEntry": {
       "type": "object",
       "properties": {
+        "allowInsecureCredentials": {
+          "description": "Send credentials to this mirror although it is `http://` and plain HTTP exposes them: to\nexactly its scheme, host and port, for the repositories reached through it, and nowhere\nelse. Without it, credentials go to a mirror only over HTTPS.",
+          "type": "boolean"
+        },
         "mirrorOf": {
           "description": "Repository ids, URL prefixes, or `*` for every repository.",
           "type": "array",

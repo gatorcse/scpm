@@ -78,6 +78,11 @@ pub struct MirrorEntry {
     /// Repository ids, URL prefixes, or `*` for every repository.
     #[schemars(length(min = 1))]
     pub mirror_of: Vec<String>,
+    /// Send credentials to this mirror although it is `http://` and plain HTTP exposes them: to
+    /// exactly its scheme, host and port, for the repositories reached through it, and nowhere
+    /// else. Without it, credentials go to a mirror only over HTTPS.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_insecure_credentials: bool,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -110,6 +115,7 @@ pub struct UserMirror {
     /// Ends with `/`.
     pub url: String,
     pub mirror_of: Vec<String>,
+    pub allow_insecure_credentials: bool,
 }
 
 /// The machine settings in effect.
@@ -225,7 +231,11 @@ impl Machine {
                 continue;
             }
             let url = if m.url.ends_with('/') { m.url.clone() } else { format!("{}/", m.url) };
-            mirrors.push(UserMirror { url, mirror_of: m.mirror_of.iter().map(|p| p.trim().to_string()).collect() });
+            mirrors.push(UserMirror {
+                url,
+                mirror_of: m.mirror_of.iter().map(|p| p.trim().to_string()).collect(),
+                allow_insecure_credentials: m.allow_insecure_credentials,
+            });
         }
         let proxy = match &config.proxy {
             Some(entry) => match proxy_from_config(entry) {
@@ -279,8 +289,11 @@ impl Machine {
             .iter()
             .find_map(|m| m.mirror_of.iter().find(|p| *p != "*" && named(p)).map(|p| (m, p)))
             .or_else(|| self.mirrors.iter().find_map(|m| m.mirror_of.iter().find(|p| *p == "*").map(|p| (m, p))))?;
-        (comparable_url(&found.0.url) != comparable_url(&repo.url))
-            .then(|| Mirror { url: found.0.url.clone(), matched: found.1.clone() })
+        (comparable_url(&found.0.url) != comparable_url(&repo.url)).then(|| Mirror {
+            url: found.0.url.clone(),
+            matched: found.1.clone(),
+            allow_insecure_credentials: found.0.allow_insecure_credentials,
+        })
     }
 
     /// Applies the machine settings to the workspace's repositories (design §5.9):
@@ -326,7 +339,7 @@ impl Machine {
         if self.user_credential(repo, &insecure).is_some() {
             return None;
         }
-        if let Some(peer) = coursier::closed_http_peer(repo, repos).filter(|_| repo.allow_insecure_credentials) {
+        if let Some(peer) = coursier::closed_http_peer(repo, repos).filter(|_| repo.opted_in()) {
             return Some(format!(
                 "the user config entry for {} is not sent over plain HTTP: repository `{}` shares the origin without `allowInsecureCredentials`, and coursier would send it there too ({})",
                 c.url,
@@ -854,6 +867,57 @@ mod tests {
             panic!("{:?}", m.credentials[1]);
         };
         assert!(path.is_absolute() && path.ends_with(".secrets/acme"), "{}", path.display());
+    }
+
+    #[test]
+    fn a_mirrors_opt_in_covers_only_its_own_origin() {
+        let config = |allow: bool| {
+            machine(&format!(
+                "credentials:\n\
+                 \x20 - {{url: 'http://nexus.local:8081', user: bob, password: 'env:NEXUS'}}\n\
+                 \x20 - {{url: 'http://other.local', user: bob, password: 'env:OTHER'}}\n\
+                 mirrors:\n\
+                 \x20 - {{url: 'http://nexus.local:8081/group/', mirrorOf: [central], allowInsecureCredentials: {allow}}}\n"
+            ))
+            .unwrap()
+        };
+        let repo = |id: &str, url: &str| Repo { id: id.into(), url: url.into(), ..Default::default() };
+        let declared = || {
+            vec![
+                repo("central", crate::coursier::CENTRAL_URL),
+                repo("plain", "http://other.local/m/"),
+                Repo { allow_insecure_credentials: true, ..repo("open", "http://other.local:9/m/") },
+            ]
+        };
+        // With the mirror's opt-in, central (reached through it) gets the mirror origin's credentials.
+        let m = config(true);
+        let repos = m.apply(declared());
+        assert!(repos[0].opted_in());
+        assert!(matches!(repos[0].credentials, Some(RepoCredentials::Basic { .. })), "{:?}", repos[0]);
+        assert_eq!(repos[0].opt_in_source().as_deref(), Some("user config, mirror http://nexus.local:8081/group/"));
+        assert_eq!(coursier::insecure_credential_origins(&repos)[..1], ["http://nexus.local:8081".to_string()]);
+        // It covers no other origin: a plain-HTTP repository elsewhere still needs its own.
+        assert!(!repos[1].opted_in() && repos[1].credentials.is_none());
+        assert!(!coursier::insecure_credential_origins(&repos).contains(&"http://other.local".to_string()));
+        // Without it, refused as before, and the help points at the mirror first.
+        let m = config(false);
+        let repos = m.apply(declared());
+        assert!(!repos[0].opted_in() && repos[0].credentials.is_none());
+        let note = m.skipped_credential(&repos[0], &repos).unwrap();
+        assert!(
+            note.contains(
+                "add `allowInsecureCredentials: true` to the user config mirror http://nexus.local:8081/group/"
+            ),
+            "{note}"
+        );
+        // A repository reached directly at the mirror's origin is a peer the mirror's opt-in
+        // doesn't cover: coursier would send it the origin's credentials, so neither gets them.
+        let m = config(true);
+        let mut with_direct = declared();
+        with_direct.push(repo("direct", "http://nexus.local:8081/direct/"));
+        let repos = m.apply(with_direct);
+        assert!(repos[0].credentials.is_none() && repos[3].credentials.is_none());
+        assert!(m.skipped_credential(&repos[0], &repos).unwrap().contains("`direct` shares the origin"));
     }
 
     #[test]

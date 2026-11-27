@@ -53,6 +53,10 @@ pub struct RepoExplanation {
     /// unusable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_error: Option<String>,
+    /// Where the opt-in to credentials over plain HTTP comes from, when `effectiveUrl` is
+    /// `http://` and there is one: `repository`, or `user config, mirror <url>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insecure_credentials: Option<String>,
     pub notes: Vec<String>,
 }
 
@@ -217,6 +221,7 @@ fn build(
                 credentials,
                 proxy: proxy.and_then(|p| p.for_url(repo.fetch_url())).map(|s| s.url()),
                 proxy_error: proxy.and_then(|p| p.route(repo.fetch_url()).err()),
+                insecure_credentials: repo.opt_in_source().filter(|_| coursier::is_plain_http(repo.fetch_url())),
                 notes,
             }
         })
@@ -276,6 +281,9 @@ pub fn render(e: &Explanation) -> String {
             None => {
                 let _ = writeln!(out, "{pad}credentials: none");
             }
+        }
+        if let Some(source) = &r.insecure_credentials {
+            let _ = writeln!(out, "{pad}credentials over plain HTTP: allowed  ({source})");
         }
         let proxy = match (&r.proxy, &e.proxy.settings, &r.proxy_error) {
             (_, _, Some(err)) => format!("error: {err}"),
@@ -413,7 +421,11 @@ mod tests {
             Repo {
                 id: "central".into(),
                 url: coursier::CENTRAL_URL.into(),
-                mirror: Some(coursier::Mirror { url: "https://acme.example/remote/".into(), matched: "*".into() }),
+                mirror: Some(coursier::Mirror {
+                    url: "https://acme.example/remote/".into(),
+                    matched: "*".into(),
+                    allow_insecure_credentials: false,
+                }),
                 ..Default::default()
             },
             Repo {
