@@ -644,16 +644,19 @@ fn relocking_through_a_catch_all_mirror_keeps_repository_ids() {
     if !cs_available() || cfg!(windows) {
         return;
     }
-    let world: std::collections::HashMap<String, Vec<u8>> = hello_repo_files(b"world jar")
-        .into_iter()
-        .map(|(p, b)| {
-            (p.replace("hello", "world"), String::from_utf8(b).unwrap().replace("hello", "world").into_bytes())
-        })
-        .collect();
+    let renamed = |name: &str| -> std::collections::HashMap<String, Vec<u8>> {
+        hello_repo_files(format!("{name} jar").as_bytes())
+            .into_iter()
+            .map(|(p, b)| (p.replace("hello", name), String::from_utf8(b).unwrap().replace("hello", name).into_bytes()))
+            .collect()
+    };
     let main = Server::maven(Default::default(), None);
-    let acme = Server::maven(hello_repo_files(b"hello jar"), None);
+    let mut acme_files = hello_repo_files(b"hello jar");
+    acme_files.extend(renamed("world"));
+    let acme = Server::maven(acme_files, None);
     let mut mirrored = moved(hello_repo_files(b"hello jar"), "mirror");
-    mirrored.extend(moved(world, "mirror"));
+    mirrored.extend(moved(renamed("world"), "mirror"));
+    mirrored.extend(moved(renamed("lonely"), "mirror"));
     let mirror = Server::maven(mirrored, None);
     let ws = tempfile::tempdir().unwrap();
     let repos = format!(
@@ -667,15 +670,27 @@ fn relocking_through_a_catch_all_mirror_keeps_repository_ids() {
     assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
 
     // Re-locked through one mirror for both repositories: hello stays acme's, so a restore
-    // without the mirror still finds it; only a new artifact gets the first repository.
-    java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n  com.example:world: '1.0'\n");
+    // without the mirror still finds it. world, new and only in acme (the second repository),
+    // is looked up behind the mirror and recorded as acme's, as it would be without the mirror.
+    let deps = "dependencies:\n  com.example:hello: '1.0'\n  com.example:world: '1.0'\n";
+    java_workspace(ws.path(), &repos, deps);
     let config = ws.path().join("user-config.yaml");
     fs::write(&config, format!("mirrors:\n  - {{url: '{}', mirrorOf: ['*']}}\n", mirror.url("/mirror"))).unwrap();
     scpm(ws.path(), cache.path()).env("SCPM_CONFIG", &config).arg("install").assert().success();
     assert!(mirror.count("/mirror/com/example/world/1.0/world-1.0.pom") > 0, "re-locked through the mirror");
     let locked = lock(ws.path());
     assert_eq!(locked["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
-    assert_eq!(locked["artifacts"]["com.example:world:1.0"]["repo"], "main");
+    assert_eq!(locked["artifacts"]["com.example:world:1.0"]["repo"], "acme");
+    assert!(main.count("/maven/com/example/world/1.0/world-1.0.jar") >= 1, "main was asked first");
+    assert!(acme.count("/maven/com/example/world/1.0/world-1.0.jar") >= 1);
+
+    // An artifact that only the mirror has can't be given any of their ids: an error, no guess.
+    java_workspace(ws.path(), &repos, &format!("{deps}  com.example:lonely: '1.0'\n"));
+    let err = stderr_of(scpm(ws.path(), cache.path()).env("SCPM_CONFIG", &config).arg("install"));
+    assert!(err.contains("com.example:lonely:1.0") && err.contains("`main`, `acme`"), "{err}");
+    assert!(err.contains("`main`: not found; `acme`: not found"), "{err}");
+    assert!(err.contains("scope the mirror with `mirrorOf` ids"), "{err}");
+    assert!(lock(ws.path())["artifacts"].get("com.example:lonely:1.0").is_none());
 }
 
 #[test]
