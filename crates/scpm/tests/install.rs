@@ -718,6 +718,28 @@ fn an_internal_name_found_in_a_public_repository_is_not_locked() {
 }
 
 #[test]
+fn a_public_name_served_by_a_grouped_repository_is_not_locked() {
+    if !cs_available() || cfg!(windows) {
+        return;
+    }
+    // acme is for com.acme, but its URL is a combined one that also proxies public artifacts.
+    let public = Server::maven(Default::default(), None);
+    let acme = Server::maven(hello_repo_files(b"hello jar"), None);
+    let ws = tempfile::tempdir().unwrap();
+    let repos = format!(
+        "repositories:\n  - {{id: public, url: '{}'}}\n  - {{id: acme, url: '{}', groups: [com.acme]}}\n",
+        public.url("/maven"),
+        acme.url("/maven")
+    );
+    java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
+    let err = stderr_of(scpm(ws.path(), tempfile::tempdir().unwrap().path()).arg("install"));
+    assert!(err.contains("com.example:hello:1.0 was served by repository `acme`"), "{err}");
+    assert!(err.contains("may only come from the repositories without `groups` (`public`)"), "{err}");
+    assert!(err.contains("internal-only repository URL") && err.contains("mirror of `central`"), "{err}");
+    assert!(!ws.path().join("scpm-lock.yaml").exists(), "nothing was locked");
+}
+
+#[test]
 fn groups_keep_internal_artifacts_away_from_other_repositories() {
     if !cs_available() || cfg!(windows) {
         return;

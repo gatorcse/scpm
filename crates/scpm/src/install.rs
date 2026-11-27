@@ -841,8 +841,8 @@ fn resolve_concurrently<'a>(
 /// sha256; its `repo` is a hint for restores (design §5.4), derived from where coursier
 /// downloaded the file among the repositories allowed for its group: an existing entry keeps
 /// its id if that is still one of them (repositories sharing a mirror can't be told apart by
-/// URL), else the first of them in declared order, else (the file came from a repository its
-/// group isn't restored from) the first repository allowed for the group. An existing entry
+/// URL), else the first of them in declared order. A file that came from a repository its group
+/// may not come from (either way `groups` route) is refused, and nothing is locked. An existing entry
 /// keeps its sha256 and size (artifacts are immutable) only if the resolved file has them: the
 /// lock doesn't record repository URLs, so a repository whose URL changed under the same id
 /// must be checked like one with a new id.
@@ -881,10 +881,28 @@ fn record_artifacts<'a>(
                 ids = ids.join(", "),
             )));
         }
+        if allowed.is_empty() {
+            return Err(InstallError::Resolve(format!("{}: {}", a.key, coursier::no_repository_for(group))));
+        }
+        // `groups` route both ways: a group no rule covers comes only from repositories without
+        // `groups`, so bytes a grouped repository served for it (a combined URL that also proxies
+        // Central) are not locked under another repository's name.
+        if candidates.is_empty() {
+            let ids: Vec<String> = allowed.iter().map(|r| format!("`{}`", r.id)).collect();
+            return Err(InstallError::Resolve(format!(
+                "{key} was served by repository `{from}` ({url}), which has `groups`, but group `{group}` is covered by \
+                 no `groups` rule, so it may only come from the repositories without `groups` ({ids}); it is not locked\n  \
+                 help: point `{from}` at the internal-only repository URL (such as …/repository/acme-releases/), not a \
+                 combined one that also proxies Central; to reach Central through the company server, add a mirror of \
+                 `central` (in the user config)",
+                key = a.key,
+                from = source.id,
+                url = a.url,
+                ids = ids.join(", "),
+            )));
+        }
         let kept = lock.artifacts.get(&a.key).and_then(|e| candidates.iter().find(|r| r.id == e.repo));
-        let repo = kept.or(candidates.first()).or(allowed.first()).copied().ok_or_else(|| {
-            InstallError::Resolve(format!("{}: {}", a.key, coursier::no_repository_for(coursier::group_of(&a.key))))
-        })?;
+        let repo = kept.or(candidates.first()).copied().expect("candidates is not empty");
         let path = coursier::maven_path(&a.key)
             .ok_or_else(|| InstallError::Resolve(format!("coursier resolved an invalid artifact key `{}`", a.key)))?;
         let expected = format!("{}{path}", source.fetch_url());
@@ -1349,10 +1367,15 @@ mod tests {
         assert!(err.contains("com.acme:x:1 was found in repository `public`"), "{err}");
         assert!(err.contains("may only come from `acme`") && err.contains("dependency confusion"), "{err}");
         assert!(lock.artifacts.is_empty());
-        // An uncovered group served by a repository with `groups` (one proxying Central) is
-        // recorded as the repository it may come from.
-        record_artifacts(&mut lock, &[from("acme", "org.x:y:1", "org/x/y/1/y-1.jar")], &repos).unwrap();
-        assert_eq!(lock.artifacts["org.x:y:1"].repo, "public");
+        // The other direction: an uncovered group served by a repository with `groups` (a combined
+        // URL that also proxies Central) is refused too, not relabelled.
+        let err = record_artifacts(&mut lock, &[from("acme", "org.x:y:1", "org/x/y/1/y-1.jar")], &repos)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("org.x:y:1 was served by repository `acme`"), "{err}");
+        assert!(err.contains("may only come from the repositories without `groups` (`public`)"), "{err}");
+        assert!(err.contains("internal-only repository URL") && err.contains("mirror of `central`"), "{err}");
+        assert!(lock.artifacts.is_empty());
     }
 
     #[test]
@@ -1535,7 +1558,7 @@ mod tests {
         // mirror that misses there asks the others (no lookup, no error).
         record_artifacts(&mut lock, &[via_mirror("g:z:1", "g/z/1/z-1.jar")], &repos).unwrap();
         assert_eq!(lock.artifacts["g:z:1"], ArtifactLock { repo: "central".into(), sha256: sha256.clone(), size });
-        // `groups` decide among the sharers, and over where the bytes came from.
+        // `groups` decide among the sharers of one mirror.
         let grouped = vec![repos[0].clone(), Repo { groups: vec!["com.acme".into()], ..repos[1].clone() }];
         record_artifacts(&mut lock, &[via_mirror("com.acme:w:1", "com/acme/w/1/w-1.jar")], &grouped).unwrap();
         assert_eq!(lock.artifacts["com.acme:w:1"].repo, "acme");
