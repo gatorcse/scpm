@@ -14,8 +14,13 @@ Status: design exploration. Nothing is implemented yet.
 
 Milestones land as a stack of PRs; see [docs/roadmap.md](docs/roadmap.md).
 
-- **M1 (this PR stack's base):** the Rust CLI, config model and module graph:
+- **M1:** the Rust CLI, config model and module graph:
   `scpm ls`, `scpm config`, `scpm graph`, `scpm schema`, and `-F` filters.
+- **M2:** dependencies: `scpm install [--frozen]` locks every variant into
+  `scpm-lock.yaml` with coursier (joint resolution, ranges, catalog selections, BOMs,
+  exclusions, compiler boot closures) and restores locked jars into the coursier cache with
+  the Rust fetcher; `scpm why`, `scpm classpath`. Needs the native coursier CLI (`cs`) on
+  `PATH` (or `SCPM_CS`); the network tests in `tests/install.rs` skip without it.
 
 ## Development
 

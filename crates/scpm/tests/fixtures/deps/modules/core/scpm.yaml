@@ -1,0 +1,8 @@
+dependencies:
+  util: workspace:*
+  io.circe::circe-core: ^0.14.10
+  com.google.guava:guava:
+    version: 33.4.0-jre
+    exclude: [com.google.code.findbugs:jsr305, 'org.checkerframework:*']
+testDependencies:
+  org.scalameta::munit: catalog

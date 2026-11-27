@@ -1,0 +1,7 @@
+name: javadeps
+scala: none
+dependencies:
+  org.slf4j:slf4j-api: 2.0.17
+  com.google.guava:guava:
+    version: 33.4.0-jre
+    exclude: ['com.google.code.findbugs:jsr305', 'org.checkerframework:*', 'com.google.errorprone:*', 'com.google.j2objc:*']

@@ -1,0 +1,10 @@
+modules: ['modules/*']
+toolchain:
+  scala: catalog
+catalog:
+  scala: 3.9.0
+  org.typelevel::cats-core: ^2.12.0
+  org.scalameta::munit: 1.2.1
+catalogs:
+  scala213:
+    scala: 2.13.18

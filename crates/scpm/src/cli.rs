@@ -11,6 +11,8 @@ use crate::config::{ModuleFile, WorkspaceFile};
 use crate::diag::Diagnostics;
 use crate::filter;
 use crate::graph::Graph;
+use crate::install::{self, ClasspathKind, InstallOptions, InstallSummary};
+use crate::lockfile::Lockfile;
 use crate::workspace::{self, Workspace};
 
 #[derive(Debug, Parser)]
@@ -43,6 +45,26 @@ pub enum Command {
     Graph {
         #[arg(long, value_enum, default_value_t = GraphFormat::Text)]
         format: GraphFormat,
+    },
+    /// Lock stale variants and restore every locked artifact into the coursier cache.
+    Install {
+        /// Fail if the lockfile is out of date instead of updating it (default when CI=true).
+        #[arg(long)]
+        frozen: bool,
+        /// Re-hash cached artifacts against the lock and re-download any that don't match.
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Explain why an artifact is on the classpath (`org::name`, `org:name_3` or `name`).
+    Why { artifact: String },
+    /// Print a variant's classpath (installs first if the lockfile is stale).
+    Classpath {
+        /// Variant id, e.g. `core@jvm-3`, or a module with a single variant.
+        target: String,
+        #[arg(long, value_enum, default_value_t = ClasspathKind::Compile)]
+        kind: ClasspathKind,
+        #[arg(long)]
+        frozen: bool,
     },
     /// Print the JSON Schema of a configuration file.
     Schema {
@@ -95,6 +117,14 @@ pub fn main() -> ExitCode {
             report_write_error(e);
             ExitCode::FAILURE
         }
+        Err(Failure::Command(message)) => {
+            if json {
+                let _ = print_json(&serde_json::json!({"ok": false, "error": {"kind": "command", "message": message}}));
+            } else {
+                eprintln!("error: {message}");
+            }
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -109,8 +139,16 @@ fn report_write_error(e: io::Error) {
 enum Failure {
     Config(Diagnostics),
     Usage(String),
+    /// The command ran and failed (resolution, download, stale lock): exit code 1.
+    Command(String),
     /// Writing to stdout failed.
     Output(io::Error),
+}
+
+impl From<install::InstallError> for Failure {
+    fn from(e: install::InstallError) -> Self {
+        Failure::Command(e.to_string())
+    }
 }
 
 impl From<io::Error> for Failure {
@@ -182,6 +220,77 @@ fn run(cli: Cli) -> Result<(), Failure> {
             }
             Ok(())
         }
+        Command::Install { frozen, verify } => {
+            let (ws, graph) = load(&start)?;
+            let summary = install::install(&ws, &graph, InstallOptions { frozen: frozen || in_ci(), verify })?;
+            if cli.json {
+                print_json(&summary)?;
+            } else {
+                print_install_summary(&summary)?;
+            }
+            Ok(())
+        }
+        Command::Why { artifact } => {
+            let (ws, graph) = load(&start)?;
+            let lock = ensure_installed(&ws, &graph, false)?;
+            let selected: Vec<String> =
+                filter::select(&ws, &graph, &cli.filter, &invocation_dir(&start)?)?.into_iter().collect();
+            let report = crate::why::why(&ws, &graph, &lock, &artifact, &selected)?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                let mut out = io::stdout().lock();
+                if report.paths.is_empty() && report.unexplained.is_empty() {
+                    writeln!(out, "`{artifact}` is not on any selected classpath")?;
+                }
+                for p in &report.paths {
+                    let via =
+                        if p.declared_by == p.variant { String::new() } else { format!(" (via {})", p.declared_by) };
+                    writeln!(out, "{}{via}: {}", p.variant, p.chain.join(" → "))?;
+                }
+                for u in &report.unexplained {
+                    writeln!(
+                        out,
+                        "{}: {} is on the classpath, but coursier reported no dependency chain to it",
+                        u.variant,
+                        u.artifacts.join(", ")
+                    )?;
+                }
+                out.flush()?;
+            }
+            Ok(())
+        }
+        Command::Classpath { target, kind, frozen } => {
+            let (ws, graph) = load(&start)?;
+            let cwd = invocation_dir(&start)?;
+            let mut selected = filter::select(&ws, &graph, std::slice::from_ref(&target), &cwd)?;
+            // The global `-F` selectors narrow what the target may name.
+            if !cli.filter.is_empty() {
+                let allowed = filter::select(&ws, &graph, &cli.filter, &cwd)?;
+                selected.retain(|id| allowed.contains(id));
+                if selected.is_empty() {
+                    return Err(Failure::Usage(format!("`{target}` is excluded by --filter")));
+                }
+            }
+            let [id] = selected.iter().collect::<Vec<_>>()[..] else {
+                return Err(Failure::Usage(format!(
+                    "`{target}` matches {} variants; name one: {}",
+                    selected.len(),
+                    selected.iter().cloned().collect::<Vec<_>>().join(", ")
+                )));
+            };
+            let lock = ensure_installed(&ws, &graph, frozen)?;
+            let files = install::classpath_files(&ws, &lock, id, kind)?;
+            if cli.json {
+                print_json(&files)?;
+            } else {
+                let sep = if cfg!(windows) { ";" } else { ":" };
+                let mut out = io::stdout().lock();
+                writeln!(out, "{}", files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(sep))?;
+                out.flush()?;
+            }
+            Ok(())
+        }
         Command::Graph { format } => {
             let (ws, graph) = load(&start)?;
             let selected = filter::select(&ws, &graph, &cli.filter, &invocation_dir(&start)?)?;
@@ -247,6 +356,79 @@ fn load(start: &std::path::Path) -> Result<(Workspace, Graph), Failure> {
     let ws = workspace::load(start)?;
     let graph = Graph::build(&ws)?;
     Ok((ws, graph))
+}
+
+/// Install-before-run (design §5.4): re-lock and fetch as needed (frozen in CI), then read the lock.
+fn ensure_installed(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<Lockfile, Failure> {
+    let summary = install::install(ws, graph, InstallOptions { frozen: frozen || in_ci(), verify: false })?;
+    for w in &summary.warnings {
+        eprintln!("warning: {w}");
+    }
+    if !summary.relocked.is_empty() || summary.fetch.downloaded > 0 {
+        eprintln!("installed: {} re-locked, {} downloaded", summary.relocked.len(), summary.fetch.downloaded);
+    }
+    Lockfile::read(&ws.root)
+        .map_err(|e| Failure::Command(e.to_string()))?
+        .ok_or_else(|| Failure::Command("no scpm-lock.yaml; run `scpm install`".into()))
+}
+
+/// CI mode (implied `--frozen`) is `CI=true` (any case: AppVeyor sets `True`).
+fn in_ci() -> bool {
+    std::env::var("CI").is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+fn print_install_summary(s: &InstallSummary) -> io::Result<()> {
+    for w in &s.warnings {
+        eprintln!("warning: {w}");
+    }
+    let mut out = io::stdout().lock();
+    let removed = if s.removed.is_empty() { String::new() } else { format!("removed {}", s.removed.join(", ")) };
+    if !s.relocked.is_empty() || !s.boot_relocked.is_empty() {
+        let mut what = Vec::new();
+        if !s.relocked.is_empty() {
+            what.push(format!("{} variant{}", s.relocked.len(), if s.relocked.len() == 1 { "" } else { "s" }));
+        }
+        if !s.boot_relocked.is_empty() {
+            what.push(format!(
+                "{} boot entr{}",
+                s.boot_relocked.len(),
+                if s.boot_relocked.len() == 1 { "y" } else { "ies" }
+            ));
+        }
+        writeln!(
+            out,
+            "Resolved {} in {:.1}s{}{}",
+            what.join(" and "),
+            s.resolve_ms as f64 / 1000.0,
+            if removed.is_empty() { String::new() } else { format!("; {removed}") },
+            if s.lockfile_written { "; wrote scpm-lock.yaml" } else { "" }
+        )?;
+    } else if s.lockfile_written {
+        if removed.is_empty() {
+            writeln!(out, "Lockfile updated")?;
+        } else {
+            writeln!(out, "Lockfile updated ({removed})")?;
+        }
+    } else {
+        writeln!(out, "Lockfile up to date ({} variants)", s.up_to_date)?;
+    }
+    if s.fetch.verified > 0 {
+        writeln!(out, "Verified {} cached artifacts; {} re-downloaded", s.fetch.verified, s.fetch.repaired)?;
+    }
+    if s.fetch.downloaded > 0 {
+        writeln!(
+            out,
+            "Downloaded {} artifact{} ({:.1} MB) in {:.1}s; {} already cached",
+            s.fetch.downloaded,
+            if s.fetch.downloaded == 1 { "" } else { "s" },
+            s.fetch.bytes as f64 / 1_000_000.0,
+            s.fetch_ms as f64 / 1000.0,
+            s.fetch.present
+        )?;
+    } else {
+        writeln!(out, "All {} artifacts cached", s.fetch.present)?;
+    }
+    out.flush()
 }
 
 fn print_json<T: Serialize + ?Sized>(value: &T) -> io::Result<()> {

@@ -187,6 +187,43 @@ fn unmatched_filter_is_a_usage_error() {
 }
 
 #[test]
+fn a_coordinate_has_one_version_across_scopes() {
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", "modules: ['modules/*']\ntoolchain:\n  scala: 3.9.0\n"),
+        (
+            "modules/a/scpm.yaml",
+            "dependencies:\n  org.typelevel::cats-core: 2.13.0\n  g:same: '1.0'\n\
+             testDependencies:\n  org.typelevel::cats-core: 2.12.0\n  g:same: '1.0'\n",
+        ),
+    ]);
+    let out = scpm(dir.path()).arg("ls").assert().code(2).get_output().stderr.clone();
+    let err = String::from_utf8_lossy(&out);
+    assert!(err.contains("modules/a/scpm.yaml"), "{err}");
+    assert!(
+        err.contains("`org.typelevel::cats-core` is declared with different versions")
+            && err.contains("`dependencies.org.typelevel::cats-core`")
+            && err.contains("testDependencies.org.typelevel::cats-core"),
+        "{err}"
+    );
+    assert!(err.contains("use one version in every scope"), "{err}");
+    assert!(!err.contains("g:same"), "the same version in two scopes is fine: {err}");
+}
+
+#[test]
+fn classpath_targets_respect_the_global_filter() {
+    // Both checks fail before anything is installed, so no coursier or network is needed.
+    scpm(&fixture("basic"))
+        .args(["classpath", "core@jvm-3", "-F", "!core"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("`core@jvm-3` is excluded by --filter"));
+    // The filter narrows an ambiguous target to one variant, which then needs a lock (frozen in CI).
+    scpm(&fixture("basic")).args(["classpath", "core", "-F", "!*@*-2.13"]).env("CI", "true").assert().code(1).stderr(
+        predicate::str::contains("scpm-lock.yaml is out of date").and(predicate::str::contains("matches").not()),
+    );
+}
+
+#[test]
 fn single_module_project_without_workspace_file() {
     let dir = workspace(&[("scpm.yaml", "name: solo\nscala: '2.13.18'\n")]);
     assert_eq!(stdout(dir.path(), &["ls"]), "solo@jvm-2.13  .\n");
