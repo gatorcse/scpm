@@ -868,15 +868,34 @@ fn record_artifacts<'a>(
         let group = coursier::group_of(&a.key);
         // A group restricted by `groups` that `cs` found elsewhere (its own repository lacks it):
         // locking those bytes would let a public repository supply an internal name.
+        // When the bytes came through a user config mirror, that mirror (one machine's setting) is
+        // what to fix, not the repository's URL in the workspace.
+        let via = source.mirror.as_ref().map(|m| format!(" through the user config mirror {}", m.url));
         if candidates.is_empty() && coursier::group_is_restricted(repos, group) {
             let ids: Vec<String> = allowed.iter().map(|r| format!("`{}`", r.id)).collect();
+            let help = match &source.mirror {
+                Some(m) => format!(
+                    "the copy came from the user config mirror {m_url}, which `{from}` is reached through on this \
+                     machine; if that URL serves more than `{from}` (a combined group), point the mirror at one that \
+                     serves only `{from}`, or don't mirror `{from}` with it; otherwise publish it to {ids}",
+                    m_url = m.url,
+                    from = source.id,
+                    ids = ids.join(", "),
+                ),
+                None => format!(
+                    "publish it to {ids}, or check the version; if `{from}` is meant to serve it, add the group to that \
+                     repository's `groups`",
+                    ids = ids.join(", "),
+                    from = source.id,
+                ),
+            };
             return Err(InstallError::Resolve(format!(
-                "{key} was found in repository `{from}` ({url}), but group `{group}` may only come from {ids}, which \
-                 didn't have it; it is not locked, since a copy of an internal name in another repository may be \
-                 dependency confusion\n  help: publish it to {ids}, or check the version; if `{from}` is meant to serve \
-                 it, add the group to that repository's `groups`",
+                "{key} was found in repository `{from}`{via} ({url}), but group `{group}` may only come from {ids}, \
+                 which didn't have it; it is not locked, since a copy of an internal name in another repository may be \
+                 dependency confusion\n  help: {help}",
                 key = a.key,
                 from = source.id,
+                via = via.as_deref().unwrap_or_default(),
                 url = a.url,
                 ids = ids.join(", "),
             )));
@@ -889,14 +908,29 @@ fn record_artifacts<'a>(
         // Central) are not locked under another repository's name.
         if candidates.is_empty() {
             let ids: Vec<String> = allowed.iter().map(|r| format!("`{}`", r.id)).collect();
+            let help = match &source.mirror {
+                Some(m) => format!(
+                    "`{from}` is reached through the user config mirror {m_url} on this machine, and that URL also \
+                     serves public artifacts: point the mirror at an internal-only URL (such as \
+                     …/repository/acme-releases/), or don't mirror `{from}` with it; to reach Central through the \
+                     company server, mirror `central` instead",
+                    m_url = m.url,
+                    from = source.id,
+                ),
+                None => format!(
+                    "point `{from}` at the internal-only repository URL (such as …/repository/acme-releases/), not a \
+                     combined one that also proxies Central; to reach Central through the company server, add a mirror \
+                     of `central` (in the user config)",
+                    from = source.id,
+                ),
+            };
             return Err(InstallError::Resolve(format!(
-                "{key} was served by repository `{from}` ({url}), which has `groups`, but group `{group}` is covered by \
-                 no `groups` rule, so it may only come from the repositories without `groups` ({ids}); it is not locked\n  \
-                 help: point `{from}` at the internal-only repository URL (such as …/repository/acme-releases/), not a \
-                 combined one that also proxies Central; to reach Central through the company server, add a mirror of \
-                 `central` (in the user config)",
+                "{key} was served by repository `{from}`{via} ({url}), which has `groups`, but group `{group}` is \
+                 covered by no `groups` rule, so it may only come from the repositories without `groups` ({ids}); it is \
+                 not locked\n  help: {help}",
                 key = a.key,
                 from = source.id,
+                via = via.as_deref().unwrap_or_default(),
                 url = a.url,
                 ids = ids.join(", "),
             )));
@@ -1375,6 +1409,35 @@ mod tests {
         assert!(err.contains("org.x:y:1 was served by repository `acme`"), "{err}");
         assert!(err.contains("may only come from the repositories without `groups` (`public`)"), "{err}");
         assert!(err.contains("internal-only repository URL") && err.contains("mirror of `central`"), "{err}");
+        assert!(lock.artifacts.is_empty());
+
+        // The same through a user config mirror: the mirror, one machine's setting, is to blame,
+        // not the repository's URL in the workspace.
+        let mirror = |url: &str| {
+            Some(coursier::Mirror { url: url.into(), matched: "acme".into(), allow_insecure_credentials: false })
+        };
+        let mirrored =
+            vec![repos[0].clone(), Repo { mirror: mirror("https://nexus.example/group/"), ..repos[1].clone() }];
+        let err = record_artifacts(&mut lock, &[from("nexus", "org.x:y:1", "group/org/x/y/1/y-1.jar")], &mirrored)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("served by repository `acme` through the user config mirror https://nexus.example/group/"),
+            "{err}"
+        );
+        assert!(
+            err.contains("point the mirror at an internal-only URL") && err.contains("don't mirror `acme`"),
+            "{err}"
+        );
+        assert!(!err.contains("point `acme` at"), "the workspace URL is fine: {err}");
+        let mirrored =
+            vec![Repo { mirror: mirror("https://nexus.example/group/"), ..repos[0].clone() }, repos[1].clone()];
+        let err =
+            record_artifacts(&mut lock, &[from("nexus", "com.acme:x:1", "group/com/acme/x/1/x-1.jar")], &mirrored)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("found in repository `public` through the user config mirror"), "{err}");
+        assert!(err.contains("dependency confusion") && err.contains("don't mirror `public` with it"), "{err}");
         assert!(lock.artifacts.is_empty());
     }
 

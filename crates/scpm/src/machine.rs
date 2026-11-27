@@ -226,6 +226,13 @@ impl Machine {
                 err(format!("{key}.url"), "a mirror URL can't have a query or fragment (`?`, `#`)".to_string());
                 continue;
             }
+            if m.allow_insecure_credentials && !coursier::is_plain_http(&m.url) {
+                err(
+                    format!("{key}.allowInsecureCredentials"),
+                    "only applies to an http:// mirror; an https:// one gets credentials without it".to_string(),
+                );
+                continue;
+            }
             if m.mirror_of.is_empty() || m.mirror_of.iter().any(|p| p.trim().is_empty()) {
                 err(format!("{key}.mirrorOf"), "list repository ids, URL prefixes, or `*`".to_string());
                 continue;
@@ -1032,6 +1039,19 @@ mod tests {
         );
         let err = m.unwrap_err().to_string();
         assert!(err.contains("mirrors[1].url") && err.contains("query or fragment"), "{err}");
+        // The opt-in only means something for an http:// mirror.
+        let err =
+            machine("mirrors:\n  - {url: 'https://h.example/m/', mirrorOf: ['*'], allowInsecureCredentials: true}\n")
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("mirrors[0].allowInsecureCredentials") && err.contains("only applies to an http:// mirror"),
+            "{err}"
+        );
+        assert!(
+            machine("mirrors:\n  - {url: 'http://h.example/m/', mirrorOf: ['*'], allowInsecureCredentials: true}\n")
+                .is_ok()
+        );
         let m =
             machine("mirrors:\n  - {url: 'https://h.example/releases/', mirrorOf: ['https://h.example/Releases/']}\n")
                 .unwrap();
