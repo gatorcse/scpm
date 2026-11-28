@@ -9,7 +9,7 @@ use std::time::Instant;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::coord::Coord;
+use crate::coord::{Coord, CrossKind};
 use crate::coursier::{self, Auth, Repo, ResolveRequest, ResolvedArtifact};
 use crate::credentials::CoursierCredentials;
 use crate::fetch::{self, FetchItem, FetchOptions, FetchReport};
@@ -147,6 +147,29 @@ impl ClasspathKind {
     }
 }
 
+/// Upstream workspace variants on a classpath by dependency distance from `id` (direct ones
+/// first), ties broken by id.
+fn upstream_by_distance(graph: &Graph, id: &str, kind: ClasspathKind) -> Vec<String> {
+    let mut dist: BTreeMap<String, usize> = BTreeMap::new();
+    let mut queue: std::collections::VecDeque<(String, usize)> =
+        graph.dependencies_of(id).filter(|e| kind.own_scopes().contains(&e.scope)).map(|e| (e.to.clone(), 1)).collect();
+    while let Some((next, d)) = queue.pop_front() {
+        if dist.contains_key(&next) {
+            continue;
+        }
+        dist.insert(next.clone(), d);
+        queue.extend(
+            graph
+                .dependencies_of(&next)
+                .filter(|e| kind.upstream_scopes().contains(&e.scope))
+                .map(|e| (e.to.clone(), d + 1)),
+        );
+    }
+    let mut ids: Vec<(usize, String)> = dist.into_iter().map(|(id, d)| (d, id)).collect();
+    ids.sort();
+    ids.into_iter().map(|(_, id)| id).collect()
+}
+
 /// Upstream workspace variants on a classpath, in dependency order.
 pub fn upstream_variants(graph: &Graph, id: &str, kind: ClasspathKind) -> Vec<String> {
     let mut found = BTreeSet::new();
@@ -217,7 +240,7 @@ struct VariantInputs<'a> {
     scala: Option<&'a str>,
     dependencies: Vec<DependencyInput<'a>>,
     compiler_plugins: Vec<DependencyInput<'a>>,
-    boms: Vec<String>,
+    boms: Vec<DependencyInput<'a>>,
     workspace_dependencies: Vec<(&'a Scope, &'a str)>,
 }
 
@@ -230,7 +253,7 @@ struct UpstreamInputs<'a> {
     platform: Platform,
     scala: Option<&'a str>,
     dependencies: Vec<DependencyInput<'a>>,
-    boms: Vec<String>,
+    boms: Vec<DependencyInput<'a>>,
 }
 
 #[derive(Serialize)]
@@ -238,7 +261,9 @@ struct DependencyInput<'a> {
     scope: Scope,
     coord: String,
     /// The spec as written: it decides how the version is selected (a plain range reuses the
-    /// variant's selection, `catalog` the workspace's), even when the effective range is equal.
+    /// variant's selection, `catalog` the workspace's), even when the effective range is equal;
+    /// `catalog:a` and `catalog:b` may also hold the same range but have different locked
+    /// selections, so switching between them must re-lock.
     spec: &'a str,
     version: String,
     exclude: &'a [String],
@@ -269,7 +294,7 @@ fn variant_inputs(v: &Variant) -> VariantInputs<'_> {
         scala: v.scala.as_ref().map(|s| s.full.as_str()),
         dependencies: v.dependencies.iter().map(DependencyInput::from).collect(),
         compiler_plugins: v.compiler_plugins.iter().map(DependencyInput::from).collect(),
-        boms: v.boms.iter().map(|b| b.to_string()).collect(),
+        boms: v.boms.iter().map(DependencyInput::from).collect(),
         workspace_dependencies: v.workspace_dependencies.iter().map(|d| (&d.scope, d.module.as_str())).collect(),
     }
 }
@@ -285,7 +310,7 @@ fn upstream_inputs(v: &Variant) -> UpstreamInputs<'_> {
             .filter(|d| matches!(d.scope, Scope::Compile | Scope::Runtime))
             .map(DependencyInput::from)
             .collect(),
-        boms: v.boms.iter().map(|b| b.to_string()).collect(),
+        boms: v.boms.iter().map(DependencyInput::from).collect(),
     }
 }
 
@@ -317,9 +342,21 @@ fn inputs_hash(ws: &Workspace, graph: &Graph, v: &Variant, repos: &[Repo], ctx: 
         })
         .collect();
     let overrides: Vec<String> = ws.config.overrides.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+    // Which upstream BOM wins depends on dependency distance, so a topology change that
+    // reorders the BOM owners must re-lock even when the upstream set is the same.
+    let bom_owners: Vec<Vec<String>> = ClasspathKind::ALL
+        .iter()
+        .map(|k| {
+            upstream_by_distance(graph, &v.id, *k)
+                .into_iter()
+                .filter(|id| ws.variant(id).is_some_and(|u| !u.boms.is_empty()))
+                .collect()
+        })
+        .collect();
     sha256_json(&serde_json::json!({
         "variant": variant_inputs(v),
         "upstream": upstream,
+        "bomOwners": bom_owners,
         "overrides": overrides,
         "repositories": repo_inputs(repos),
         "context": ctx,
@@ -408,11 +445,64 @@ impl Selector<'_> {
     }
 }
 
-/// `<catalog>/<key>@<platform>-<scala binary>` for catalog references, else `None`.
+/// `<catalog>/<key>@<platform>-<scala binary>` for catalog references, else `None`. A Java
+/// coordinate (`org:name`) names the same artifact on every Scala version, so it gets one
+/// selection per platform (`@<platform>-java`).
 fn catalog_key(variant: &Variant, dep: &Dependency) -> Option<String> {
     let VersionSpec::Catalog { catalog } = VersionSpec::parse(&dep.spec) else { return None };
-    let binary = variant.scala.as_ref().map(|s| s.binary.as_str()).unwrap_or("java");
+    let binary = match &variant.scala {
+        Some(s) if dep.coord.cross != CrossKind::Java => s.binary.as_str(),
+        _ => "java",
+    };
     Some(format!("{}/{}@{}-{binary}", catalog.as_deref().unwrap_or("default"), dep.coord, variant.platform))
+}
+
+/// Locks written before Java coordinates shared one catalog selection keyed them by the
+/// variant's Scala version. Moves such selections to the shared key (when it has none yet), so
+/// they survive pruning and are honoured: a range is never re-selected implicitly (§5.5).
+///
+/// Legacy selections of one coordinate for different Scala versions can disagree. They can't
+/// all survive under one shared key, so the first (in variant order) is kept and the others
+/// are named in a warning: those variants move to the shared version on their next re-lock.
+fn migrate_catalog_keys(ws: &Workspace, catalogs: &mut BTreeMap<String, CatalogSelection>, warnings: &mut Vec<String>) {
+    let mut migrated: BTreeMap<String, String> = BTreeMap::new();
+    for v in ws.variants() {
+        for dep in versioned(v) {
+            let (Some(key), Some(legacy)) = (catalog_key(v, dep), legacy_catalog_key(v, dep)) else { continue };
+            let Some(sel) = catalogs.get(&legacy).cloned() else { continue };
+            match catalogs.get(&key) {
+                None => {
+                    catalogs.insert(key.clone(), sel);
+                    migrated.insert(key, legacy);
+                }
+                // Also when the shared key came from elsewhere (e.g. a Java-only module): the
+                // legacy selection is about to be pruned either way.
+                Some(shared) if shared.version != sel.version => {
+                    let warning = format!(
+                        "{}: the lock selected {} for {} (`{legacy}`) and {} (`{}`); Java coordinates now share one selection, so {} moves to {} when it re-locks",
+                        dep.coord,
+                        sel.version,
+                        v.id,
+                        shared.version,
+                        migrated.get(&key).unwrap_or(&key),
+                        v.id,
+                        shared.version
+                    );
+                    if !warnings.contains(&warning) {
+                        warnings.push(warning);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// The pre-sharing catalog key of a Java coordinate in a Scala variant, if it differs.
+fn legacy_catalog_key(variant: &Variant, dep: &Dependency) -> Option<String> {
+    let VersionSpec::Catalog { catalog } = VersionSpec::parse(&dep.spec) else { return None };
+    let scala = variant.scala.as_ref().filter(|_| dep.coord.cross == CrossKind::Java)?;
+    Some(format!("{}/{}@{}-{}", catalog.as_deref().unwrap_or("default"), dep.coord, variant.platform, scala.binary))
 }
 
 fn artifact_name(variant: &Variant, coord: &Coord) -> String {
@@ -467,14 +557,25 @@ pub(crate) fn classpath_request(
     version_of: &mut VersionOf<'_>,
 ) -> Result<ResolveRequest, InstallError> {
     let mut req = ResolveRequest { jdk_version: Some(jdk.to_string()), ..Default::default() };
-    let mut boms: BTreeSet<String> = v.boms.iter().map(|b| bom_string(v, b)).collect();
     for dep in v.dependencies.iter().filter(|d| kind.own_scopes().contains(&d.scope)) {
         let version = version_of(v, dep)?;
         add_dependency(&mut req, v, dep, &version);
     }
-    for up_id in upstream_variants(graph, &v.id, kind) {
+    let upstreams = upstream_variants(graph, &v.id, kind);
+    // One version per BOM coordinate (coursier applies the first `--bom` it is given): the
+    // variant's own BOM wins, then upstreams by dependency distance (nearest first).
+    let mut boms: Vec<String> = Vec::new();
+    let mut bom_coords = BTreeSet::new();
+    let nearest = upstream_by_distance(graph, &v.id, kind);
+    for owner in std::iter::once(v).chain(nearest.iter().map(|id| ws.variant(id).expect("graph ids are variants"))) {
+        for bom in &owner.boms {
+            if bom_coords.insert(format!("{}:{}", bom.coord.org, artifact_name(owner, &bom.coord))) {
+                boms.push(bom_string(owner, bom, &version_of(owner, bom)?));
+            }
+        }
+    }
+    for up_id in upstreams {
         let up = ws.variant(&up_id).expect("graph ids are variants");
-        boms.extend(up.boms.iter().map(|b| bom_string(up, b)));
         for dep in up.dependencies.iter().filter(|d| kind.upstream_scopes().contains(&d.scope)) {
             let version = version_of(up, dep)?;
             add_dependency(&mut req, up, dep, &version);
@@ -490,7 +591,7 @@ pub(crate) fn classpath_request(
         req.dependencies.insert(0, lib.clone());
         forced.push(lib);
     }
-    req.boms = boms.into_iter().collect();
+    req.boms = boms;
     req.forced = forced;
     Ok(req)
 }
@@ -587,7 +688,8 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     let cache = coursier::cache_dir();
     let ctx = resolution_context(ws);
     let mut warnings = machine.warnings.clone();
-    let previous = read_previous(&ws.root, opts.frozen, &mut warnings)?;
+    let mut previous = read_previous(&ws.root, opts.frozen, &mut warnings)?;
+    migrate_catalog_keys(ws, &mut previous.catalogs, &mut warnings);
 
     let hashes: BTreeMap<String, String> =
         ws.variants().map(|v| (v.id.clone(), inputs_hash(ws, graph, v, &repos, &ctx))).collect();
@@ -650,22 +752,23 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     let mut chosen: HashMap<(String, String), String> = HashMap::new();
     for v in ws.variants() {
         let Some(prev) = previous.variants.get(&v.id) else { continue };
-        for dep in v.dependencies.iter().chain(&v.compiler_plugins) {
+        for dep in versioned(v) {
             // Only plain ranges are seeded: exact versions need no selection (and an edited
             // catalog entry keeps the spec text `catalog`), and catalog ranges are shared
             // through the lock's catalog selections.
             if !matches!(dep.version, VersionSpec::Range { .. }) || catalog_key(v, dep).is_some() {
                 continue;
             }
-            if let Some(Specifier { spec, version: Some(version) }) = prev.specifiers.get(&dep.coord.to_string())
+            let key = specifier_key(v, dep);
+            if let Some(Specifier { spec, version: Some(version) }) = prev.specifiers.get(&key)
                 && spec == &dep.spec
             {
-                chosen.insert((v.id.clone(), dep.coord.to_string()), version.clone());
+                chosen.insert((v.id.clone(), key), version.clone());
             }
         }
     }
     let mut version_of = |owner: &Variant, dep: &Dependency| -> Result<String, InstallError> {
-        let key = (owner.id.clone(), dep.coord.to_string());
+        let key = (owner.id.clone(), specifier_key(owner, dep));
         if let Some(found) = chosen.get(&key) {
             return Ok(found.clone());
         }
@@ -682,9 +785,9 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     for id in &stale {
         let v = ws.variant(id).expect("stale ids come from the workspace");
         let mut specs = BTreeMap::new();
-        for dep in v.dependencies.iter().chain(&v.compiler_plugins) {
+        for dep in versioned(v) {
             let version = version_of(v, dep)?;
-            specs.entry(dep.coord.to_string()).or_insert(Specifier { spec: dep.spec.clone(), version: Some(version) });
+            specs.entry(specifier_key(v, dep)).or_insert(Specifier { spec: dep.spec.clone(), version: Some(version) });
         }
         for wd in &v.workspace_dependencies {
             specs.insert(wd.module.clone(), Specifier { spec: "workspace:*".into(), version: None });
@@ -763,7 +866,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     // Catalog selections: keep those still referenced by some variant.
     let mut used_catalogs = BTreeSet::new();
     for v in ws.variants() {
-        for dep in v.dependencies.iter().chain(&v.compiler_plugins) {
+        for dep in versioned(v) {
             if let (Some(key), VersionSpec::Range { .. }) = (catalog_key(v, dep), &dep.version) {
                 used_catalogs.insert(key);
             }
@@ -842,8 +945,20 @@ fn same_arch(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
-fn bom_string(v: &Variant, bom: &crate::coord::VersionedCoord) -> String {
-    format!("{}:{}:{}", bom.coord.org, artifact_name(v, &bom.coord), bom.version)
+fn bom_string(v: &Variant, bom: &Dependency, version: &str) -> String {
+    format!("{}:{}:{version}", bom.coord.org, artifact_name(v, &bom.coord))
+}
+
+/// Everything in a variant whose version is selected and locked: dependencies, compiler plugins
+/// and BOMs.
+fn versioned(v: &Variant) -> impl Iterator<Item = &Dependency> {
+    v.dependencies.iter().chain(&v.compiler_plugins).chain(&v.boms)
+}
+
+/// The key of `dep`'s entry in its variant's lock `specifiers`: the coordinate, or
+/// `bom:<coordinate>` for a BOM, so a BOM never shares an entry with a dependency.
+pub(crate) fn specifier_key(owner: &Variant, dep: &Dependency) -> String {
+    if owner.boms.iter().any(|b| std::ptr::eq(b, dep)) { format!("bom:{}", dep.coord) } else { dep.coord.to_string() }
 }
 
 pub(crate) fn tempfile_dir() -> Result<tempfile::TempDir, InstallError> {
@@ -1223,6 +1338,22 @@ pub fn classpath_files(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn upstreams_by_distance_not_global_order() {
+        use crate::graph::{Edge, Graph};
+        use crate::workspace::Scope;
+        let e = |from: &str, to: &str| Edge { from: from.into(), to: to.into(), scope: Scope::Compile };
+        // R depends on A and B; B depends on C. A is nearer than C whatever the global order.
+        let graph = Graph {
+            order: vec!["A".into(), "C".into(), "B".into(), "R".into()],
+            edges: vec![e("R", "A"), e("R", "B"), e("B", "C")],
+        };
+        assert_eq!(upstream_by_distance(&graph, "R", ClasspathKind::Compile), vec!["A", "B", "C"]);
+        // The old rule (reversed global order) put C before A.
+        let rev: Vec<String> = upstream_variants(&graph, "R", ClasspathKind::Compile).into_iter().rev().collect();
+        assert_eq!(rev, vec!["B", "C", "A"]);
+    }
     use super::*;
 
     #[test]

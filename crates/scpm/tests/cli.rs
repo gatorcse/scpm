@@ -614,7 +614,7 @@ fn forbidden_keys_inside_variants() {
 #[test]
 fn presets_are_applied_once() {
     let ws = format!(
-        "{WS}presets:\n  base: {{scalacOptions: [-base], boms: ['a:b:1']}}\n  a: {{extends: [base], scalacOptions: [-a]}}\n  b: {{extends: [base, base], scalacOptions: [-b]}}\n"
+        "{WS}presets:\n  base: {{scalacOptions: [-base], boms: {{'a:b': '1'}}}}\n  a: {{extends: [base], scalacOptions: [-a]}}\n  b: {{extends: [base, base], scalacOptions: [-b]}}\n"
     );
     let dir = workspace(&[("scpm-workspace.yaml", &ws), ("modules/m/scpm.yaml", "extends: [a, b, a]\n")]);
     let v = json(dir.path(), &["config", "m"]);
@@ -643,7 +643,8 @@ fn integers_are_valid_versions() {
 
 #[test]
 fn workspace_errors_are_reported_once_in_the_workspace_file() {
-    let ws = "toolchain: {scala: '3.9'}\nmodules: ['modules/*']\nboms: ['nope']\npresets:\n  x: {extends: [missing]}\n";
+    let ws =
+        "toolchain: {scala: '3.9'}\nmodules: ['modules/*']\nboms: {nope: '1'}\npresets:\n  x: {extends: [missing]}\n";
     let dir = workspace(&[
         ("scpm-workspace.yaml", ws),
         ("modules/a/scpm.yaml", "{}\n"),
@@ -653,7 +654,7 @@ fn workspace_errors_are_reported_once_in_the_workspace_file() {
     let err = config_error(dir.path(), &["ls"]);
     once(&err, "scpm-workspace.yaml: toolchain.scala: `3.9` is not a full Scala version");
     once(&err, "is not a full Scala version");
-    once(&err, "scpm-workspace.yaml: boms[0]: invalid coordinate `nope`");
+    once(&err, "scpm-workspace.yaml: boms.nope: invalid coordinate `nope`");
     once(&err, "scpm-workspace.yaml: presets.x.extends: unknown preset `missing`");
     once(&err, "unknown preset");
 }
@@ -1216,4 +1217,74 @@ fn config_explain_shows_machine_settings_and_ignored_sources() {
     // `config` with targets still prints variants.
     let out = scpm(dir.path()).args(["config", "a"]).assert().success().get_output().stdout.clone();
     assert!(String::from_utf8_lossy(&out).contains("a@jvm-3"));
+}
+
+#[test]
+fn bom_versions_resolve_through_catalogs() {
+    let ws = format!(
+        "{WS}catalog:\n  a:bom: '1.0'\ncatalogs:\n  x:\n    b:bom: ^2.0\nboms:\n  a:bom: catalog\n  b:bom: catalog:x\n"
+    );
+    let dir =
+        workspace(&[("scpm-workspace.yaml", &ws), ("modules/m/scpm.yaml", "boms:\n  a:bom: '1.5'\n  c:bom: '3'\n")]);
+    let boms = &json(dir.path(), &["config", "m"])[0]["boms"];
+    // Workspace BOMs first; the module's `a:bom` replaces the workspace one in place.
+    let got: Vec<(String, String, Value)> = boms
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| (b["coord"].as_str().unwrap().into(), b["spec"].as_str().unwrap().into(), b["version"].clone()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("a:bom".into(), "1.5".into(), serde_json::json!({"kind": "exact", "version": "1.5"})),
+            ("b:bom".into(), "catalog:x".into(), serde_json::json!({"kind": "range", "range": "^2.0"})),
+            ("c:bom".into(), "3".into(), serde_json::json!({"kind": "exact", "version": "3"})),
+        ]
+    );
+}
+
+#[test]
+fn bom_errors() {
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", &format!("{WS}catalogs:\n  x: {{}}\n")),
+        ("modules/m/scpm.yaml", "scala: ['3.9.0', '2.13.18']\nboms:\n  a:bom: catalog:nope\n  d:bom: catalog\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    once(&err, "modules/m/scpm.yaml: boms.a:bom: unknown catalog `nope`");
+    once(&err, "modules/m/scpm.yaml: boms.d:bom: `d:bom` is not in the default catalog");
+
+    // The old list form points at the map form.
+    let dir = workspace(&[("scpm-workspace.yaml", WS), ("modules/m/scpm.yaml", "boms:\n  - a:bom:1\n")]);
+    let err = config_error(dir.path(), &["ls"]);
+    assert!(err.contains("`boms` is a map of coordinate to version"), "{err}");
+}
+
+#[test]
+fn java_only_modules_and_scala_boms() {
+    // A workspace `org::name` BOM is skipped for a Java-only module; its own is an error.
+    let ws = format!("{WS}boms:\n  'org.x::s-bom': '1'\n  'org.x:j-bom': '2'\n");
+    let dir = workspace(&[("scpm-workspace.yaml", &ws), ("modules/j/scpm.yaml", "scala: none\n")]);
+    let boms = &json(dir.path(), &["config", "j"])[0]["boms"];
+    assert_eq!(boms.as_array().unwrap().len(), 1, "{boms}");
+    assert_eq!(boms[0]["coord"], "org.x:j-bom");
+
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", WS),
+        ("modules/j/scpm.yaml", "scala: none\nboms:\n  'org.x::s-bom': '1'\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    once(&err, "modules/j/scpm.yaml: boms.org.x::s-bom: `org.x::s-bom` needs a Scala version");
+}
+
+#[test]
+fn workspace_bom_errors_are_reported_once() {
+    let ws = format!("{WS}boms:\n  a:bom: catalog\n");
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", &ws),
+        ("modules/a/scpm.yaml", "{}\n"),
+        ("modules/b/scpm.yaml", "scala: ['3.9.0', '2.13.18']\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    once(&err, "scpm-workspace.yaml: boms.a:bom: `a:bom` is not in the default catalog");
 }

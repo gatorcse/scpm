@@ -11,9 +11,10 @@
       ]
     },
     "boms": {
-      "type": "array",
-      "items": {
-        "type": "string"
+      "description": "BOMs: `org:name: <version>` (exact, a range, `catalog` or `catalog:<name>`).",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Ver"
       }
     },
     "compilerPlugins": {

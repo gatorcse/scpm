@@ -237,6 +237,7 @@ catalog:                         # default catalog → referenced as `catalog`
   org.typelevel::cats-core: 2.13.0
   org.typelevel::cats-effect: ^3.6.0
   org.scalameta::munit: 1.2.1
+  com.fasterxml.jackson:jackson-bom: 2.20.1       # BOMs are catalog entries too (see `boms`)
 
 catalogs:
   scala213:
@@ -244,9 +245,13 @@ catalogs:
     org.typelevel::cats-core: 2.12.0
   spark:
     org.apache.spark::spark-sql: 3.5.1
+  aws:
+    software.amazon.awssdk:bom: ^2.31.0
 
 boms:                            # applied to every module (Maven BOM import semantics via coursier)
-  - com.fasterxml.jackson:jackson-bom:2.20.1
+  com.fasterxml.jackson:jackson-bom: catalog      # coord → spec, like dependencies: exact, range,
+  software.amazon.awssdk:bom: catalog:aws         #   `catalog` or `catalog:<name>` (looked up by the
+  io.netty:netty-bom: 4.1.115.Final               #   BOM's coordinate); the lock pins the version
 
 overrides:                       # forced versions, workspace-wide (coursier --force-version)
   com.google.guava:guava: 33.4.0-jre
@@ -304,8 +309,8 @@ providedDependencies:
 testDependencies:
   org.scalameta::munit: catalog
 
-boms:
-  - com.acme:platform-bom:2026.11.0
+boms:                            # added to the workspace's; same coordinate → the module's wins
+  com.acme:platform-bom: 2026.11.0 # (workspace BOMs aren't in the merge chain: `!replace` can't drop them)
 
 javacOptions: [-parameters]
 generatedSources: [src_managed]  # Phase 3: dirs under ${outDir} that tasks write; compiled with the sources
@@ -388,7 +393,7 @@ Directory-based implicit inheritance (child configs silently picking up parent-d
 | Map | Merge by key, recursively. |
 | Scalar | Later replaces earlier. |
 | List | Append, **without** deduplication. |
-| Set-like list: `extends`, `boms` | Append, deduplicated (first occurrence kept). |
+| Set-like list: `extends` | Append, deduplicated (first occurrence kept). |
 | `scala`, `platforms` | Always **replace** (`platforms` is also deduplicated). They define the matrix, so a module's `scala:` overrides a preset's list rather than growing it. |
 | Any value tagged `!replace` | Replaces. |
 
@@ -538,12 +543,13 @@ boot:                            # everything needed before a JVM starts; lists 
     scalafmt@3.10.1: [org.scalameta:scalafmt-cli_2.13:3.10.1, …]
     scalafix@0.14.4: [ch.epfl.scala:scalafix-cli_2.13.18:0.14.4, …]
 
-catalogs:                        # selections for catalog *ranges*, one per (platform, Scala binary version)
+catalogs:                        # selections for catalog *ranges*, one per (platform, Scala binary version; `java` for Java coordinates)
   default/org.typelevel::cats-effect@jvm-3: { range: ^3.6.0, version: 3.6.3 }
 
 variants:                        # keyed by variant id, even for single-variant modules
   core@jvm-3:
     specifiers:                  # each direct dependency as written, and the version scpm selected
+      bom:com.fasterxml.jackson:jackson-bom: { spec: catalog, version: 2.20.1 }   # BOMs too
       org.typelevel::cats-core: { spec: catalog, version: 2.13.0 }
       io.circe::circe-core:     { spec: ^0.14.10, version: 0.14.14 }
       org.scalameta::munit:     { spec: catalog, version: 1.2.1 }
@@ -580,7 +586,7 @@ Each variant locks four ordered classpaths:
 - **Workspace modules** (`workspace:*`) appear as references (`{ module: util@jvm-3 }`), not artifacts: every upstream variant in the transitive closure, in dependency order, before the external artifacts, which follow coursier's order. A direct `workspace:*` reference lands on the lists its declaring scope feeds (table above), so one under `testDependencies` is on the test lists only. From there the closure follows each upstream module's `dependencies` on every list and its `runtimeDependencies` on the runtime lists, never its provided or test dependencies.
 - **Resolution is joint over the variant's transitive workspace closure.** A variant's external dependencies are resolved in one coursier call together with those of every upstream variant, so if A depends on B, A's classpaths hold one version of each library for both A's and B's code.
 - **Catalog ranges are resolved once per (platform, Scala binary version) for the whole workspace**, so every variant that uses that catalog entry on that platform and Scala binary version gets the same version. The selection lives in the lock's top-level `catalogs` section, keyed `<catalog>/<key>@<platform>-<scala binary>`. Re-locking a stale variant reuses an existing selection whose range is unchanged; only `scpm update` re-selects, and it then re-locks every variant that uses the entry.
-- **`specifiers`** records each direct dependency's spec as written and the version scpm selected for it (§5.5), before coursier's reconciliation, like pnpm's importers. `workspace:*` entries have no version.
+- **`specifiers`** records each direct dependency's spec as written and the version scpm selected for it (§5.5), before coursier's reconciliation, like pnpm's importers. `workspace:*` entries have no version. BOMs (the workspace's and the module's) are recorded too, keyed `bom:<coordinate>` so they never collide with a dependency on the same coordinate. A joint resolution applies one version per BOM coordinate: the variant's own, else the nearest upstream variant's (§5.4). A Java-only module skips workspace BOMs written `org::name`; its own are errors.
 - **`inputsHash`** is a sha256 over every effective input that affects the variant's resolution, after presets and `variants` (§4.4): platform and full Scala version, dependencies of every scope (catalog references replaced by their entries), `compilerPlugins`, BOMs, overrides, repositories (ids, URLs and `groups`), the resolution context and `policy.minimumReleaseAge` / `minimumReleaseAgeExclude`, plus what joint resolution consumes from each upstream variant in its workspace closure: its compile and runtime dependencies, BOMs and Scala version. An upstream variant's test or provided dependencies and compiler plugins don't affect downstream variants, so editing them re-locks only that variant.
 - A variant with `compilerPlugins` also has an ordered `compilerPlugins` list.
 
@@ -646,8 +652,8 @@ The risk is that ranges in **published** POMs are bad for Maven consumers: they 
    4. drops versions younger than `minimumReleaseAge` (§5.6);
    5. keeps those within the bounds and picks the highest.
 
-   Ranges are **not** passed to coursier as Maven intervals: in Maven ordering `2.0.0-RC1 < 2.0.0`, so `[1.2.3,2.0.0)` would admit `2.0.0` pre-releases (MNG-3092). A catalog range is selected once per (platform, Scala binary version) for the whole workspace (§5.4).
-4. **Only direct dependencies get ranges.** Transitive versions follow coursier's normal reconciliation. Ranges *inside* third-party POMs are honoured, because coursier does, and then pinned by the lock. A transitive version that violates `minimumReleaseAge` is an error naming the dependency path; fix it with an `overrides` pin or an exclusion.
+   Ranges are **not** passed to coursier as Maven intervals: in Maven ordering `2.0.0-RC1 < 2.0.0`, so `[1.2.3,2.0.0)` would admit `2.0.0` pre-releases (MNG-3092). A catalog range is selected once per (platform, Scala binary version) for the whole workspace (§5.4); a Java coordinate (`org:name`) once per platform, shared by every Scala version.
+4. **Only direct dependencies and BOMs get ranges.** Transitive versions follow coursier's normal reconciliation. Ranges *inside* third-party POMs are honoured, because coursier does, and then pinned by the lock. A transitive version that violates `minimumReleaseAge` is an error naming the dependency path; fix it with an `overrides` pin or an exclusion.
 5. **Ranges are resolved at lock time and never re-resolved implicitly.** A spec whose text is unchanged keeps its locked version even when its variant re-locks for another reason; only new or edited specs are selected (and `scpm update`).
 6. **Publishing rewrites every spec to a concrete version.** The default is the **locked** version, which is what was actually tested, so Maven consumers see an ordinary POM. Option: publish the range's lower bound instead.
 7. **Conflict policy:** after resolution, check every eviction against the evicted library's `info.versionScheme` (early-semver, pvp, semver-spec, strict, always), as sbt does. Fail with a readable diff that suggests an override.

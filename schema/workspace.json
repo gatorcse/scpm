@@ -11,12 +11,12 @@
       ]
     },
     "boms": {
-      "description": "BOMs (`org:name:version`) applied to every module.",
-      "type": "array",
-      "default": [],
-      "items": {
-        "type": "string"
-      }
+      "description": "BOMs applied to every module: `org:name: <version>`, where the version may be exact, a\nrange, `catalog` or `catalog:<name>` (looked up by the BOM's coordinate).",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Ver"
+      },
+      "default": {}
     },
     "catalog": {
       "description": "The default catalog, referenced as `catalog:`.",
@@ -238,9 +238,10 @@
           ]
         },
         "boms": {
-          "type": "array",
-          "items": {
-            "type": "string"
+          "description": "BOMs: `org:name: <version>` (exact, a range, `catalog` or `catalog:<name>`).",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Ver"
           }
         },
         "compilerPlugins": {

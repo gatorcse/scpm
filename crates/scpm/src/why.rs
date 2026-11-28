@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::coursier;
 use crate::graph::Graph;
-use crate::install::{ClasspathKind, InstallError, classpath_request, upstream_variants};
+use crate::install::{ClasspathKind, InstallError, classpath_request, specifier_key, upstream_variants};
 use crate::lockfile::{ClasspathEntry, Lockfile};
 use crate::version::VersionSpec;
 use crate::workspace::{Dependency, Variant, Workspace};
@@ -92,7 +92,7 @@ pub fn why(
             let locked = lock
                 .variants
                 .get(&owner.id)
-                .and_then(|l| l.specifiers.get(&dep.coord.to_string()))
+                .and_then(|l| l.specifiers.get(&specifier_key(owner, dep)))
                 .and_then(|s| s.version.clone());
             match (locked, &dep.version) {
                 (Some(v), _) => Ok(v),

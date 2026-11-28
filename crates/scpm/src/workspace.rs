@@ -14,7 +14,7 @@ use serde_yaml_ng::Value;
 use crate::config::{
     DepSpec, MODULE_FILE, ModuleFile, OneOrMany, Repository, TaskDef, VersionScheme, WORKSPACE_FILE, WorkspaceFile,
 };
-use crate::coord::{Coord, CrossKind, VersionedCoord};
+use crate::coord::{Coord, CrossKind};
 use crate::diag::{Diagnostic, Diagnostics, closest, ser_opt_path, ser_path, ser_paths, slash_path};
 use crate::merge::{
     has_replace_tags, merge_module, parse_with_visible_tags, strip_replace_tags, unknown_tags, untag_replace,
@@ -65,8 +65,11 @@ pub struct Variant {
     pub workspace_dependencies: Vec<WorkspaceDependency>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub compiler_plugins: Vec<Dependency>,
+    /// BOMs, workspace ones first; a module BOM replaces a workspace BOM with the same key.
+    /// Their versions resolve like dependencies' (catalogs, ranges); they are never added to a
+    /// classpath themselves.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub boms: Vec<VersionedCoord>,
+    pub boms: Vec<Dependency>,
     pub scalac_options: Vec<String>,
     pub javac_options: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -243,10 +246,10 @@ fn load_at(root: &Path, workspace_file: Option<PathBuf>) -> Result<Workspace, Di
         }
     }
     // Workspace BOMs apply to every module: parse them once.
-    for (i, bom) in config.boms.iter().enumerate() {
-        match VersionedCoord::parse(bom) {
+    for (key, spec) in &config.boms {
+        match bom_dependency(&ctx, key, spec) {
             Ok(b) => ctx.boms.push(b),
-            Err(e) => diags.push(ctx.in_ws(Diagnostic::new(e.to_string()).at_key(format!("boms[{i}]")))),
+            Err(e) => diags.push(ctx.in_ws(e.at_key(format!("boms.{key}")))),
         }
     }
     validate_workspace(&ctx, &mut diags);
@@ -288,7 +291,7 @@ struct Ctx<'a> {
     presets: IndexMap<String, Value>,
     ws_file: Option<PathBuf>,
     /// Parsed workspace `boms`.
-    boms: Vec<VersionedCoord>,
+    boms: Vec<Dependency>,
 }
 
 impl Ctx<'_> {
@@ -595,9 +598,9 @@ fn module_checks(m: &ModuleFile, prefix: &str, kind: Kind, depth: Option<usize>)
     if !m.generated_sources.is_empty() {
         out.push(not_supported(at("generatedSources"), "`generatedSources`", 3));
     }
-    for (i, bom) in m.boms.iter().enumerate() {
-        if let Err(e) = VersionedCoord::parse(bom) {
-            out.push(Diagnostic::new(e.to_string()).at_key(at(&format!("boms[{i}]"))));
+    for key in m.boms.keys() {
+        if let Err(e) = Coord::parse(key) {
+            out.push(Diagnostic::new(e.to_string()).at_key(at(&format!("boms.{key}"))));
         }
     }
     let dirs = [
@@ -1276,11 +1279,30 @@ fn build_variant(
             Err(d) => diags.push(d.in_file(file).at_key(at)),
         }
     }
-    // Invalid module and preset BOMs are reported by `module_checks`.
-    let mut boms = ctx.boms.clone();
-    for b in cfg.boms.iter().filter_map(|raw| VersionedCoord::parse(raw).ok()) {
-        if !boms.contains(&b) {
-            boms.push(b);
+    // Invalid BOM coordinates are reported by `module_checks`; catalog lookups here.
+    // A Java-only module skips workspace BOMs that need a Scala version (`org::name`): they
+    // can't name an artifact for it. Its own such BOMs are errors, like dependencies.
+    let mut boms: Vec<Dependency> =
+        ctx.boms.iter().filter(|b| scala.is_some() || b.coord.cross == CrossKind::Java).cloned().collect();
+    for (key, spec) in &cfg.boms {
+        let Ok(coord) = Coord::parse(key) else { continue };
+        if scala.is_none() && coord.cross != CrossKind::Java {
+            diags.push(
+                Diagnostic::new(format!(
+                    "`{coord}` needs a Scala version, but this module is Java-only (`scala: none`)"
+                ))
+                .in_file(file)
+                .at_key(format!("boms.{key}"))
+                .with_help("use the full artifact name with a single `:`, e.g. `org:name_3`"),
+            );
+            continue;
+        }
+        match bom_dependency(ctx, key, spec) {
+            Ok(b) => match boms.iter_mut().find(|w| w.coord == b.coord) {
+                Some(w) => *w = b,
+                None => boms.push(b),
+            },
+            Err(d) => diags.push(d.in_file(file).at_key(format!("boms.{key}"))),
         }
     }
     // The module's own directories were checked as written; any that leave the workspace here
@@ -1399,6 +1421,25 @@ fn external_dependency(
         }
     }
     Ok(Dependency { scope, coord, spec: spec.version().0.clone(), version, exclude, classifier, kind, transitive })
+}
+
+/// A BOM entry (`org:name: <spec>`): its version resolves through catalogs like a dependency's.
+fn bom_dependency(ctx: &Ctx, key: &str, spec: &Ver) -> Result<Dependency, Diagnostic> {
+    let coord = Coord::parse(key).map_err(|e| Diagnostic::new(e.to_string()))?;
+    let version = resolve_catalog(ctx, key, spec)?;
+    if let VersionSpec::Workspace { .. } = version {
+        return Err(Diagnostic::new("a BOM's version cannot be `workspace:`"));
+    }
+    Ok(Dependency {
+        scope: Scope::Compile,
+        coord,
+        spec: spec.0.clone(),
+        version,
+        exclude: Vec::new(),
+        classifier: None,
+        kind: None,
+        transitive: false,
+    })
 }
 
 /// Reports dependencies on modules that don't exist. `failed` holds the names of modules that

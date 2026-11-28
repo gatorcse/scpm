@@ -12,6 +12,31 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::platform::Platform;
 use crate::version::Ver;
 
+/// `boms` is a map like `dependencies`; the earlier `[org:name:version]` list form gets a
+/// pointer to the new form rather than serde's generic type error.
+fn boms<'de, D: Deserializer<'de>>(d: D) -> Result<IndexMap<String, Ver>, D::Error> {
+    struct Boms;
+    impl<'de> serde::de::Visitor<'de> for Boms {
+        type Value = IndexMap<String, Ver>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map of BOM coordinates to versions")
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(IndexMap::new())
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            IndexMap::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, _: A) -> Result<Self::Value, A::Error> {
+            Err(A::Error::custom(
+                "`boms` is a map of coordinate to version, like `dependencies` \
+                 (e.g. `io.netty:netty-bom: 4.1.115.Final` or `com.fasterxml.jackson:jackson-bom: catalog`)",
+            ))
+        }
+    }
+    d.deserialize_any(Boms)
+}
+
 pub const WORKSPACE_FILE: &str = "scpm-workspace.yaml";
 pub const MODULE_FILE: &str = "scpm.yaml";
 
@@ -42,9 +67,10 @@ pub struct WorkspaceFile {
     /// Named catalogs, referenced as `catalog:<name>`.
     #[serde(default)]
     pub catalogs: IndexMap<String, IndexMap<String, Ver>>,
-    /// BOMs (`org:name:version`) applied to every module.
-    #[serde(default)]
-    pub boms: Vec<String>,
+    /// BOMs applied to every module: `org:name: <version>`, where the version may be exact, a
+    /// range, `catalog` or `catalog:<name>` (looked up by the BOM's coordinate).
+    #[serde(default, deserialize_with = "boms")]
+    pub boms: IndexMap<String, Ver>,
     /// Forced versions applied workspace-wide.
     #[serde(default)]
     pub overrides: IndexMap<String, Ver>,
@@ -288,8 +314,9 @@ pub struct ModuleFile {
     /// Compiler plugins (`org:::name` for full-cross Scala 2 plugins); added as `-Xplugin`.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub compiler_plugins: IndexMap<String, DepSpec>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub boms: Vec<String>,
+    /// BOMs: `org:name: <version>` (exact, a range, `catalog` or `catalog:<name>`).
+    #[serde(default, deserialize_with = "boms", skip_serializing_if = "IndexMap::is_empty")]
+    pub boms: IndexMap<String, Ver>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scalac_options: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
