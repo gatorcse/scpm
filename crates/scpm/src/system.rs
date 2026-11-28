@@ -115,16 +115,23 @@ pub fn worker_jdk() -> Option<PathBuf> {
 /// and architecture scpm runs on. Computed once per process.
 pub fn host() -> &'static Host {
     static HOST: OnceLock<Host> = OnceLock::new();
-    HOST.get_or_init(|| host_from(project_jdk(), own()))
+    let scpm_java = std::env::var_os("SCPM_JAVA").filter(|j| !j.is_empty()).map(PathBuf::from);
+    HOST.get_or_init(|| host_from(project_jdk(), own(), scpm_java))
 }
 
-fn host_from(project_jdk: Option<PathBuf>, own: String) -> Host {
+/// `scpm_java`: what `SCPM_JAVA` names, which (when set) is the only place the JDK may come from.
+fn host_from(project_jdk: Option<PathBuf>, own: String, scpm_java: Option<PathBuf>) -> Host {
     match project_jdk.as_deref().and_then(|home| Some((home, of_jdk(home)?))) {
         Some((home, system)) => Host { system, jdk: Some(home.to_path_buf()), note: None },
         None => {
-            let why = match &project_jdk {
-                Some(home) => format!("the release file of the project JDK {} names no OS and arch", home.display()),
-                None => "no project JDK was found".to_string(),
+            let why = match (&project_jdk, &scpm_java) {
+                (Some(home), _) => {
+                    format!("the release file of the project JDK {} names no OS and arch", home.display())
+                }
+                (None, Some(java)) => {
+                    format!("`SCPM_JAVA` ({}) has no JDK home with a `release` file around it", java.display())
+                }
+                (None, None) => "no project JDK was found".to_string(),
             };
             Host {
                 note: Some(format!("{why}, so the host system is {own}, the one scpm runs on")),
@@ -183,12 +190,17 @@ mod tests {
     fn the_host_is_the_project_jdks_system() {
         let jdk = tempfile::tempdir().unwrap();
         std::fs::write(jdk.path().join("release"), "OS_NAME=\"Linux\"\nOS_ARCH=\"x86_64\"\n").unwrap();
-        let host = host_from(Some(jdk.path().to_path_buf()), "macos-aarch64".into());
+        let host = host_from(Some(jdk.path().to_path_buf()), "macos-aarch64".into(), None);
         assert_eq!(host.system, "linux-x86_64", "an x86_64 JDK under Rosetta gets x86_64 natives");
         assert_eq!(host.note, None);
-        let fallback = host_from(None, "macos-aarch64".into());
+        let fallback = host_from(None, "macos-aarch64".into(), None);
         assert_eq!(fallback.system, "macos-aarch64");
         assert!(fallback.note.unwrap().contains("no project JDK was found"));
+        // `SCPM_JAVA` names a java without a JDK home (a wrapper script): the note says so.
+        let wrapper = host_from(None, "macos-aarch64".into(), Some("/opt/bin/java-wrapper".into()));
+        let note = wrapper.note.unwrap();
+        assert!(note.starts_with("`SCPM_JAVA` (/opt/bin/java-wrapper) has no JDK home"), "{note}");
+        assert!(note.ends_with("so the host system is macos-aarch64, the one scpm runs on"), "{note}");
     }
 
     #[test]
