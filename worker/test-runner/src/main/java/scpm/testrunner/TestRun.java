@@ -2,6 +2,7 @@ package scpm.testrunner;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -59,9 +60,11 @@ final class TestRun {
   /**
    * The frameworks to run: the named ones, or every known one on the classpath.
    *
-   * @throws IllegalArgumentException if a named framework is missing or cannot be created
+   * @throws IllegalArgumentException if a named framework is missing, or a named or detected one
+   *     cannot be created
    */
   static List<Framework> frameworks(List<String> names, ClassLoader loader) {
+    if (names.isEmpty()) return detect(KNOWN_FRAMEWORKS, loader);
     List<Framework> frameworks = new ArrayList<>();
     for (String name : names) {
       try {
@@ -69,28 +72,47 @@ final class TestRun {
       } catch (ClassNotFoundException | NoClassDefFoundError e) {
         throw new IllegalArgumentException("framework " + name + " is not on the classpath");
       } catch (ReflectiveOperationException | LinkageError | ClassCastException e) {
-        throw new IllegalArgumentException("cannot create framework " + name + ": " + e);
-      }
-    }
-    if (!names.isEmpty()) return frameworks;
-    for (String name : KNOWN_FRAMEWORKS) {
-      try {
-        frameworks.add(instantiate(name, loader));
-      } catch (ReflectiveOperationException | LinkageError e) {
-        // not on the test classpath
+        throw cannotCreate(name, e);
       }
     }
     return frameworks;
+  }
+
+  /**
+   * The {@code candidates} whose class is on the classpath. One that is there but cannot be
+   * created (a missing dependency, a failing initializer or constructor) is an error, not skipped:
+   * skipping it could turn a broken test classpath into a run of zero tests.
+   */
+  static List<Framework> detect(List<String> candidates, ClassLoader loader) {
+    List<Framework> frameworks = new ArrayList<>();
+    for (String name : candidates) {
+      try {
+        frameworks.add(instantiate(name, loader));
+      } catch (ClassNotFoundException e) {
+        // not on the test classpath
+      } catch (ReflectiveOperationException | LinkageError | ClassCastException e) {
+        throw cannotCreate(name, e);
+      }
+    }
+    return frameworks;
+  }
+
+  private static IllegalArgumentException cannotCreate(String name, Throwable e) {
+    // A constructor's own exception arrives wrapped; name it rather than the wrapper.
+    Throwable cause = e instanceof InvocationTargetException && e.getCause() != null ? e.getCause() : e;
+    return new IllegalArgumentException("cannot create framework " + name + ": " + cause);
   }
 
   private static Framework instantiate(String name, ClassLoader loader) throws ReflectiveOperationException {
     return (Framework) Class.forName(name, true, loader).getDeclaredConstructor().newInstance();
   }
 
-  Map<String, Object> run() {
+  /** The suites of each framework, in framework priority order; a class goes to the first. */
+  private List<Map.Entry<Framework, List<TaskDef>>> suites() {
     Discovery discovery = new Discovery(loader);
     List<String> classNames = Discovery.classNames(params.testClassesDirs());
     Set<String> claimed = new HashSet<>();
+    List<Map.Entry<Framework, List<TaskDef>>> suites = new ArrayList<>();
     for (Framework framework : frameworks) {
       List<TaskDef> taskDefs = new ArrayList<>();
       for (String className : classNames) {
@@ -104,13 +126,37 @@ final class TestRun {
                   taskDefs.add(new TaskDef(testName, fp, params.names(testName), selectors()));
                 });
       }
-      if (!taskDefs.isEmpty()) runFramework(framework, taskDefs);
+      if (!taskDefs.isEmpty()) suites.add(Map.entry(framework, taskDefs));
     }
+    return suites;
+  }
+
+  /**
+   * The {@code discover} result: {@code {"status": "ok", "suites": [{"framework": "munit",
+   * "classes": ["a.FooSuite"]}]}}, without running anything.
+   */
+  Map<String, Object> discover() {
+    List<Object> suites = new ArrayList<>();
+    for (Map.Entry<Framework, List<TaskDef>> e : suites()) {
+      Map<String, Object> item = new LinkedHashMap<>();
+      item.put("framework", e.getKey().name());
+      item.put("classes", e.getValue().stream().map(TaskDef::fullyQualifiedName).toList());
+      suites.add(item);
+    }
+    Map<String, Object> result = new LinkedHashMap<>();
+    result.put("status", "ok");
+    result.put("suites", suites);
+    return result;
+  }
+
+  Map<String, Object> run() {
+    List<Map.Entry<Framework, List<TaskDef>>> suites = suites();
+    for (Map.Entry<Framework, List<TaskDef>> e : suites) runFramework(e.getKey(), e.getValue());
     if (frameworks.isEmpty()) {
       out.log("warn", "no test framework found on the classpath");
-    } else if (claimed.isEmpty() && !params.filters().isEmpty()) {
+    } else if (suites.isEmpty() && !params.filters().isEmpty()) {
       out.log("warn", "no test suites match the filters " + String.join(", ", params.filters()));
-    } else if (claimed.isEmpty()) {
+    } else if (suites.isEmpty()) {
       out.log(
           "warn",
           "no test suites found in " + String.join(", ", params.testClassesDirs())

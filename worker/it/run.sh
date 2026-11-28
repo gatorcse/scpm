@@ -551,6 +551,27 @@ else
   else fail "and kills the processes its tests started" "child pid: $CHILD"; kill "$CHILD" 2>/dev/null || true; fi
 fi
 
+start_runner munit-hook "$MUNIT_CP" "$(run_params '{filters: ["*.HangingHookSuite"]}')"
+deadline=$((SECONDS + 300))
+until jq -e 'select(.params.message? // "" | startswith("hook registered"))' "$WORK/munit-hook.out" >/dev/null 2>&1; do
+  kill -0 "$RUNNER_PID" 2>/dev/null ||
+    { echo "test runner exited before its test registered a hook:" >&2; cat "$WORK/munit-hook.out" >&2; exit 1; }
+  [ "$SECONDS" -lt "$deadline" ] || { kill "$RUNNER_PID"; echo "timed out waiting for the HangingHookSuite hook" >&2; exit 1; }
+  sleep 0.05
+done
+exec 4>&-
+deadline=$((SECONDS + 20))
+while kill -0 "$RUNNER_PID" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.1; done
+if kill -0 "$RUNNER_PID" 2>/dev/null; then
+  kill -9 "$RUNNER_PID"
+  fail "the runner exits when its parent goes, even if a test's shutdown hook hangs"
+else
+  set +e; wait "$RUNNER_PID"; HOOK_EXIT=$?; set -e
+  expect "the runner halts with 4 when a test's shutdown hook hangs after its parent goes" "$HOOK_EXIT" '. == 4'
+  expect "and still answers crashed" "$(jq -c 'select(has("id"))' "$WORK/munit-hook.out")" \
+    '.result.status == "crashed" and .result.message == "parent went away (stdin closed)"'
+fi
+
 run_tests munit-missing "$MUNIT_CP" "$(run_params '{frameworks: ["no.such.Framework"]}')"
 expect "a named framework that is not on the classpath is a bad request" "$RUN_RESULT" \
   '.error == {code: "bad_request", message: "framework no.such.Framework is not on the classpath"}'

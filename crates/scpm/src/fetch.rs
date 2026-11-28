@@ -786,7 +786,7 @@ fn release(lock: File, lock_path: &Path) {
 }
 
 #[cfg(unix)]
-fn try_lock(file: &File) -> io::Result<bool> {
+pub fn try_lock(file: &File) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
     // SAFETY: `flock` is plain data; zeroed is a valid initial state and we set every field
     // fcntl reads.
@@ -808,7 +808,7 @@ fn try_lock(file: &File) -> io::Result<bool> {
 }
 
 #[cfg(not(unix))]
-fn try_lock(file: &File) -> io::Result<bool> {
+pub fn try_lock(file: &File) -> io::Result<bool> {
     // On Windows the JDK's FileChannel.tryLock uses LockFileEx, as does std's try_lock.
     match file.try_lock() {
         Ok(()) => Ok(true),

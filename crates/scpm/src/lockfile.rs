@@ -82,7 +82,7 @@ pub struct Specifier {
 }
 
 /// An artifact key, or a reference to an upstream workspace variant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ClasspathEntry {
     Artifact(String),

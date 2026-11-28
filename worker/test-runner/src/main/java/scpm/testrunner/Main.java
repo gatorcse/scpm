@@ -15,7 +15,7 @@ import sbt.testing.Framework;
 
 /**
  * The scpm test runner: reads one {@code run} request from stdin, runs the tests, writes the
- * response and exits. Everything the tests print becomes {@code log} events, so stdout carries
+ * response and exits (or, for {@code discover}, lists the test classes without running them). Everything the tests print becomes {@code log} events, so stdout carries
  * protocol messages only.
  */
 public final class Main {
@@ -30,6 +30,7 @@ public final class Main {
     if (line == null) badRequest(protocol, null, "no request on stdin");
 
     Object id = null;
+    Object method = null;
     RunParams params = null;
     try {
       Map<String, Object> request = asObject(Json.parse(line));
@@ -37,7 +38,8 @@ public final class Main {
       // Responses carry an integer id or null, never the request's malformed one.
       if (!(requestId instanceof Long)) throw new IllegalArgumentException("'id' must be an integer");
       id = requestId;
-      if (!"run".equals(request.get("method"))) {
+      method = request.get("method");
+      if (!"run".equals(method) && !"discover".equals(method)) {
         Output.error(protocol, id, "unknown_method", "unknown method: " + request.get("method"));
         System.exit(2);
       }
@@ -70,6 +72,21 @@ public final class Main {
     }
 
     TestRun run = new TestRun(params, frameworks, out, loader);
+    if ("discover".equals(method)) {
+      Map<String, Object> result;
+      try {
+        result = run.discover();
+      } catch (Throwable t) {
+        t.printStackTrace();
+        result = run.result("crashed");
+      }
+      stdout.close();
+      stderr.close();
+      // Answered: the parent closing stdin after reading this is no longer "going away".
+      answered.set(true);
+      out.result(result);
+      System.exit(0);
+    }
     // A run the JVM abandons (System.exit in a test, or the CLI went away) is still answered.
     ExitStatus.capture();
     Runtime.getRuntime()
@@ -123,11 +140,35 @@ public final class Main {
               if (answered.get()) return;
               parentGone.set(true);
               ProcessHandle.current().descendants().forEach(ProcessHandle::destroyForcibly);
+              // System.exit waits for every shutdown hook, the tests' included, and blocks for good
+              // if a test's System.exit is already shutting down. Nothing else will end this JVM.
+              haltAfter(PARENT_GONE_GRACE_MS, 4);
               System.exit(4);
             },
             "scpm-stdin-watcher");
     watcher.setDaemon(true);
     watcher.start();
+  }
+
+  /** How long shutdown hooks get to finish once the parent is gone. */
+  private static final long PARENT_GONE_GRACE_MS = 5_000;
+
+  /** Halts the JVM with {@code status} after {@code millis}, unless it has exited by then. */
+  private static void haltAfter(long millis, int status) {
+    Thread halter =
+        new Thread(
+            () -> {
+              try {
+                Thread.sleep(millis);
+              } catch (InterruptedException e) {
+                // halt now
+              }
+              Runtime.getRuntime().halt(status);
+            },
+            "scpm-halt");
+    // Daemon threads keep running while shutdown hooks do, and do not keep the JVM alive.
+    halter.setDaemon(true);
+    halter.start();
   }
 
   private static void badRequest(PrintStream protocol, Object id, String message) {

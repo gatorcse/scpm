@@ -56,6 +56,14 @@ fn scpm(dir: &Path, cache: &Path) -> Command {
     cmd
 }
 
+/// `scpm` for tests whose repositories can't serve scpm's own compiler and worker jars: their
+/// boot entries are left out of the lock (the hidden `SCPM_TEST_SKIP_BOOT`).
+fn scpm_no_boot(dir: &Path, cache: &Path) -> Command {
+    let mut cmd = scpm(dir, cache);
+    cmd.env("SCPM_TEST_SKIP_BOOT", "1");
+    cmd
+}
+
 fn lock(dir: &Path) -> Value {
     let text = fs::read_to_string(dir.join("scpm-lock.yaml")).unwrap();
     serde_yaml_ng::from_str(&text).unwrap()
@@ -439,7 +447,7 @@ fn configured_credentials_reach_cs_through_a_private_file() {
     let ws = tempfile::tempdir().unwrap();
     let manifest = |opt_in: &str| {
         format!(
-            "repositories:\n  - id: local\n    url: '{}'\n    credentials: {{user: 'env:REPO_USER', password: 'env:REPO_PASS'}}\n{opt_in}",
+            "repositories:\n  - id: local\n    url: '{}'\n    credentials: {{user: 'env:REPO_USER', password: 'env:REPO_PASS'}}\n{opt_in}  - central\n",
             server.url("/maven")
         )
     };
@@ -498,7 +506,8 @@ fn coursier_credentials_are_used_for_repositories_without_configured_ones() {
     // Without the repository's opt-in, not even `cs` gets them over plain HTTP.
     java_workspace(
         ws.path(),
-        &format!("repositories:\n  - {{id: local, url: '{}'}}\n", server.url("/maven")),
+        // Central serves the compiler and worker boot closures.
+        &format!("repositories:\n  - {{id: local, url: '{}'}}\n  - central\n", server.url("/maven")),
         "dependencies:\n  com.example:hello: '1.0'\n",
     );
     let err = stderr_of(scpm(ws.path(), cache.path()).env("COURSIER_CREDENTIALS", &props).arg("install"));
@@ -507,7 +516,10 @@ fn coursier_credentials_are_used_for_repositories_without_configured_ones() {
 
     java_workspace(
         ws.path(),
-        &format!("repositories:\n  - {{id: local, url: '{}', allowInsecureCredentials: true}}\n", server.url("/maven")),
+        &format!(
+            "repositories:\n  - {{id: local, url: '{}', allowInsecureCredentials: true}}\n  - central\n",
+            server.url("/maven")
+        ),
         "dependencies:\n  com.example:hello: '1.0'\n",
     );
     scpm(ws.path(), cache.path()).env("COURSIER_CREDENTIALS", &props).arg("install").assert().success();
@@ -543,7 +555,7 @@ fn user_config_credentials_reach_cs_and_the_fetcher() {
     };
     let (wrapper, log) = logging_cs(ws.path());
     let with_config = |cache: &Path| {
-        let mut cmd = scpm(ws.path(), cache);
+        let mut cmd = scpm_no_boot(ws.path(), cache);
         cmd.env("SCPM_CONFIG", &config).env("NEXUS_PASS", "s3cret-pass").env("SCPM_CS", &wrapper);
         cmd
     };
@@ -566,11 +578,12 @@ fn user_config_credentials_reach_cs_and_the_fetcher() {
 
     // A missing variable names the user config.
     let other = tempfile::tempdir().unwrap();
-    let err = stderr_of(scpm(ws.path(), other.path()).env("SCPM_CONFIG", &config).args(["install", "--frozen"]));
+    let err =
+        stderr_of(scpm_no_boot(ws.path(), other.path()).env("SCPM_CONFIG", &config).args(["install", "--frozen"]));
     assert!(err.contains("`NEXUS_PASS`") && err.contains("user config"), "{err}");
     // The file is parsed strictly: an unknown key is a configuration error.
     fs::write(&config, "mirror: []\n").unwrap();
-    let out = scpm(ws.path(), other.path()).env("SCPM_CONFIG", &config).arg("install").assert().code(2);
+    let out = scpm_no_boot(ws.path(), other.path()).env("SCPM_CONFIG", &config).arg("install").assert().code(2);
     let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
     assert!(err.contains("user-config.yaml") && err.contains("mirrors"), "{err}");
 }
@@ -603,7 +616,7 @@ fn one_origin_shares_its_credentials_on_both_paths() {
         server.url("/other")
     );
     java_workspace(ws.path(), &format!("repositories:\n{private}{other}"), deps);
-    let mut cmd = scpm(ws.path(), tempfile::tempdir().unwrap().path());
+    let mut cmd = scpm_no_boot(ws.path(), tempfile::tempdir().unwrap().path());
     env(&mut cmd);
     let out = cmd.arg("install").assert().code(2);
     let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
@@ -617,7 +630,7 @@ fn one_origin_shares_its_credentials_on_both_paths() {
     let config = ws.path().join("user-config.yaml");
     fs::write(&config, format!("mirrors:\n  - {{url: '{}', mirrorOf: [central]}}\n", server.url("/remote"))).unwrap();
     let with_config = |cache: &Path| {
-        let mut cmd = scpm(ws.path(), cache);
+        let mut cmd = scpm_no_boot(ws.path(), cache);
         env(&mut cmd);
         cmd.env("SCPM_CONFIG", &config);
         cmd
@@ -701,7 +714,7 @@ fn relocking_through_a_catch_all_mirror_keeps_repository_ids() {
     );
     java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
     let cache = tempfile::tempdir().unwrap();
-    scpm(ws.path(), cache.path()).arg("install").assert().success();
+    scpm_no_boot(ws.path(), cache.path()).arg("install").assert().success();
     assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
 
     // Re-locked through one mirror for both repositories, without error: hello keeps acme. world
@@ -711,7 +724,7 @@ fn relocking_through_a_catch_all_mirror_keeps_repository_ids() {
     java_workspace(ws.path(), &repos, deps);
     let config = ws.path().join("user-config.yaml");
     fs::write(&config, format!("mirrors:\n  - {{url: '{}', mirrorOf: ['*']}}\n", mirror.url("/mirror"))).unwrap();
-    scpm(ws.path(), cache.path()).env("SCPM_CONFIG", &config).arg("install").assert().success();
+    scpm_no_boot(ws.path(), cache.path()).env("SCPM_CONFIG", &config).arg("install").assert().success();
     assert!(mirror.count("/mirror/com/example/world/1.0/world-1.0.pom") > 0, "re-locked through the mirror");
     let locked = lock(ws.path());
     assert_eq!(locked["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
@@ -720,13 +733,13 @@ fn relocking_through_a_catch_all_mirror_keeps_repository_ids() {
     // A restore without the mirror follows the wrong hint, gets a 404 and asks acme next; the
     // sha256 decides that it is the locked file.
     let empty = tempfile::tempdir().unwrap();
-    scpm(ws.path(), empty.path()).args(["install", "--frozen"]).assert().success();
+    scpm_no_boot(ws.path(), empty.path()).args(["install", "--frozen"]).assert().success();
     assert!(main.count("/maven/com/example/world/1.0/world-1.0.jar") >= 1, "the hint was asked first");
     assert!(acme.count("/maven/com/example/world/1.0/world-1.0.jar") >= 1, "then the next repository");
     let jar = empty.path().join(format!("http/127.0.0.1%3A{}/maven/com/example/world/1.0/world-1.0.jar", acme.port));
     assert_eq!(fs::read(jar).unwrap(), b"world jar");
     // The classpath names the copy that was found.
-    let out = scpm(ws.path(), empty.path()).args(["classpath", "lib", "--frozen"]).assert().success();
+    let out = scpm_no_boot(ws.path(), empty.path()).args(["classpath", "lib", "--frozen"]).assert().success();
     let classpath = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
     assert!(classpath.contains(&format!("127.0.0.1%3A{}/maven/com/example/world", acme.port)), "{classpath}");
 }
@@ -746,7 +759,7 @@ fn an_internal_name_found_in_a_public_repository_is_not_locked() {
         acme.url("/maven")
     );
     java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
-    let err = stderr_of(scpm(ws.path(), tempfile::tempdir().unwrap().path()).arg("install"));
+    let err = stderr_of(scpm_no_boot(ws.path(), tempfile::tempdir().unwrap().path()).arg("install"));
     assert!(err.contains("com.example:hello:1.0 was found in repository `public`"), "{err}");
     assert!(err.contains("may only come from `acme`") && err.contains("dependency confusion"), "{err}");
     assert!(acme.count("/maven/com/example/hello/1.0/hello-1.0.pom") >= 1, "acme was asked first");
@@ -768,7 +781,7 @@ fn a_public_name_served_by_a_grouped_repository_is_not_locked() {
         acme.url("/maven")
     );
     java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
-    let err = stderr_of(scpm(ws.path(), tempfile::tempdir().unwrap().path()).arg("install"));
+    let err = stderr_of(scpm_no_boot(ws.path(), tempfile::tempdir().unwrap().path()).arg("install"));
     assert!(err.contains("com.example:hello:1.0 was served by repository `acme`"), "{err}");
     assert!(err.contains("may only come from the repositories without `groups` (`public`)"), "{err}");
     assert!(err.contains("internal-only repository URL") && err.contains("mirror of `central`"), "{err}");
@@ -794,12 +807,12 @@ fn groups_keep_internal_artifacts_away_from_other_repositories() {
 
     // Re-locking: `cs` asks the repositories with `groups` first, so it finds hello in acme and
     // never asks public about it.
-    scpm(ws.path(), tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    scpm_no_boot(ws.path(), tempfile::tempdir().unwrap().path()).arg("install").assert().success();
     assert_eq!(lock(ws.path())["artifacts"]["com.example:hello:1.0"]["repo"], "acme");
     assert_eq!(asked_public(), 0, "re-lock");
     // Restoring: only acme is ever a source for com.example.
     let empty = tempfile::tempdir().unwrap();
-    scpm(ws.path(), empty.path()).args(["install", "--frozen"]).assert().success();
+    scpm_no_boot(ws.path(), empty.path()).args(["install", "--frozen"]).assert().success();
     assert_eq!(asked_public(), 0, "restore");
     assert!(acme.count(HELLO_JAR_PATH) >= 2);
     // Even with a hint naming public (the lock's `repo` is only a hint), public isn't asked.
@@ -807,7 +820,7 @@ fn groups_keep_internal_artifacts_away_from_other_repositories() {
     let text = fs::read_to_string(&lock_file).unwrap();
     assert!(text.contains("repo: acme"), "{text}");
     fs::write(&lock_file, text.replace("repo: acme", "repo: public")).unwrap();
-    scpm(ws.path(), tempfile::tempdir().unwrap().path()).args(["install", "--frozen"]).assert().success();
+    scpm_no_boot(ws.path(), tempfile::tempdir().unwrap().path()).args(["install", "--frozen"]).assert().success();
     assert_eq!(asked_public(), 0, "restore with a hint for public");
 }
 
@@ -825,7 +838,7 @@ fn mirrors_serve_both_paths_and_never_reach_the_lock() {
     let deps = "dependencies:\n  com.example:hello: '1.0'\n";
     let plain = tempfile::tempdir().unwrap();
     java_workspace(plain.path(), &manifest, deps);
-    scpm(plain.path(), tempfile::tempdir().unwrap().path()).arg("install").assert().success();
+    scpm_no_boot(plain.path(), tempfile::tempdir().unwrap().path()).arg("install").assert().success();
     let real_requests = real.requests.lock().unwrap().len();
     assert!(real_requests > 0);
 
@@ -842,7 +855,7 @@ fn mirrors_serve_both_paths_and_never_reach_the_lock() {
     )
     .unwrap();
     let with_mirror = |cache: &Path| {
-        let mut cmd = scpm(ws.path(), cache);
+        let mut cmd = scpm_no_boot(ws.path(), cache);
         cmd.env("SCPM_CONFIG", &config).env("MIRROR_PASS", "mirror-pass");
         cmd
     };
@@ -910,11 +923,11 @@ fn both_paths_use_exactly_the_resolved_proxy() {
 
     // The user config's proxy wins over the environment's, for `cs` and for the fetcher.
     let cache = tempfile::tempdir().unwrap();
-    let mut cmd = scpm(ws.path(), cache.path());
+    let mut cmd = scpm_no_boot(ws.path(), cache.path());
     hostile_jvm(&mut cmd);
     cmd.env("SCPM_CONFIG", &config).env("HTTP_PROXY", dead).arg("install").assert().success();
     let empty = tempfile::tempdir().unwrap();
-    scpm(ws.path(), empty.path())
+    scpm_no_boot(ws.path(), empty.path())
         .env("SCPM_CONFIG", &config)
         .env("http_proxy", dead)
         .args(["install", "--frozen"])
@@ -927,33 +940,43 @@ fn both_paths_use_exactly_the_resolved_proxy() {
     fs::remove_file(ws.path().join("scpm-lock.yaml")).unwrap();
     let cache = tempfile::tempdir().unwrap();
     let proxy_url = format!("http://127.0.0.1:{}", proxy.port);
-    scpm(ws.path(), cache.path()).env("HTTP_PROXY", &proxy_url).arg("install").assert().success();
+    scpm_no_boot(ws.path(), cache.path()).env("HTTP_PROXY", &proxy_url).arg("install").assert().success();
     let empty = tempfile::tempdir().unwrap();
-    scpm(ws.path(), empty.path()).env("HTTP_PROXY", &proxy_url).args(["install", "--frozen"]).assert().success();
+    scpm_no_boot(ws.path(), empty.path())
+        .env("HTTP_PROXY", &proxy_url)
+        .args(["install", "--frozen"])
+        .assert()
+        .success();
     assert_eq!(fs::read(jar(empty.path())).unwrap(), b"hello jar");
 
     // Proxy authentication is not supported: a clear error that never repeats the password,
     // and only when something must be downloaded.
     let with_user = format!("http://alice:s3cret@127.0.0.1:{}", proxy.port);
     let err = stderr_of(
-        scpm(ws.path(), tempfile::tempdir().unwrap().path())
+        scpm_no_boot(ws.path(), tempfile::tempdir().unwrap().path())
             .env("HTTP_PROXY", &with_user)
             .args(["install", "--frozen"]),
     );
     assert!(err.contains("HTTP_PROXY") && err.contains("proxy authentication is not supported"), "{err}");
     assert!(!err.contains("s3cret"), "{err}");
-    scpm(ws.path(), empty.path()).env("HTTP_PROXY", &with_user).args(["install", "--frozen"]).assert().success();
+    scpm_no_boot(ws.path(), empty.path())
+        .env("HTTP_PROXY", &with_user)
+        .args(["install", "--frozen"])
+        .assert()
+        .success();
     // A `#` in the password used to end the authority early and land the value in the error.
     let hashed = format!("http://alice:pa#ss@127.0.0.1:{}", proxy.port);
     let err = stderr_of(
-        scpm(ws.path(), tempfile::tempdir().unwrap().path()).env("HTTP_PROXY", &hashed).args(["install", "--frozen"]),
+        scpm_no_boot(ws.path(), tempfile::tempdir().unwrap().path())
+            .env("HTTP_PROXY", &hashed)
+            .args(["install", "--frozen"]),
     );
     assert!(err.contains("proxy authentication is not supported") && !err.contains("pa#ss"), "{err}");
 
     // An unusable proxy for a scheme no repository uses blocks nothing, on either path.
     fs::remove_file(ws.path().join("scpm-lock.yaml")).unwrap();
     let with_socks = |cache: &Path| {
-        let mut cmd = scpm(ws.path(), cache);
+        let mut cmd = scpm_no_boot(ws.path(), cache);
         cmd.env("HTTPS_PROXY", "socks5://127.0.0.1:1080").env("HTTP_PROXY", &proxy_url);
         cmd
     };
@@ -1054,7 +1077,8 @@ fn boot_entries_follow_their_inputs() {
     let text = fs::read_to_string(&wsfile).unwrap();
     fs::write(&wsfile, format!("{text}lock:\n  resolutionContext: {{jdk: '21'}}\n")).unwrap();
     let summary = json_install(ws.path(), &shared_cache(), &[]);
-    assert_eq!(summary["bootRelocked"].as_array().unwrap().len(), 4, "{summary}");
+    // Two compilers and two bridges, plus the worker and test-runner closures.
+    assert_eq!(summary["bootRelocked"].as_array().unwrap().len(), 6, "{summary}");
     let l = lock(ws.path());
     assert_ne!(l["bootInputs"], before);
     assert_eq!(strings(&l["boot"]["scala-compiler@3.9.0"]), full);
@@ -1271,7 +1295,7 @@ fn foreign_mirror_settings_do_not_redirect_cs() {
     );
     let cache = tempfile::tempdir().unwrap();
     let hostile_scpm = || {
-        let mut cmd = scpm(ws.path(), cache.path());
+        let mut cmd = scpm_no_boot(ws.path(), cache.path());
         cmd.envs(hostile.iter().map(|(k, v)| (*k, v.as_os_str())))
             .env("COURSIER_MODE", "offline")
             .env("COURSIER_TTL", "0")
@@ -1302,7 +1326,7 @@ fn foreign_mirror_settings_do_not_redirect_cs() {
     assert!(!explained.contains("offline"), "names only, never values: {explained}");
     // `why --json` keeps the notice of the install it runs first.
     let fresh = tempfile::tempdir().unwrap();
-    let mut cmd = scpm(ws.path(), fresh.path());
+    let mut cmd = scpm_no_boot(ws.path(), fresh.path());
     cmd.envs(hostile.iter().map(|(k, v)| (*k, v.as_os_str()))).env("HOME", ws.path());
     let out = cmd.args(["--json", "why", "com.example:hello"]).assert().success();
     let report: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
@@ -1319,4 +1343,285 @@ fn foreign_mirror_settings_do_not_redirect_cs() {
     );
     let err = stderr_of(hostile_scpm().arg("install"));
     assert!(err.contains("note: ") && err.contains("scpm config explain"), "{err}");
+}
+
+#[test]
+fn bom_versions_come_from_catalogs_and_are_locked() {
+    if !cs_available() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    let bom_key = "bom:com.fasterxml.jackson:jackson-bom";
+    // jackson-databind 2.17.0 depends on jackson-core 2.17.0; the BOM manages it.
+    let lib = "dependencies:\n  com.fasterxml.jackson.core:jackson-databind: 2.17.0\n";
+    let workspace = |bom: &str| {
+        format!(
+            "catalogs:\n  json:\n    com.fasterxml.jackson:jackson-bom: {bom}\nboms:\n  com.fasterxml.jackson:jackson-bom: catalog:json\n"
+        )
+    };
+    let core_of = |l: &Value| {
+        strings(&l["variants"]["lib@jvm"]["compileClasspath"])
+            .into_iter()
+            .find(|k| k.starts_with("com.fasterxml.jackson.core:jackson-core:"))
+            .unwrap()
+    };
+
+    java_workspace(ws.path(), &workspace("2.18.2"), lib);
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    let l = lock(ws.path());
+    assert_eq!(core_of(&l), "com.fasterxml.jackson.core:jackson-core:2.18.2");
+    assert_eq!(
+        l["variants"]["lib@jvm"]["specifiers"][bom_key],
+        serde_json::json!({"spec": "catalog:json", "version": "2.18.2"})
+    );
+
+    // A catalog range is selected once, recorded with the catalog selections, and applied.
+    java_workspace(ws.path(), &workspace("~2.17.0"), lib);
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    let l = lock(ws.path());
+    let selected =
+        l["catalogs"]["json/com.fasterxml.jackson:jackson-bom@jvm-java"]["version"].as_str().unwrap().to_string();
+    assert!(selected.starts_with("2.17."), "{l:#}");
+    assert_eq!(l["variants"]["lib@jvm"]["specifiers"][bom_key]["version"], selected.as_str());
+    assert_eq!(core_of(&l), format!("com.fasterxml.jackson.core:jackson-core:{selected}"));
+    scpm(ws.path(), &shared_cache()).args(["install", "--frozen"]).assert().success();
+
+    // A module BOM on the same coordinate replaces the workspace one.
+    java_workspace(
+        ws.path(),
+        &workspace("~2.17.0"),
+        &format!("{lib}boms:\n  com.fasterxml.jackson:jackson-bom: 2.18.1\n"),
+    );
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    let l = lock(ws.path());
+    assert_eq!(core_of(&l), "com.fasterxml.jackson.core:jackson-core:2.18.1");
+    assert!(l["catalogs"].get("json/com.fasterxml.jackson:jackson-bom@jvm-java").is_none(), "{l:#}");
+}
+
+/// Writes Java-only modules `a` and `b` (b depends on a), each with the given extra config.
+fn two_java_modules(dir: &Path, workspace_extra: &str, a: &str, b: &str) {
+    fs::write(dir.join("scpm-workspace.yaml"), format!("modules: ['modules/*']\n{workspace_extra}")).unwrap();
+    for (name, extra) in [("a", a), ("b", b)] {
+        fs::create_dir_all(dir.join("modules").join(name)).unwrap();
+        fs::write(dir.join("modules").join(name).join("scpm.yaml"), format!("scala: none\n{extra}")).unwrap();
+    }
+}
+
+fn jackson_core(l: &Value, variant: &str) -> String {
+    strings(&l["variants"][variant]["compileClasspath"])
+        .into_iter()
+        .find(|k| k.starts_with("com.fasterxml.jackson.core:jackson-core:"))
+        .unwrap()
+}
+
+#[test]
+fn joint_resolution_applies_one_version_per_bom() {
+    if !cs_available() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    let a = "dependencies:\n  com.fasterxml.jackson.core:jackson-databind: 2.17.0\nboms:\n  com.fasterxml.jackson:jackson-bom: 2.17.3\n";
+    // b's own BOM wins over its upstream's, whatever the versions' string order.
+    two_java_modules(
+        ws.path(),
+        "",
+        a,
+        "dependencies:\n  a: workspace:*\nboms:\n  com.fasterxml.jackson:jackson-bom: 2.18.2\n",
+    );
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    let l = lock(ws.path());
+    assert_eq!(jackson_core(&l, "a@jvm"), "com.fasterxml.jackson.core:jackson-core:2.17.3");
+    assert_eq!(jackson_core(&l, "b@jvm"), "com.fasterxml.jackson.core:jackson-core:2.18.2");
+
+    // Without a BOM of its own, b gets its upstream's.
+    two_java_modules(ws.path(), "", a, "dependencies:\n  a: workspace:*\n");
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    assert_eq!(jackson_core(&lock(ws.path()), "b@jvm"), "com.fasterxml.jackson.core:jackson-core:2.17.3");
+}
+
+#[test]
+fn locked_bom_ranges_are_not_reselected_when_a_variant_relocks() {
+    if !cs_available() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    let bom_key = "bom:com.fasterxml.jackson:jackson-bom";
+    let lib = "dependencies:\n  com.fasterxml.jackson.core:jackson-databind: 2.17.0\nboms:\n  com.fasterxml.jackson:jackson-bom: ~2.17.0\n";
+    java_workspace(ws.path(), "", lib);
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    // Pretend the range was locked when 2.17.1 was the latest.
+    let path = ws.path().join("scpm-lock.yaml");
+    let mut l: serde_yaml_ng::Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    l["variants"]["lib@jvm"]["specifiers"][bom_key]["version"] = "2.17.1".into();
+    fs::write(&path, serde_yaml_ng::to_string(&l).unwrap()).unwrap();
+
+    // An unrelated edit re-locks lib@jvm; the unchanged BOM range keeps its version.
+    let edited = lib.replace("2.17.0\nboms", "2.17.0\n  org.slf4j:slf4j-api: 2.0.17\nboms");
+    assert_ne!(edited, lib);
+    java_workspace(ws.path(), "", &edited);
+    let summary = json_install(ws.path(), &shared_cache(), &[]);
+    assert_eq!(summary["relocked"], serde_json::json!(["lib@jvm"]));
+    let l = lock(ws.path());
+    assert_eq!(l["variants"]["lib@jvm"]["specifiers"][bom_key]["version"], "2.17.1");
+    assert_eq!(jackson_core(&l, "lib@jvm"), "com.fasterxml.jackson.core:jackson-core:2.17.1");
+}
+
+#[test]
+fn catalog_selections_under_the_pre_sharing_key_are_honoured() {
+    if !cs_available() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    let write = |extra: &str| {
+        fs::write(
+            ws.path().join("scpm-workspace.yaml"),
+            "modules: ['modules/*']\ntoolchain: {scala: '3.9.0'}\ncatalog:\n  org.slf4j:slf4j-api: ~2.0.0\n",
+        )
+        .unwrap();
+        fs::create_dir_all(ws.path().join("modules/m")).unwrap();
+        fs::write(
+            ws.path().join("modules/m/scpm.yaml"),
+            format!("dependencies:\n  org.slf4j:slf4j-api: catalog\n{extra}"),
+        )
+        .unwrap();
+    };
+    write("");
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    // Rewrite the selection as a lock from before Java coordinates shared one: keyed by the
+    // variant's Scala version, at an older version within the range.
+    let path = ws.path().join("scpm-lock.yaml");
+    let mut l: serde_yaml_ng::Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let catalogs = l["catalogs"].as_mapping_mut().unwrap();
+    assert!(catalogs.remove("default/org.slf4j:slf4j-api@jvm-java").is_some());
+    catalogs.insert(
+        "default/org.slf4j:slf4j-api@jvm-3".into(),
+        serde_yaml_ng::from_str("{range: ~2.0.0, version: 2.0.16}").unwrap(),
+    );
+    fs::write(&path, serde_yaml_ng::to_string(&l).unwrap()).unwrap();
+
+    // A no-op install rewrites the selection under the shared key instead of pruning it.
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    assert_eq!(lock(ws.path())["catalogs"]["default/org.slf4j:slf4j-api@jvm-java"]["version"], "2.0.16");
+    scpm(ws.path(), &shared_cache()).args(["install", "--frozen"]).assert().success();
+
+    // An unrelated edit re-locks m@jvm-3; the range keeps its version.
+    write("  org.slf4j:slf4j-simple: 2.0.16\n");
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    let l = lock(ws.path());
+    assert_eq!(l["catalogs"]["default/org.slf4j:slf4j-api@jvm-java"]["version"], "2.0.16", "{l:#}");
+    assert!(l["catalogs"].get("default/org.slf4j:slf4j-api@jvm-3").is_none());
+    assert!(strings(&l["variants"]["m@jvm-3"]["compileClasspath"]).contains(&"org.slf4j:slf4j-api:2.0.16".to_string()));
+}
+
+#[test]
+fn conflicting_pre_sharing_selections_are_reported() {
+    if !cs_available() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    fs::write(
+        ws.path().join("scpm-workspace.yaml"),
+        "modules: ['modules/*']\ntoolchain: {scala: '3.9.0'}\ncatalog:\n  org.slf4j:slf4j-api: ~2.0.0\n",
+    )
+    .unwrap();
+    fs::create_dir_all(ws.path().join("modules/m")).unwrap();
+    fs::write(
+        ws.path().join("modules/m/scpm.yaml"),
+        "scala: ['3.9.0', '2.13.18']\ndependencies:\n  org.slf4j:slf4j-api: catalog\n",
+    )
+    .unwrap();
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    // A lock from before sharing: one selection per Scala version, and they disagree.
+    let path = ws.path().join("scpm-lock.yaml");
+    let mut l: serde_yaml_ng::Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let catalogs = l["catalogs"].as_mapping_mut().unwrap();
+    assert!(catalogs.remove("default/org.slf4j:slf4j-api@jvm-java").is_some());
+    for (binary, version) in [("3", "2.0.16"), ("2.13", "2.0.15")] {
+        catalogs.insert(
+            format!("default/org.slf4j:slf4j-api@jvm-{binary}").into(),
+            serde_yaml_ng::from_str(&format!("{{range: ~2.0.0, version: {version}}}")).unwrap(),
+        );
+    }
+    fs::write(&path, serde_yaml_ng::to_string(&l).unwrap()).unwrap();
+
+    let out = scpm(ws.path(), &shared_cache()).arg("install").assert().success().get_output().clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Java coordinates now share one selection"), "{err}");
+    assert!(err.contains("2.0.15") && err.contains("2.0.16"), "{err}");
+    let shared = lock(ws.path())["catalogs"]["default/org.slf4j:slf4j-api@jvm-java"]["version"].clone();
+    assert!(shared == "2.0.16" || shared == "2.0.15", "{shared}");
+}
+
+#[test]
+fn a_topology_change_that_reorders_bom_owners_relocks() {
+    if !cs_available() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    fs::write(ws.path().join("scpm-workspace.yaml"), "modules: ['modules/*']\n").unwrap();
+    let module = |name: &str, body: &str| {
+        fs::create_dir_all(ws.path().join("modules").join(name)).unwrap();
+        fs::write(ws.path().join("modules").join(name).join("scpm.yaml"), format!("scala: none\n{body}")).unwrap();
+    };
+    let bom = |v: &str| format!("boms:\n  com.fasterxml.jackson:jackson-bom: {v}\n");
+    // r -> b, d; b -> e; e -> a; d -> c. a's BOM is 3 hops away, c's 2: c wins.
+    module(
+        "r",
+        "dependencies:\n  com.fasterxml.jackson.core:jackson-databind: 2.17.0\n  b: workspace:*\n  d: workspace:*\n",
+    );
+    module("b", "dependencies:\n  e: workspace:*\n");
+    module("e", "dependencies:\n  a: workspace:*\n");
+    module("d", "dependencies:\n  c: workspace:*\n");
+    module("a", &bom("2.17.3"));
+    module("c", &bom("2.18.2"));
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    assert_eq!(jackson_core(&lock(ws.path()), "r@jvm"), "com.fasterxml.jackson.core:jackson-core:2.18.2");
+
+    // b now depends on a directly: a and c are both 2 hops away and a wins the tie by id.
+    // r's own config and its upstream set are unchanged.
+    module("b", "dependencies:\n  e: workspace:*\n  a: workspace:*\n");
+    let summary = json_install(ws.path(), &shared_cache(), &[]);
+    assert!(summary["relocked"].as_array().unwrap().contains(&"r@jvm".into()), "{summary:#}");
+    assert_eq!(jackson_core(&lock(ws.path()), "r@jvm"), "com.fasterxml.jackson.core:jackson-core:2.17.3");
+}
+
+#[test]
+fn a_legacy_selection_conflicting_with_an_existing_shared_one_is_reported() {
+    if !cs_available() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    fs::write(
+        ws.path().join("scpm-workspace.yaml"),
+        "modules: ['modules/*']\ntoolchain: {scala: '3.9.0'}\ncatalog:\n  org.slf4j:slf4j-api: ~2.0.0\n",
+    )
+    .unwrap();
+    // A Java-only module owns the shared `@jvm-java` selection; a Scala module has a legacy one.
+    for (name, extra) in [("j", "scala: none\n"), ("s", "")] {
+        fs::create_dir_all(ws.path().join("modules").join(name)).unwrap();
+        fs::write(
+            ws.path().join("modules").join(name).join("scpm.yaml"),
+            format!("{extra}dependencies:\n  org.slf4j:slf4j-api: catalog\n"),
+        )
+        .unwrap();
+    }
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    let path = ws.path().join("scpm-lock.yaml");
+    let mut l: serde_yaml_ng::Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let catalogs = l["catalogs"].as_mapping_mut().unwrap();
+    catalogs.insert(
+        "default/org.slf4j:slf4j-api@jvm-java".into(),
+        serde_yaml_ng::from_str("{range: ~2.0.0, version: 2.0.16}").unwrap(),
+    );
+    catalogs.insert(
+        "default/org.slf4j:slf4j-api@jvm-3".into(),
+        serde_yaml_ng::from_str("{range: ~2.0.0, version: 2.0.15}").unwrap(),
+    );
+    fs::write(&path, serde_yaml_ng::to_string(&l).unwrap()).unwrap();
+
+    let out = scpm(ws.path(), &shared_cache()).arg("install").assert().success().get_output().clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Java coordinates now share one selection"), "{err}");
+    assert!(err.contains("2.0.15") && err.contains("s@jvm-3"), "{err}");
+    assert_eq!(lock(ws.path())["catalogs"]["default/org.slf4j:slf4j-api@jvm-java"]["version"], "2.0.16");
 }
