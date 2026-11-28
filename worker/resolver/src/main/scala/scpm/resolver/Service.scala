@@ -189,7 +189,10 @@ final class Service(proxy: Option[ProxySpec], trust: Option[TrustSpec], userAgen
         // lower version. Coursier's fallback, a directory listing after a 404, often isn't
         // allowed (a Nexus without browse rights, S3 without ListBucket): its failures count
         // as no listing.
-        for (url, e) <- cache.entries if Service.under(url, Some(r.url)) && url.endsWith("/maven-metadata.xml")
+        // This repository's metadata for this module exactly: a nested repository's URL is under
+        // `r.url` too, and its answers aren't this repository's.
+        val metadataUrl = s"${Service.normalized(r.url)}/${org.replace('.', '/')}/$name/maven-metadata.xml"
+        for (url, e) <- cache.entries if url == metadataUrl
         do
           e.left.foreach { err =>
             Recording.status(err) match
@@ -204,12 +207,12 @@ final class Service(proxy: Option[ProxySpec], trust: Option[TrustSpec], userAgen
         // The metadata was served but gave no versions (unparseable, say): an error too, not an
         // empty list. Only a metadata 404 with no listing is "no versions".
         val metadataServed = cache.entries.exists((url, e) =>
-          Service.under(url, Some(r.url)) && url.endsWith("/maven-metadata.xml") && e.isRight
+          url == metadataUrl && e.isRight
         )
         outcome.left.foreach { err =>
           if metadataServed then
             val url = cache.entries.collectFirst {
-              case (u, Right(_)) if Service.under(u, Some(r.url)) && u.endsWith("/maven-metadata.xml") => u
+              case (u, Right(_)) if u == metadataUrl => u
             }.getOrElse(r.url)
             throw ResolverError("transport", s"repository `$id` served $url, which gave no versions: $err", TransportData(id, url, err))
         }

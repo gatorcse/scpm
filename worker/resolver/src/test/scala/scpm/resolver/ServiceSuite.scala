@@ -272,6 +272,23 @@ class ServiceSuite extends munit.FunSuite:
     finally server.statuses.remove("/public/org/fix/garbled/")
   }
 
+  test("listVersions with nested repository URLs judges each by its own metadata") {
+    // `root` is the server's root, `public` a repository under it; only `public` has the module.
+    val nested = List(RepoSpec("root", server.origin + "/"), RepoSpec("public", server.url("public")))
+    val r = service.listVersions(ListVersionsParams(nested, Files.createTempDirectory("c").toFile.getPath, module = "org.fix:base"))
+    assertEquals(r.versions, List("0.1", "1.0"))
+    assertEquals(r.repositories.map(_.id), List("root", "public"))
+    // A refusal from `public` is `public`'s, not `root`'s.
+    server.statuses.put("/public/org/fix/base/maven-metadata.xml", 401)
+    try
+      val err = intercept[ResolverError](
+        service.listVersions(ListVersionsParams(nested, Files.createTempDirectory("c").toFile.getPath, module = "org.fix:base"))
+      )
+      assertEquals(err.body.code, "unauthorized")
+      assert(err.body.message.contains("repository `public`"), err.body.message)
+    finally server.statuses.remove("/public/org/fix/base/maven-metadata.xml")
+  }
+
   test("refresh re-checks changing metadata whatever the TTL") {
     val cache = Files.createTempDirectory("resolver-cache").toFile
     server.metadata("public", "org.fix", "fresh", Seq("1.0"))

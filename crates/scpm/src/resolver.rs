@@ -359,21 +359,33 @@ impl Sidecar {
     /// it passes: a JVM that stops reading its input would otherwise block the write itself.
     fn call(&self, method: &str, params: Value, limit: Duration) -> Result<Value, ResolverError> {
         let (done, finished) = std::sync::mpsc::channel::<()>();
-        let expired = std::sync::atomic::AtomicBool::new(false);
+        // `(replied, expired)`, decided under one lock: a reply that lands right at the deadline
+        // is either used (and the process lives on) or dropped (and the process killed), never
+        // used with the process killed behind it.
+        let state = std::sync::Mutex::new((false, false));
         let result = std::thread::scope(|s| {
-            let expired = &expired;
+            let state = &state;
             s.spawn(move || {
                 if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = finished.recv_timeout(limit) {
-                    expired.store(true, std::sync::atomic::Ordering::SeqCst);
-                    self.worker.kill("was stopped: it did not answer in time");
+                    let mut st = state.lock().expect("call state");
+                    if !st.0 {
+                        st.1 = true;
+                        self.worker.kill("was stopped: it did not answer in time");
+                    }
                 }
             });
             let result = self.worker.request(method, params);
+            let mut st = state.lock().expect("call state");
+            if !st.1 {
+                st.0 = true;
+            }
+            drop(st);
             let _ = done.send(());
             result
         });
+        let expired = state.lock().expect("call state").1;
         match result {
-            Err(_) if expired.load(std::sync::atomic::Ordering::SeqCst) => Err(WorkerError::Timeout(format!(
+            _ if expired => Err(WorkerError::Timeout(format!(
                 "the resolver sidecar did not answer `{method}` within {}s, and was stopped",
                 limit.as_secs_f64().ceil()
             ))
