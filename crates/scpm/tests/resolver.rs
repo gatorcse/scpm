@@ -169,6 +169,24 @@ fn a_mapped_native_jar_the_repository_lacks() {
         warnings.contains("no native jar on linux-aarch64 (`linux-aarch_64`)") && warnings.contains("404 or 403"),
         "{summary}"
     );
+    // On a linux-aarch64 host, every later install says so again, frozen ones too: it is read
+    // from the lock, not only from the run that re-locked.
+    let arm = fake_jdk(ws.path(), "Linux", "aarch64");
+    for args in [&["--json", "install"][..], &["--json", "install", "--frozen"]] {
+        let out = scpm(ws.path(), cache.path())
+            .env_remove("SCPM_JAVA")
+            .env("SCPM_JAVA_HOME", &arm)
+            .args(args)
+            .assert()
+            .success();
+        let summary: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert_eq!(summary["relocked"], serde_json::json!([]), "{summary}");
+        let warnings = summary["warnings"].to_string();
+        assert!(
+            warnings.contains("io.netty:netty-transport-native-epoll:4.1.115.Final has no native jar for linux-aarch64 (`linux-aarch_64`)"),
+            "{args:?}: {summary}"
+        );
+    }
     // A mapping the user wrote, with a typo: an error, and no lock is written.
     let ws = tempfile::tempdir().unwrap();
     workspace(

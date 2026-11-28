@@ -76,11 +76,13 @@ object Interval:
 final class Recording(underlying: FileCache[Task]) extends Cache[Task]:
   val log = ConcurrentLinkedQueue[(String, Either[String, Unit])]()
 
-  private val cacheRoot = underlying.location.getCanonicalPath
+  private val cacheRoots =
+    val l = underlying.location
+    Seq(l.getPath, l.getAbsolutePath, l.getCanonicalPath).distinct
 
   private def recorded(f: Cache.Fetch[Task]): Cache.Fetch[Task] = artifact =>
     EitherT(f(artifact).run.map { result =>
-      if !result.left.exists(Recording.localMiss(_, cacheRoot)) then log.add(artifact.url -> result.map(_ => ()))
+      if !result.left.exists(Recording.localMiss(_, cacheRoots)) then log.add(artifact.url -> result.map(_ => ()))
       result
     })
 
@@ -99,17 +101,26 @@ final class Recording(underlying: FileCache[Task]) extends Cache[Task]:
   def entries: List[(String, Either[String, Unit])] = log.asScala.toList
 
 object Recording:
-  /** Whether an error is the cache's own miss (a file not in the cache, or too old there), which
-    * no repository answered: those name a path under the cache, or are `FileTooOldOrNotFound`. */
-  def localMiss(error: String, cacheRoot: String): Boolean =
-    error.contains(cacheRoot) || status(error) == "offline"
+  /** Whether an error is the cache's own miss, which no repository answered. By kind, never by
+    * whether the text names a cached file (a wrong checksum names the cached file too, and must
+    * be kept): `not found: <cached path>`, `<cached path> not found`, or `file in cache not
+    * found or too old`. `cacheRoots` are the cache's spellings (as given, absolute, canonical):
+    * coursier writes the path as given, which a symlink makes differ from the canonical one. */
+  def localMiss(error: String, cacheRoots: Seq[String]): Boolean =
+    val e = error.trim
+    def underCache(path: String) = cacheRoots.exists(r => path.trim.startsWith(r))
+    e.startsWith("file in cache not found or too old") ||
+      (e.startsWith("not found: ") && underCache(e.stripPrefix("not found: "))) ||
+      (e.endsWith(" not found") && underCache(e.stripSuffix(" not found")))
 
   /** `(expected, actual)` from a checksum error's text, when it has them (both empty otherwise). */
   def checksums(error: String): (String, String) =
-    val pattern = """.*expected \S+ (\S+).*got (\S+?)\)?$""".r
-    error.trim match
-      case pattern(expected, actual) => (expected, actual)
-      case _                         => ("", "")
+    // `expected [<type>] <hex> …, got <hex>`: the digests are the hex runs after each word.
+    val expected = """expected (?:[A-Za-z0-9-]*[A-Za-z][A-Za-z0-9-]* )?([0-9a-fA-F]+)""".r
+    val actual = """got ([0-9a-fA-F]+)""".r
+    (expected.findFirstMatchIn(error), actual.findFirstMatchIn(error)) match
+      case (Some(e), Some(a)) => (e.group(1), a.group(1))
+      case _                  => ("", "")
 
   /** An HTTP status, or what went wrong, from coursier's error text (`ArtifactError.describe`). */
   def status(error: String): String =
@@ -527,7 +538,7 @@ object Service:
           case (Some(t), _, _, _) =>
             ResolverError("unauthorized", s"repository `${t.repository}` refused ${t.url} (HTTP ${t.status})", UnauthorizedData(t.repository, t.url, t.status.toInt))
           case (_, Some(t), _, _) =>
-            val text = recording.entries.collectFirst { case (u, Left(e)) if u == t.url => e }.getOrElse("")
+            val text = recording.entries.collectFirst { case (u, Left(e)) if u == t.url && Recording.status(e) == "checksum" => e }.getOrElse("")
             val (expected, actual) = Recording.checksums(text)
             ResolverError("checksum", s"${t.url}: a served checksum didn't match ($text)", ChecksumData(t.url, expected, actual))
           case (_, _, Some(t), Some((c, _))) =>

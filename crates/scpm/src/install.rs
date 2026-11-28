@@ -739,6 +739,62 @@ pub(crate) fn classpath_request(
 /// The native mappings for one classpath of a JVM variant (design §5.4): its dependencies'
 /// `natives:` (the variant's own, then upstream ones), then `lock.nativeClassifiers`, each
 /// replacing the built-in mapping for its module.
+/// Mapped modules on the host system's locked classpaths whose native jar for the host isn't
+/// there, read from the lock alone: for each variant the sidecar locked against this table
+/// (`fullContext`, and the header's `nativeMappings` equal to the table's version), each main
+/// jar whose mapping (built-in, or the manifest's override) names a classifier for the host.
+fn host_native_warnings(
+    ws: &Workspace,
+    graph: &Graph,
+    lock: &Lockfile,
+    host: &str,
+    table: &crate::natives::Table,
+) -> Vec<String> {
+    if lock.native_mappings != Some(table.version) || !lock.systems.iter().any(|s| s == host) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (id, vlock) in lock.variants.iter().filter(|(_, l)| l.full_context) {
+        let Some(v) = ws.variant(id) else { continue };
+        for kind in ClasspathKind::ALL {
+            let specs = native_specs(ws, graph, v, kind);
+            let entries = kind.classpath(vlock).project(host);
+            let keys: BTreeSet<&str> = entries
+                .iter()
+                .filter_map(|e| match e {
+                    ClasspathEntry::Artifact(k) => Some(k.as_str()),
+                    ClasspathEntry::Module { .. } => None,
+                })
+                .collect();
+            for key in keys.iter().filter(|k| k.split(':').count() == 3 && !k.contains('@')) {
+                let mut parts = key.split(':');
+                let (Some(g), Some(a), Some(ver)) = (parts.next(), parts.next(), parts.next()) else { continue };
+                let module = format!("{g}:{a}");
+                let classifier = specs
+                    .iter()
+                    .filter(|s| s.module == module)
+                    .filter(|s| s.versions.as_deref().is_none_or(|i| interval_contains(i, ver)))
+                    .find_map(|s| s.natives.get(host));
+                if let Some(c) = classifier
+                    && !keys.contains(format!("{key}:{c}").as_str())
+                {
+                    let w = format!(
+                        "{key} has no native jar for {host} (`{c}`) in {}: the repository didn't serve it when \
+                         {id} was locked, so {id} runs without it here\n  help: once the repository (or the mirror \
+                         you reach it through) serves it, remove {id} from {} and run `scpm install`",
+                        crate::lockfile::LOCK_FILE,
+                        crate::lockfile::LOCK_FILE
+                    );
+                    if !out.contains(&w) {
+                        out.push(w);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 fn native_specs(ws: &Workspace, graph: &Graph, v: &Variant, kind: ClasspathKind) -> Vec<crate::natives::NativeSpec> {
     if v.platform != Platform::Jvm {
         return Vec::new();
@@ -1251,6 +1307,14 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     let host = crate::system::host();
     notes.extend(host.note.clone());
     let keys = restore_keys(&lock, &host.system, &opts.restore, &mut notes)?;
+    // Every install, frozen included: a mapped module on the host's classpaths without its
+    // native jar (the repository had none when it was locked) is said each time, not only on
+    // the run that re-locked it (design §5.4, "Mapped modules contribute a jar").
+    for w in host_native_warnings(ws, graph, &lock, &host.system, table) {
+        if !warnings.contains(&w) {
+            warnings.push(w);
+        }
+    }
 
     // Whenever a sidecar install writes the lock at all, every variant was re-locked against
     // this scpm's mapping table (affected ones in this run), so the header becomes its version;

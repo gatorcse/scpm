@@ -90,6 +90,9 @@ final class FixtureServer:
         for c <- classifiers do files(base + (if c.isEmpty then "" else s"-$c") + ".jar") = s"$name $c".getBytes
     }
 
+  /** Serves `body` at `path`. */
+  def put(path: String, body: Array[Byte]): Unit = files.synchronized(files(path) = body)
+
   def metadata(repo: String, org: String, name: String, versions: Seq[String]): Unit =
     val xml =
       s"<metadata><groupId>$org</groupId><artifactId>$name</artifactId><versioning><versions>${versions.map(v => s"<version>$v</version>").mkString}</versions></versioning></metadata>"
@@ -273,6 +276,34 @@ class ServiceSuite extends munit.FunSuite:
       server.statuses.remove("/public/org/fix/base/maven-metadata.xml")
       server.metadata("public", "org.fix", "base", Seq("0.1", "1.0"))
   }
+
+  // A served checksum that doesn't match is `checksum`, never a quiet miss: the error names the
+  // cached file, which must not make it look like the cache's own miss. With the cache's
+  // canonical path and through a symlink (coursier writes the path as given).
+  for (kind, cacheDir) <- Seq(
+      "canonical" -> (() => Files.createTempDirectory("resolver-cache").toRealPath().toFile),
+      "symlinked" -> { () =>
+        val real = Files.createTempDirectory("resolver-cache-real").toRealPath()
+        val link = Files.createTempDirectory("resolver-cache-links").toRealPath().resolve("cache")
+        Files.createSymbolicLink(link, real).toFile
+      }
+    )
+  do
+    test(s"a bad served checksum is `checksum`, in resolve and listVersions ($kind cache)") {
+      server.module("public", "org.fix", "badsum", "1.0")
+      server.put("/public/org/fix/badsum/1.0/badsum-1.0.pom.sha1", "1234567890abcdef1234567890abcdef12345678".getBytes)
+      val Seq(r) = resolve(cacheDir(), request(List("linux-x86_64"), root = "org.fix:badsum", natives = Nil)): @unchecked
+      val err = r.error.getOrElse(fail(s"expected an error: $r"))
+      assertEquals(err.code, "checksum", err.toString)
+      val data = new String(com.github.plokhotnyuk.jsoniter_scala.core.writeToArray(err.data.get), "UTF-8")
+      assert(data.contains("\"expected\":\"1234567890abcdef1234567890abcdef12345678\""), s"$data ${err.message}")
+      assert(data.contains("\"actual\":\"38a"), s"$data ${err.message}")
+
+      server.metadata("public", "org.fix", "badmeta", Seq("1.0"))
+      server.put("/public/org/fix/badmeta/maven-metadata.xml.sha1", ("0" * 40).getBytes)
+      val e = intercept[ResolverError](service.listVersions(ListVersionsParams(repos, cacheDir().getPath, module = "org.fix:badmeta")))
+      assertEquals(e.body.code, "checksum")
+    }
 
   test("an offline miss names the POM it would have needed") {
     val cache = Files.createTempDirectory("resolver-cache").toFile
