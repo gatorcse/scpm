@@ -5,10 +5,11 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -30,6 +31,9 @@ pub enum WorkerError {
     /// The process ended before answering; the message names it and includes context.
     #[error("{0}")]
     Exited(String),
+    /// No answer in time.
+    #[error("{0}")]
+    Timeout(String),
     #[error("compile worker error ({code}): {message}")]
     Remote { code: String, message: String },
 }
@@ -82,6 +86,52 @@ pub struct Java {
     pub major: u32,
 }
 
+/// The first executable file named `name` in the directories of `path` (a `PATH` value),
+/// skipping non-executable entries the way process spawning does.
+pub fn find_in_path(path: &std::ffi::OsStr, name: &Path) -> Option<PathBuf> {
+    // Absolute (symlinks kept): a relative `PATH` entry must name the same file after a child
+    // is started in another directory (test JVMs run in their module directory).
+    env::split_paths(path)
+        .map(|d| d.join(name))
+        .find(|p| is_executable(p))
+        .map(|p| std::path::absolute(&p).unwrap_or(p))
+}
+
+/// [`find_in_path`] on `$PATH`.
+pub fn find_on_path(name: &Path) -> Option<PathBuf> {
+    find_in_path(&env::var_os("PATH")?, name)
+}
+
+fn is_executable(p: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        p.is_file()
+    }
+}
+
+/// A bare executable name resolved on `PATH` (so the probe, the launch and fingerprints all use
+/// the same file); paths are kept as they are.
+fn on_path(exe: PathBuf) -> PathBuf {
+    if exe.components().count() == 1 { find_on_path(&exe).unwrap_or(exe) } else { exe }
+}
+
+/// Opens a log for appending, refusing a symlink planted at its path.
+pub fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
+}
+
 /// Finds `java`: `SCPM_JAVA_HOME`, `JAVA_HOME`, then `PATH`; checks its version once per process.
 pub fn java() -> Result<Java, WorkerError> {
     static JAVA: OnceLock<Result<Java, WorkerError>> = OnceLock::new();
@@ -90,13 +140,19 @@ pub fn java() -> Result<Java, WorkerError> {
 
 fn detect_java() -> Result<Java, WorkerError> {
     let exe = if cfg!(windows) { "java.exe" } else { "java" };
-    let (path, source) = ["SCPM_JAVA_HOME", "JAVA_HOME"]
-        .iter()
-        .find_map(|var| {
-            let home = env::var_os(var).filter(|h| !h.is_empty())?;
-            Some((Path::new(&home).join("bin").join(exe), format!("${var}")))
+    // `SCPM_JAVA` names the executable itself (the daemon gets the exact one its key was
+    // computed for, which needn't be `<home>/bin/java`); otherwise `<home>/bin/java`, then PATH.
+    let explicit =
+        env::var_os("SCPM_JAVA").filter(|j| !j.is_empty()).map(|j| (PathBuf::from(j), "$SCPM_JAVA".to_string()));
+    let (path, source) = explicit
+        .or_else(|| {
+            ["SCPM_JAVA_HOME", "JAVA_HOME"].iter().find_map(|var| {
+                let home = env::var_os(var).filter(|h| !h.is_empty())?;
+                Some((Path::new(&home).join("bin").join(exe), format!("${var}")))
+            })
         })
         .unwrap_or_else(|| (PathBuf::from(exe), "PATH".to_string()));
+    let path = on_path(path);
     let version = java_version(&path, &source)?;
     let major = major_version(&version);
     if major < MIN_JAVA {
@@ -139,27 +195,10 @@ fn major_version(version: &str) -> u32 {
 /// symlinks resolved. `None` when `java` is not an executable in a `bin` directory or the file
 /// is missing or has no usable `JAVA_VERSION`; a wrapper script outside a JDK has none.
 fn release_version(java: &Path) -> Option<String> {
-    let java = if java.components().count() == 1 {
-        env::split_paths(&env::var_os("PATH")?).map(|d| d.join(java)).find(|p| runnable(p))?
-    } else {
-        java.to_path_buf()
-    };
-    let java = java.canonicalize().ok().filter(|p| runnable(p))?;
+    let java = if java.components().count() == 1 { find_on_path(java)? } else { java.to_path_buf() };
+    let java = java.canonicalize().ok().filter(|p| is_executable(p))?;
     let bin = java.parent().filter(|b| b.file_name().is_some_and(|n| n == "bin"))?;
     parse_release(&std::fs::read_to_string(bin.parent()?.join("release")).ok()?)
-}
-
-/// Whether spawning `p` can run it: an executable file.
-fn runnable(p: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        p.is_file()
-    }
 }
 
 /// What `java -version` would report, from a JDK `release` file: `JAVA_VERSION` (`25.0.2`,
@@ -201,10 +240,25 @@ fn parse_java_version(output: &str) -> Option<String> {
 }
 
 /// An identity of the JDK for build fingerprints, found without starting a JVM when possible:
-/// the `release` file of the JDK home that `detect_java` uses (`SCPM_JAVA_HOME`, `JAVA_HOME`,
-/// or the resolved `java` on `PATH`). Falls back to running `java -version`, never to another
-/// JDK's `release` file.
+/// the `release` file of the JDK that `detect_java` uses (`SCPM_JAVA`, `SCPM_JAVA_HOME`,
+/// `JAVA_HOME`, or the resolved `java` on `PATH`). Falls back to running `java -version`, never
+/// to another JDK's `release` file.
 pub fn java_identity() -> Result<String, WorkerError> {
+    // Same precedence as `detect_java`: an explicit `SCPM_JAVA` executable comes first, so
+    // switching it changes the fingerprint even while `JAVA_HOME` is set.
+    if let Some(explicit) = env::var_os("SCPM_JAVA").filter(|j| !j.is_empty()) {
+        // A bare name runs whatever PATH finds, so identify that, not the literal name.
+        let exe = on_path(PathBuf::from(explicit));
+        let real = exe.canonicalize().unwrap_or(exe);
+        let release = real.parent().and_then(Path::parent).and_then(|home| {
+            let text = std::fs::read_to_string(home.join("release")).ok()?;
+            text.lines().find(|l| l.starts_with("JAVA_VERSION=")).map(str::to_string)
+        });
+        return Ok(match release {
+            Some(line) => format!("{} {line}", real.display()),
+            None => format!("{} {}", real.display(), java()?.version),
+        });
+    }
     if let Some(id) = selected_java_home(|v| env::var_os(v)).as_deref().and_then(release_identity) {
         return Ok(id);
     }
@@ -212,16 +266,15 @@ pub fn java_identity() -> Result<String, WorkerError> {
     Ok(format!("{} {}", java.path.display(), java.version))
 }
 
-/// The JDK home `detect_java` picks, with the same precedence: the first non-empty of
-/// `SCPM_JAVA_HOME` and `JAVA_HOME`, else the home of the `java` found on `PATH`.
+/// The JDK home `detect_java` picks when `SCPM_JAVA` is unset, with the same precedence: the
+/// first non-empty of `SCPM_JAVA_HOME` and `JAVA_HOME`, else the home of the `java` found on
+/// `PATH`.
 fn selected_java_home(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
     let exe = if cfg!(windows) { "java.exe" } else { "java" };
     if let Some(home) = ["SCPM_JAVA_HOME", "JAVA_HOME"].iter().find_map(|v| var(v).filter(|h| !h.is_empty())) {
         return Some(PathBuf::from(home));
     }
-    env::split_paths(&var("PATH")?)
-        .map(|d| d.join(exe))
-        .find(|p| p.is_file())
+    find_in_path(&var("PATH")?, Path::new(exe))
         .and_then(|p| p.canonicalize().ok())
         .and_then(|p| p.parent()?.parent().map(Path::to_path_buf))
 }
@@ -271,15 +324,41 @@ pub struct Spawn<'a> {
 /// Requests waiting for a reply; `None` once the worker's stdout has closed.
 type Pending = Arc<Mutex<Option<HashMap<u64, Sender<Reply>>>>>;
 
-/// A running worker. Requests may be sent from several threads at once.
+/// Receives the events of one routed request. It runs on the thread reading the worker's
+/// output, so it must not block.
+pub type EventSink = Arc<dyn Fn(Value) + Send + Sync>;
+
+/// Worker stderr logs are truncated when they grow past this size.
+const LOG_CAP: u64 = 10 * 1024 * 1024;
+
+/// Per-request event sinks, keyed by request id (see [`Worker::request_routed`]).
+type Sinks = Arc<Mutex<HashMap<u64, EventSink>>>;
+
+/// A running worker: a child JVM on stdio, or a connection to the shared daemon. Requests may
+/// be sent from several threads at once.
 pub struct Worker {
     name: String,
     own_group: bool,
-    child: Mutex<Child>,
-    stdin: Mutex<Option<ChildStdin>>,
+    /// `None` when connected to a daemon.
+    child: Mutex<Option<Child>>,
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
     pending: Pending,
+    sinks: Sinks,
     next_id: AtomicU64,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// The `initialize` result, once initialized.
+    init: OnceLock<Value>,
+    /// The connection, when connected to a daemon (to close it both ways).
+    #[cfg(unix)]
+    socket: Option<std::os::unix::net::UnixStream>,
+}
+
+fn push_tail(tail: &Mutex<VecDeque<String>>, line: String) {
+    let mut t = tail.lock().expect("tail");
+    if t.len() == 40 {
+        t.pop_front();
+    }
+    t.push_back(line);
 }
 
 impl Worker {
@@ -300,7 +379,6 @@ impl Worker {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
-        let log_file = spec.log_file;
         let mut child =
             cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| {
                 WorkerError::Spawn {
@@ -308,32 +386,29 @@ impl Worker {
                     message: e.to_string(),
                 }
             })?;
-        let name = spec.name.to_string();
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
         let stdin = child.stdin.take().expect("piped");
-        let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
         let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
-        let push_tail = |tail: &Mutex<VecDeque<String>>, line: String| {
-            let mut t = tail.lock().expect("tail");
-            if t.len() == 40 {
-                t.pop_front();
-            }
-            t.push_back(line);
-        };
-
         {
             let tail = stderr_tail.clone();
-            let mut log = log_file.and_then(|p| {
+            let mut log = spec.log_file.and_then(|p| {
                 std::fs::create_dir_all(p.parent()?).ok()?;
-                std::fs::OpenOptions::new().create(true).append(true).open(p).ok()
+                open_log(p).ok()
             });
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stderr);
                 let mut buf = Vec::new();
+                let mut lines = 0u64;
                 while reader.read_until(b'\n', &mut buf).is_ok_and(|n| n > 0) {
                     let line = String::from_utf8_lossy(&buf).trim_end().to_string();
                     if let Some(log) = log.as_mut() {
+                        lines += 1;
+                        // Keep a chatty worker from filling the disk (the file is in append mode).
+                        if lines.is_multiple_of(256) && log.metadata().is_ok_and(|m| m.len() > LOG_CAP) {
+                            let _ = log.set_len(0);
+                            let _ = writeln!(log, "[log truncated at {} MB]", LOG_CAP >> 20);
+                        }
                         let _ = writeln!(log, "{line}");
                     }
                     push_tail(&tail, line);
@@ -341,19 +416,99 @@ impl Worker {
                 }
             });
         }
+        let mut worker = Worker::attach(spec.name, stdout, Box::new(stdin), Some(child), stderr_tail, on_event);
+        worker.own_group = spec.own_process_group;
+        if spec.initialize {
+            worker.initialize(None)?;
+        }
+        Ok(worker)
+    }
+
+    /// Wraps a connection to a worker served on a Unix socket (the shared daemon) and, if
+    /// `initialize`, initializes it, giving up after `timeout` without an answer.
+    #[cfg(unix)]
+    pub fn over_socket(
+        name: &str,
+        stream: std::os::unix::net::UnixStream,
+        timeout: Duration,
+        initialize: bool,
+        on_event: impl Fn(Value) + Send + 'static,
+    ) -> Result<Worker, WorkerError> {
+        let setup = |e: std::io::Error| WorkerError::Setup(format!("{name}: {e}"));
+        // A stalled peer must not block a writer forever.
+        stream.set_write_timeout(Some(Duration::from_secs(10))).map_err(setup)?;
+        let reader = stream.try_clone().map_err(setup)?;
+        let writer = stream.try_clone().map_err(setup)?;
+        let mut worker =
+            Worker::attach(name, reader, Box::new(writer), None, Arc::new(Mutex::new(VecDeque::new())), on_event);
+        worker.socket = Some(stream);
+        if initialize {
+            worker.initialize(Some(timeout))?;
+        }
+        Ok(worker)
+    }
+
+    /// The worker's `initialize` result (absent if it wasn't initialized).
+    pub fn init_result(&self) -> Option<&Value> {
+        self.init.get()
+    }
+
+    /// Wires a worker around a transport: a thread reads responses and events from `reader`.
+    fn attach(
+        name: &str,
+        reader: impl std::io::Read + Send + 'static,
+        writer: Box<dyn Write + Send>,
+        child: Option<Child>,
+        stderr_tail: Arc<Mutex<VecDeque<String>>>,
+        on_event: impl Fn(Value) + Send + 'static,
+    ) -> Worker {
+        let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
+        let sinks: Sinks = Arc::new(Mutex::new(HashMap::new()));
         {
             let pending = pending.clone();
+            let sinks = sinks.clone();
             let tail = stderr_tail.clone();
-            let name = name.clone();
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(stdout);
-                let mut buf = Vec::new();
-                while reader.read_until(b'\n', &mut buf).is_ok_and(|n| n > 0) {
-                    match serde_json::from_slice::<Value>(&buf) {
-                        Ok(msg) if msg.get("method").and_then(Value::as_str) == Some("event") => {
-                            on_event(msg["params"].clone())
+            let name = name.to_string();
+            // One thread only reads, so the peer is never held up by slow event handling (a
+            // terminal paused by `| less`); another handles messages in order, so a response
+            // still comes after its request's events.
+            let (tx, rx) = channel::<Value>();
+            {
+                let tail = tail.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(reader);
+                    let mut buf = Vec::new();
+                    while reader.read_until(b'\n', &mut buf).is_ok_and(|n| n > 0) {
+                        match serde_json::from_slice::<Value>(&buf) {
+                            Ok(msg) => {
+                                if tx.send(msg).is_err() {
+                                    break;
+                                }
+                            }
+                            // Not JSON (shouldn't happen with the launch flags): keep it as context.
+                            Err(_) => {
+                                push_tail(&tail, format!("(stdout) {}", String::from_utf8_lossy(&buf).trim_end()))
+                            }
                         }
-                        Ok(msg) => {
+                        buf.clear();
+                    }
+                });
+            }
+            std::thread::spawn(move || {
+                for msg in rx {
+                    match msg {
+                        msg if msg.get("method").and_then(Value::as_str) == Some("event") => {
+                            let params = msg["params"].clone();
+                            // Called outside the lock: one sink must never hold up the others.
+                            let sink = params["requestId"]
+                                .as_u64()
+                                .and_then(|id| sinks.lock().expect("sinks").get(&id).cloned());
+                            match sink {
+                                Some(sink) => sink(params),
+                                None => on_event(params),
+                            }
+                        }
+                        msg => {
                             if let Some(id) = msg.get("id").and_then(Value::as_u64) {
                                 let reply = match msg.get("error") {
                                     Some(err) => Err(WorkerError::Remote {
@@ -368,10 +523,7 @@ impl Worker {
                                 }
                             }
                         }
-                        // Not JSON (shouldn't happen with the launch flags): keep it as context.
-                        Err(_) => push_tail(&tail, format!("(stdout) {}", String::from_utf8_lossy(&buf).trim_end())),
                     }
-                    buf.clear();
                 }
                 // EOF: fail everything still waiting, and refuse new requests.
                 let context = format!("{name} exited unexpectedly{}", tail_context(&tail));
@@ -381,66 +533,172 @@ impl Worker {
                 }
             });
         }
-        let worker = Worker {
-            name,
-            own_group: spec.own_process_group,
+        Worker {
+            name: name.to_string(),
+            own_group: false,
             child: Mutex::new(child),
-            stdin: Mutex::new(Some(stdin)),
+            writer: Mutex::new(Some(writer)),
             pending,
+            sinks,
             next_id: AtomicU64::new(1),
             stderr_tail,
-        };
-        if spec.initialize {
-            worker.handshake()?;
+            init: OnceLock::new(),
+            #[cfg(unix)]
+            socket: None,
         }
-        Ok(worker)
     }
 
-    /// Sends `initialize` and checks the protocol version (what `Spawn::initialize` does, for
-    /// callers that need the worker before the handshake, e.g. to be able to kill it).
-    pub fn handshake(&self) -> Result<(), WorkerError> {
-        let init = self.request("initialize", json!({"protocolVersion": PROTOCOL_VERSION}))?;
+    /// The child process id (not for a daemon connection).
+    pub fn pid(&self) -> Option<u32> {
+        self.child.lock().expect("child").as_ref().map(Child::id)
+    }
+
+    /// Sends `initialize` and checks the protocol version (for a worker spawned without it).
+    pub fn initialize(&self, timeout: Option<Duration>) -> Result<Value, WorkerError> {
+        let init = self.request_timeout("initialize", json!({"protocolVersion": PROTOCOL_VERSION}), timeout)?;
         if init["protocolVersion"].as_u64() != Some(PROTOCOL_VERSION) {
             return Err(WorkerError::Setup(format!(
                 "worker speaks protocol {}, expected {PROTOCOL_VERSION}",
                 init["protocolVersion"]
             )));
         }
-        Ok(())
+        let _ = self.init.set(init.clone());
+        Ok(init)
     }
 
     /// Sends a request and blocks until its response.
     pub fn request(&self, method: &str, params: Value) -> Result<Value, WorkerError> {
+        self.send_request(method, params, None, |_| {}, None)
+    }
+
+    /// Like [`Worker::request`], but fails if there is no answer within `timeout`.
+    pub fn request_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, WorkerError> {
+        self.send_request(method, params, None, |_| {}, timeout)
+    }
+
+    /// Sends a request whose events go to `sink` (instead of the worker-wide handler), and
+    /// tells `on_id` the id it was sent with once it has been written (so a `cancel` sent
+    /// from `on_id` on reaches the worker after the request). Blocks until the response.
+    pub fn request_routed(
+        &self,
+        method: &str,
+        params: Value,
+        sink: Option<EventSink>,
+        on_id: impl FnOnce(u64),
+    ) -> Result<Value, WorkerError> {
+        self.send_request(method, params, sink, on_id, None)
+    }
+
+    fn send_request(
+        &self,
+        method: &str,
+        params: Value,
+        sink: Option<EventSink>,
+        on_id: impl FnOnce(u64),
+        timeout: Option<Duration>,
+    ) -> Result<Value, WorkerError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = channel();
-        match self.pending.lock().expect("pending").as_mut() {
-            Some(p) => p.insert(id, tx),
-            None => return Err(self.exited()),
-        };
-        let line = json!({"id": id, "method": method, "params": params}).to_string();
-        {
-            let mut stdin = self.stdin.lock().expect("stdin");
-            let sent = stdin.as_mut().map(|s| writeln!(s, "{line}").and_then(|()| s.flush()));
-            if !matches!(sent, Some(Ok(()))) {
-                if let Some(p) = self.pending.lock().expect("pending").as_mut() {
-                    p.remove(&id);
-                }
-                return Err(self.exited());
+        // Release `pending` before `exited()`, which locks `child` (`is_alive` takes `child`
+        // first): holding both in opposite orders deadlocks.
+        let registered = match self.pending.lock().expect("pending").as_mut() {
+            Some(p) => {
+                p.insert(id, tx);
+                true
             }
+            None => false,
+        };
+        if !registered {
+            return Err(self.exited());
         }
-        match rx.recv() {
-            // Closed stdout: add the exit status and stderr context. Other failures (a kill
-            // with its own reason) pass through.
-            Ok(Err(WorkerError::Exited(m))) if m.contains("exited unexpectedly") => Err(self.exited()),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(self.exited()),
-            Ok(reply) => reply,
+        if let Some(sink) = sink {
+            self.sinks.lock().expect("sinks").insert(id, sink);
         }
+        let reply = if self.write_line(&json!({"id": id, "method": method, "params": params})) {
+            on_id(id);
+            let received = match timeout {
+                Some(t) => rx.recv_timeout(t),
+                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            match received {
+                // Closed stdout: add the exit status and stderr context. Other failures (a
+                // kill with its own reason) pass through.
+                Ok(Err(WorkerError::Exited(m))) if m.contains("exited unexpectedly") => Err(self.exited()),
+                Ok(reply) => reply,
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(p) = self.pending.lock().expect("pending").as_mut() {
+                        p.remove(&id);
+                    }
+                    Err(WorkerError::Timeout(format!(
+                        "{} did not answer `{method}` within {}s",
+                        self.name,
+                        timeout.unwrap_or_default().as_secs()
+                    )))
+                }
+                Err(RecvTimeoutError::Disconnected) => Err(self.exited()),
+            }
+        } else {
+            if let Some(p) = self.pending.lock().expect("pending").as_mut() {
+                p.remove(&id);
+            }
+            Err(self.exited())
+        };
+        self.sinks.lock().expect("sinks").remove(&id);
+        reply
+    }
+
+    /// Writes one message. A failed (possibly partial) write leaves the stream unusable: it
+    /// is closed and everything waiting on it fails.
+    fn write_line(&self, msg: &Value) -> bool {
+        let failed = {
+            let mut writer = self.writer.lock().expect("writer");
+            let Some(w) = writer.as_mut() else { return false };
+            match writeln!(w, "{msg}").and_then(|()| w.flush()) {
+                Ok(()) => return true,
+                Err(e) => {
+                    writer.take();
+                    e
+                }
+            }
+        };
+        self.close_socket();
+        let waiting = self.pending.lock().expect("pending").take().unwrap_or_default();
+        for (_, tx) in waiting {
+            let _ = tx.send(Err(WorkerError::Exited(format!("{} cannot be sent requests: {failed}", self.name))));
+        }
+        false
+    }
+
+    /// Asks the worker to cancel request `id`, without waiting for the answer.
+    pub fn send_cancel(&self, id: u64) {
+        let own = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.write_line(&json!({"id": own, "method": "cancel", "params": {"requestId": id}}));
+    }
+
+    /// Closes a daemon connection in both directions, so the reading thread ends and the
+    /// daemon sees the client go away (and cancels what it still runs for it). For a child
+    /// process, closes its stdin.
+    fn close_socket(&self) {
+        #[cfg(unix)]
+        if let Some(s) = &self.socket {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        self.writer.lock().map(|mut w| w.take()).ok();
     }
 
     /// An `Exited` error with the exit status (if known) and the end of stderr.
     fn exited(&self) -> WorkerError {
+        #[cfg(unix)]
+        if self.socket.is_some() {
+            return WorkerError::Exited(format!("{} closed the connection (see `scpm daemon logs`)", self.name));
+        }
         let status = self.child.lock().ok().and_then(|mut c| {
+            let c = c.as_mut()?;
             // Give the process a moment to finish exiting so its status is available.
             for _ in 0..20 {
                 if let Ok(Some(s)) = c.try_wait() {
@@ -454,16 +712,19 @@ impl Worker {
         WorkerError::Exited(format!("{} exited unexpectedly{status}{}", self.name, tail_context(&self.stderr_tail)))
     }
 
-    /// Whether the process is still running.
+    /// Whether the process is still running (or the daemon connection still open).
     pub fn is_alive(&self) -> bool {
-        self.child.lock().is_ok_and(|mut c| matches!(c.try_wait(), Ok(None)))
+        // One lock at a time: `child` and `pending` are never held together.
+        let running = self.child.lock().expect("child").as_mut().is_none_or(|c| matches!(c.try_wait(), Ok(None)));
+        running && self.pending.lock().expect("pending").is_some()
     }
 
     /// Kills the process (and its process group, if it has its own) and fails pending
     /// requests with `reason` right away, without waiting for stdout to close (a grandchild
-    /// may keep it open).
+    /// may keep it open). For a daemon connection, the requests in flight are cancelled and
+    /// the connection is closed (the daemon stays up).
     pub fn kill(&self, reason: &str) {
-        if let Ok(mut child) = self.child.lock() {
+        if let Some(child) = self.child.lock().expect("child").as_mut() {
             #[cfg(unix)]
             if self.own_group {
                 // SAFETY: plain syscall on a pid we own; a negative pid targets its group.
@@ -472,6 +733,13 @@ impl Worker {
                 }
             }
             let _ = child.kill();
+        } else {
+            let in_flight: Vec<u64> =
+                self.pending.lock().expect("pending").as_ref().map(|p| p.keys().copied().collect()).unwrap_or_default();
+            for id in in_flight {
+                self.send_cancel(id);
+            }
+            self.close_socket();
         }
         let waiting = self.pending.lock().expect("pending").take().unwrap_or_default();
         for (_, tx) in waiting {
@@ -482,10 +750,15 @@ impl Worker {
     /// Closes stdin and waits up to `limit` for the process to exit, killing it (and its group)
     /// after that. Returns the exit status if it exited by itself.
     pub fn wait_timeout(self, limit: Option<std::time::Duration>) -> Option<std::process::ExitStatus> {
-        self.stdin.lock().expect("stdin").take();
+        self.close(limit)
+    }
+
+    /// [`Worker::wait_timeout`] for a worker that may be shared.
+    pub fn close(&self, limit: Option<std::time::Duration>) -> Option<std::process::ExitStatus> {
+        self.writer.lock().expect("writer").take();
         let started = std::time::Instant::now();
         loop {
-            if let Ok(Some(status)) = self.child.lock().expect("child").try_wait() {
+            if let Ok(Some(status)) = self.child.lock().expect("child").as_mut()?.try_wait() {
                 return Some(status);
             }
             if limit.is_some_and(|l| started.elapsed() >= l) {
@@ -496,11 +769,16 @@ impl Worker {
         }
     }
 
-    /// Asks the worker to exit and waits for it.
+    /// Asks a child worker to exit and waits for it; a daemon connection is just closed (the
+    /// daemon is shared and stays up).
     pub fn shutdown(self) {
-        let _ = self.request("shutdown", json!({}));
-        self.stdin.lock().expect("stdin").take();
-        let _ = self.child.lock().expect("child").wait();
+        if self.child.lock().expect("child").is_some() {
+            let _ = self.request("shutdown", json!({}));
+        }
+        self.close_socket();
+        if let Some(c) = self.child.lock().expect("child").as_mut() {
+            let _ = c.wait();
+        }
     }
 }
 
@@ -517,8 +795,10 @@ fn tail_context(tail: &Mutex<VecDeque<String>>) -> String {
 impl Drop for Worker {
     fn drop(&mut self) {
         // Closing stdin is a clean shutdown for the worker; make sure it doesn't outlive us.
-        self.stdin.lock().map(|mut s| s.take()).ok();
+        // A daemon connection is closed both ways, so the daemon drops what it runs for us.
+        self.close_socket();
         if let Ok(mut child) = self.child.lock()
+            && let Some(child) = child.as_mut()
             && matches!(child.try_wait(), Ok(None))
         {
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -533,6 +813,32 @@ impl Drop for Worker {
 #[cfg(test)]
 mod version_tests {
     use super::{absolute, parse_java_version};
+
+    #[test]
+    #[cfg(unix)]
+    fn path_lookup_skips_non_executable_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(a.path().join("java"), "not a program").unwrap();
+        std::fs::write(b.path().join("java"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(b.path().join("java"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([a.path(), b.path()]).unwrap();
+        assert_eq!(super::find_in_path(&path, std::path::Path::new("java")), Some(b.path().join("java")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn path_lookup_returns_absolute_paths_for_relative_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&cwd).unwrap();
+        std::fs::write(dir.path().join("java"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(dir.path().join("java"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let relative = dir.path().strip_prefix(&cwd).unwrap();
+        let found = super::find_in_path(relative.as_os_str(), std::path::Path::new("java")).unwrap();
+        assert!(found.is_absolute(), "{}", found.display());
+        assert_eq!(found, cwd.join(relative).join("java"));
+    }
 
     #[test]
     fn java_versions_ignore_unrelated_quotes() {

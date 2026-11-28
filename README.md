@@ -36,6 +36,14 @@ Milestones land as a stack of PRs; see [docs/roadmap.md](docs/roadmap.md).
   its resources are `scpm://workspace` and `scpm://run/latest`. Results are compact: a
   green compile lists no tasks, and lists are capped with `more` counts. One compile
   worker stays warm across calls.
+- **M6:** a shared compile daemon. Outside CI, compiles go to one warm worker JVM per
+  (scpm build, JDK, worker build, JVM options), shared by every workspace and worktree over
+  a Unix socket private to the user. It starts on demand and exits after an hour idle
+  (`SCPM_DAEMON_IDLE_SECS`); its heap is capped at 4 GB with ZGC returning idle memory
+  (`SCPM_DAEMON_HEAP`). Use `scpm daemon ls|stop [--force]|logs [--tail N]` to manage it,
+  and `--no-daemon` or `SCPM_NO_DAEMON=1` to opt out. If it can't start or doesn't answer,
+  commands fall back to a worker of their own. It is always off in CI, and the MCP server
+  uses it too (retrying a minute after a failure).
 
 ## Development
 

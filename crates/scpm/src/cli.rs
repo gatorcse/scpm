@@ -27,6 +27,10 @@ pub struct Cli {
     /// Machine-readable JSON output (including errors).
     #[arg(long, global = true)]
     pub json: bool,
+    /// Don't use the shared compile daemon; run a worker for this command only (also
+    /// `SCPM_NO_DAEMON=1`; always the case in CI).
+    #[arg(long, global = true)]
+    pub no_daemon: bool,
     /// Select modules/variants with pnpm-style selectors (repeatable): `core`, `core...`,
     /// `...core`, `core@jvm-3`, `./modules/**`, `[origin/main]`, `!core`.
     #[arg(short = 'F', long = "filter", global = true, value_name = "SELECTOR")]
@@ -102,6 +106,11 @@ pub enum Command {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// Manage the shared compile daemon.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
     /// Serve the Model Context Protocol on stdio for agents (keeps a compile worker warm).
     Mcp,
     /// Explain why an artifact is on the classpath (`org::name`, `org:name_3` or `name`).
@@ -127,6 +136,36 @@ pub enum ConfigCommand {
     /// Show where each repository's credentials, mirror and proxy come from (machine-local
     /// settings), and which settings of other tools are ignored.
     Explain,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DaemonAction {
+    /// List running daemons.
+    Ls,
+    /// Stop every running daemon (waiting up to 30 s for active compiles).
+    Stop {
+        /// Cancel active compiles instead of waiting for them.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the log of the most recently active daemon.
+    Logs {
+        /// Only the last N lines.
+        #[arg(long, value_name = "N")]
+        tail: Option<usize>,
+    },
+    /// Run a daemon in the foreground (started automatically by other commands).
+    #[command(hide = true)]
+    Serve {
+        #[arg(long)]
+        key: String,
+        /// A worker classpath entry (repeated).
+        #[arg(long = "cp")]
+        classpath: Vec<PathBuf>,
+        /// A worker JVM option (repeated), e.g. `--jvm-opt=-Xmx4g`.
+        #[arg(long = "jvm-opt", allow_hyphen_values = true)]
+        jvm_options: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -240,6 +279,9 @@ impl From<filter::FilterError> for Failure {
 }
 
 fn run(cli: Cli) -> Result<(), Failure> {
+    if cli.no_daemon {
+        crate::daemon::disable();
+    }
     let cwd = std::env::current_dir().map_err(|e| Failure::Usage(e.to_string()))?;
     let start = match &cli.dir {
         Some(d) => cwd.join(d),
@@ -438,6 +480,71 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 Err(e) => Err(Failure::Command(e.to_string())),
             }
         }
+        Command::Daemon { action } => match action {
+            DaemonAction::Ls => {
+                let daemons = crate::daemon::list();
+                if cli.json {
+                    print_json(&daemons)?;
+                } else if daemons.is_empty() {
+                    println!("no daemons running");
+                } else {
+                    for d in daemons {
+                        let key = d["key"].as_str().unwrap_or("");
+                        if d["state"] != "running" {
+                            println!("{key}  pid {}  {}", d["pid"], d["state"].as_str().unwrap_or("unknown"));
+                            continue;
+                        }
+                        let rss = d["workerRssKb"].as_u64().map_or("?".to_string(), |kb| format!("{}M", kb / 1024));
+                        println!(
+                            "{key}  pid {}  worker {} ({rss} of {} heap)  up {}s  idle {}s  {} active  {} requests  {} client(s)  {} workspace(s)",
+                            d["pid"],
+                            d["workerPid"],
+                            d["heap"].as_str().unwrap_or("?"),
+                            d["uptimeSeconds"],
+                            d["idleSeconds"],
+                            d["activeRequests"],
+                            d["requests"],
+                            d["clients"],
+                            d["workspaces"].as_array().map_or(0, Vec::len)
+                        );
+                    }
+                }
+                Ok(())
+            }
+            DaemonAction::Stop { force } => {
+                let (n, failed) = crate::daemon::stop_all(force, |msg| eprintln!("{msg}"));
+                if cli.json {
+                    print_json(&serde_json::json!({"stopped": n, "failed": failed}))?;
+                } else {
+                    println!("stopped {n} daemon{}", if n == 1 { "" } else { "s" });
+                }
+                if failed.is_empty() { Ok(()) } else { Err(Failure::Silent) }
+            }
+            DaemonAction::Logs { tail } => {
+                let Some(log) = crate::daemon::logs().into_iter().next() else {
+                    return Err(Failure::Command("no daemon logs".into()));
+                };
+                let text =
+                    std::fs::read_to_string(&log).map_err(|e| Failure::Command(format!("{}: {e}", log.display())))?;
+                let lines: Vec<&str> = text.lines().collect();
+                let from = tail.map_or(0, |n| lines.len().saturating_sub(n));
+                if cli.json {
+                    print_json(&serde_json::json!({"log": log, "lines": &lines[from..]}))?;
+                    return Ok(());
+                }
+                eprintln!("==> {} <==", log.display());
+                let mut out = std::io::stdout().lock();
+                for line in &lines[from..] {
+                    writeln!(out, "{line}")?;
+                }
+                out.flush()?;
+                Ok(())
+            }
+            DaemonAction::Serve { key, classpath, jvm_options } => {
+                crate::daemon::serve(crate::daemon::ServeArgs { key, classpath, jvm_options })
+                    .map_err(|e| Failure::Command(e.to_string()))
+            }
+        },
         Command::Mcp => {
             crate::mcp::Server::new(start).serve().map_err(|e| Failure::Command(e.to_string()))?;
             Ok(())
