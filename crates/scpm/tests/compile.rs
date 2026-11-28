@@ -452,3 +452,148 @@ fn removing_every_test_clears_the_report_and_filters_still_must_match() {
     let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(doc["error"].as_str().unwrap_or_default().contains("no tests matched"), "{doc:#}");
 }
+
+#[test]
+fn mcp_server_compiles_and_reports() {
+    use std::io::{BufRead, BufReader, Write};
+    if !prerequisites() {
+        return;
+    }
+    let ws = workspace();
+    fs::write(
+        ws.path().join("modules/app/src/test/scala/app/LoudSuite.scala"),
+        "package app\n\nclass LoudSuite extends munit.FunSuite:\n  test(\"loud\") {\n    println(\"to stdout\")\n    assertEquals(1, 2)\n  }\n",
+    )
+    .unwrap();
+    let bin = assert_cmd::cargo::cargo_bin("scpm");
+    let mut child = StdCommand::new(bin)
+        .arg("-C")
+        .arg(ws.path())
+        .arg("mcp")
+        .env("COURSIER_CACHE", Path::new(env!("CARGO_TARGET_TMPDIR")).join("coursier-cache"))
+        .env("SCPM_WORKER_JAR", worker_jar())
+        .env_remove("CI")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut send = |msg: Value| {
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
+    };
+    // Reads messages until the response with `id`; every stdout line must be JSON-RPC.
+    let mut read_until = |id: u64| -> (Value, Vec<Value>) {
+        let mut others = Vec::new();
+        loop {
+            let mut line = String::new();
+            assert!(stdout.read_line(&mut line).unwrap() > 0, "server closed stdout");
+            let msg: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("non-JSON on stdout ({e}): {line}"));
+            assert_eq!(msg["jsonrpc"], "2.0", "{line}");
+            if msg["id"] == id {
+                return (msg, others);
+            }
+            others.push(msg);
+        }
+    };
+    let call = |id: u64, name: &str, args: Value| serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args}});
+    send(
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}}),
+    );
+    assert_eq!(read_until(1).0["result"]["serverInfo"]["name"], "scpm");
+
+    // A ping sent while a compile runs is answered before the compile finishes.
+    let mut compile = call(2, "compile", serde_json::json!({"targets": ["app"]}));
+    compile["params"]["_meta"] = serde_json::json!({"progressToken": "p1"});
+    send(compile);
+    send(serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}));
+    let (pong, before) = read_until(3);
+    assert_eq!(pong["result"], serde_json::json!({}));
+    assert!(!before.iter().any(|m| m["id"] == 2), "ping waited for the compile");
+    let (ok, progress) = read_until(2);
+    let r = &ok["result"]["structuredContent"];
+    assert_eq!(r["ok"], true, "{ok:#}");
+    assert_eq!(r["tasks"]["problems"], serde_json::json!([]), "a green compile lists no tasks");
+    // Progress comes from the compile thread, so some may arrive before the ping's reply.
+    assert!(
+        before.iter().chain(&progress).any(|m| m["method"] == "notifications/progress"),
+        "before: {before:?}; after: {progress:?}"
+    );
+
+    fs::write(
+        ws.path().join("modules/app/src/main/scala/app/Broken.scala"),
+        "package app\n\nval broken: Int = \"x\"\n",
+    )
+    .unwrap();
+    send(call(4, "compile", serde_json::json!({"targets": ["app"]})));
+    let r = read_until(4).0["result"]["structuredContent"].clone();
+    assert_eq!(r["ok"], false);
+    assert_eq!(r["diagnostics"][0]["file"], "modules/app/src/main/scala/app/Broken.scala");
+    assert_eq!(r["tasks"]["problems"][0]["status"], "failed");
+
+    send(call(5, "diagnostics", serde_json::json!({"file": "Broken.scala"})));
+    let d = read_until(5).0["result"]["structuredContent"].clone();
+    assert_eq!(d["diagnostics"][0]["code"], "E007", "{d:#}");
+    fs::remove_file(ws.path().join("modules/app/src/main/scala/app/Broken.scala")).unwrap();
+
+    // A failing test that prints to stdout: the result has the failure; stdout stays JSON.
+    send(call(6, "test", serde_json::json!({"targets": ["app"], "suites": ["app.LoudSuite"]})));
+    let t = read_until(6).0["result"].clone();
+    assert_eq!(t["isError"], false, "{t:#}");
+    assert_eq!(t["structuredContent"]["tests"]["failed"], 1, "{t:#}");
+    assert_eq!(
+        t["structuredContent"]["tests"]["failures"][0]["failure"]["file"],
+        "modules/app/src/test/scala/app/LoudSuite.scala"
+    );
+
+    // A test call whose compile fails clears the old report, as `scpm test` does.
+    let junit = ws.path().join(".scpm/out/app@jvm-3/test-reports/junit.xml");
+    assert!(junit.is_file());
+    fs::write(ws.path().join("modules/app/src/test/scala/app/Bad.scala"), "package app\n\nval bad: Int = \"x\"\n")
+        .unwrap();
+    send(call(16, "test", serde_json::json!({"targets": ["app"]})));
+    let t = read_until(16).0["result"]["structuredContent"].clone();
+    assert_eq!(t["ok"], false, "{t:#}");
+    assert!(!junit.exists(), "a stale report survived a failed test compile");
+    fs::remove_file(ws.path().join("modules/app/src/test/scala/app/Bad.scala")).unwrap();
+
+    // As in the CLI, a module without tests passes unless filters asked for tests.
+    send(call(17, "test", serde_json::json!({"targets": ["javalib"]})));
+    let t = read_until(17).0["result"].clone();
+    assert_eq!(t["isError"], false, "{t:#}");
+    assert_eq!(t["structuredContent"]["ok"], true, "{t:#}");
+    send(call(18, "test", serde_json::json!({"targets": ["javalib"], "suites": ["*"]})));
+    let t = read_until(18).0["result"].clone();
+    assert_eq!(t["isError"], true, "{t:#}");
+    assert!(t["structuredContent"]["error"].as_str().unwrap_or_default().contains("no tests matched"), "{t:#}");
+
+    // Every tool returns an object as structuredContent; bad arguments are tool errors.
+    for (id, name, args) in [
+        (7, "ls", serde_json::json!({})),
+        (8, "config", serde_json::json!({"targets": ["javalib"]})),
+        (9, "why", serde_json::json!({"artifact": "cats-kernel", "targets": ["util@jvm-3"]})),
+        (10, "classpath", serde_json::json!({"target": "app"})),
+        (11, "graph", serde_json::json!({})),
+    ] {
+        send(call(id, name, args));
+        let r = read_until(id).0;
+        assert!(r["result"]["structuredContent"].is_object(), "{name}: {r:#}");
+    }
+    send(call(12, "compile", serde_json::json!({"targets": "app"})));
+    let bad = read_until(12).0;
+    assert_eq!(bad["result"]["isError"], true);
+
+    // A call cancelled while it waits behind a running build is never answered.
+    send(call(13, "test", serde_json::json!({"targets": ["app"], "suites": ["app.MainSuite"]})));
+    send(call(14, "compile", serde_json::json!({"targets": ["app"]})));
+    send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 14}}));
+    let (_, before13) = read_until(13);
+    send(serde_json::json!({"jsonrpc": "2.0", "id": 15, "method": "ping"}));
+    let (_, before15) = read_until(15);
+    assert!(!before13.iter().chain(&before15).any(|m| m["id"] == 14), "cancelled request 14 was answered");
+
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+}

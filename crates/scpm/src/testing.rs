@@ -17,6 +17,32 @@ use crate::report::{Event, Reporter, TaskStatus, TestCase, TestFailure, plain_te
 use crate::worker::{self, Worker};
 use crate::workspace::Variant;
 
+/// Test JVMs currently running, so a cancelled MCP call can stop them.
+static RUNNING: Mutex<Vec<std::sync::Weak<Worker>>> = Mutex::new(Vec::new());
+
+/// Set by [`cancel_all`]: no further test JVMs start until [`reset_cancel`].
+static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Cancels a test run: kills running test JVMs and starts no more.
+pub fn cancel_all(reason: &str) {
+    CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    kill_running(reason);
+}
+
+/// Allows test JVMs to start again (at the start of a run).
+pub fn reset_cancel() {
+    CANCELLED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Kills every running test JVM (and its process group).
+pub fn kill_running(reason: &str) {
+    let mut running = RUNNING.lock().expect("running");
+    running.retain(|w| w.strong_count() > 0);
+    for w in running.iter().filter_map(std::sync::Weak::upgrade) {
+        w.kill(reason);
+    }
+}
+
 /// How long a test JVM may take to exit after it reported its results.
 const EXIT_GRACE: Duration = Duration::from_secs(30);
 
@@ -120,6 +146,10 @@ pub fn run_tests(
                     // Pop in its own statement: the guard must not live through the run.
                     let next = queue.lock().expect("queue").pop();
                     let Some(v) = next else { break };
+                    if CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
+                        *all_ok.lock().expect("ok") = false;
+                        break;
+                    }
                     if !run_variant_tests(tc, v, runner_cp, opts, reporter) {
                         *all_ok.lock().expect("ok") = false;
                     }
@@ -228,6 +258,12 @@ fn fork_runner(
         }
     };
     let runner = Arc::new(Worker::spawn(spec, on_event)?);
+    RUNNING.lock().expect("running").push(Arc::downgrade(&runner));
+    // A cancel between the queue's check and the registration above didn't see this runner;
+    // re-checking after registering closes the gap (`cancel_all` sets the flag, then kills).
+    if CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
+        runner.kill("was stopped (request cancelled)");
+    }
     let started = Instant::now();
 
     // The watchdog stops waiting as soon as the run finishes (no thread sleeps out the full

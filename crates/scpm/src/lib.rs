@@ -20,6 +20,7 @@ pub mod graph;
 pub mod install;
 pub mod lockfile;
 pub mod machine;
+pub mod mcp;
 pub mod merge;
 pub mod platform;
 pub mod report;

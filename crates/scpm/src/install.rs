@@ -547,6 +547,18 @@ fn helper_roots() -> Vec<BootRoot> {
     ]
 }
 
+/// Install-before-run (design §5.4): installs (frozen when asked or in CI), then reads the lock.
+pub fn ensure(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<(Lockfile, InstallSummary), InstallError> {
+    let summary = install(ws, graph, InstallOptions { frozen: frozen || in_ci(), verify: false })?;
+    let lock = Lockfile::read(&ws.root)?.ok_or_else(|| InstallError::Stale(vec!["(no scpm-lock.yaml)".into()]))?;
+    Ok((lock, summary))
+}
+
+/// CI mode (implied `--frozen`) is `CI=true` (any case: AppVeyor sets `True`).
+pub fn in_ci() -> bool {
+    std::env::var("CI").is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
 /// Reads the previous lock. A corrupt or merge-conflicted lock is re-built from scratch
 /// (with a warning), except in frozen mode, where it is an error.
 fn read_previous(root: &Path, frozen: bool, warnings: &mut Vec<String>) -> Result<Lockfile, InstallError> {
