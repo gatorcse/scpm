@@ -1316,11 +1316,11 @@ fn workspace_bom_errors_are_reported_once() {
 #[test]
 fn init_writes_a_workspace_that_loads_then_adds_a_module() {
     let tmp = tempfile::tempdir().unwrap();
-    // DIR is relative to -C (and is not mistaken for -C itself).
-    let report = json(tmp.path(), &["init", "hello"]);
+    // DIR is relative to -C (and is not mistaken for -C itself). The space makes the hint quote.
+    let report = json(tmp.path(), &["init", "my ws/hello"]);
     assert_eq!(report["kind"], "workspace");
     assert_eq!(report["variants"], serde_json::json!(["app@jvm-3"]));
-    let root = tmp.path().join("hello");
+    let root = tmp.path().join("my ws/hello");
     assert!(root.join("scpm-workspace.yaml").is_file());
     assert!(!root.join("hello").exists());
     assert_eq!(stdout(&root, &["ls"]).split_whitespace().collect::<Vec<_>>(), ["app@jvm-3", "modules/app"]);
@@ -1337,7 +1337,8 @@ fn init_writes_a_workspace_that_loads_then_adds_a_module() {
             .clone(),
     )
     .unwrap();
-    assert!(hint.contains(&format!("then `scpm -C {} compile`", root.canonicalize().unwrap().display())), "{hint}");
+    let quoted = format!("'{}'", root.canonicalize().unwrap().display().to_string().replace('\'', r"'\''"));
+    assert!(hint.contains(&format!("then `scpm -C {quoted} compile`")), "{hint}");
     fs::remove_dir_all(root.join("modules/core")).unwrap();
     let text = String::from_utf8(
         scpm(&root).args(["init", "modules/core"]).current_dir(&root).assert().success().get_output().stdout.clone(),
