@@ -19,7 +19,7 @@
 | CLI language | **Rust.** It owns everything that does not need a JVM: config, graph, hashing, no-op detection, lockfile fetch, cache restore, reporting. |
 | Compiler side | A **Scala JVM worker** (“`scpmd`”) that embeds **Zinc 2.1** directly — *not* Bloop. Narrow protocol: compile/test/run requests in, structured events out. All scheduling stays in Rust. |
 | Daemon? | **Yes locally** (one shared per-user daemon per `(scpm version, worker JDK)`, idle-timeout, serves every workspace and worktree). **In CI, the same worker runs in the foreground for the life of the job** with a JDK 25 AOT cache. Zinc cannot be made fast enough cold: JIT warmup is 3.4–5× (*measured*). |
-| Dependencies | **Coursier owns resolution and the cache.** Phase 1: spawn native `cs`. Phase 3: a small native-image resolver sidecar on the coursier API (JSON-lines over stdio). Never reimplement Maven resolution in Rust. |
+| Dependencies | **Coursier owns resolution and the cache.** Phase 1: spawn native `cs`. Phase 3: a resolver sidecar on the coursier API (JSON lines over stdio), shipped as a JVM jar; native-image later (§5.2.1). With it the lock becomes universal: locked for every standard system (OS and arch), each machine using its own (§5.4). Never reimplement Maven resolution in Rust. |
 | Lockfile | **Yes**, our own (`scpm-lock.yaml`), because nothing in the Scala ecosystem has one. Restoring from the lock needs no resolver, only intransitive downloads with sha256 verification, so the Rust CLI does it itself from Phase 1, writing a coursier-compatible cache layout. |
 | Semver ranges | Allowed **only in manifests, only for direct deps, resolved at lock time**. Published POMs never contain ranges. `^`/`~` are translated with Scala's early-semver rules and the dependency's `info.versionScheme`. |
 | Agents | **`scpm mcp`** is a first-class front-end from Phase 1. It is a thin layer over `--json` and the event stream, owns a foreground worker in Phase 1 and uses the shared daemon from Phase 2, and is token-frugal by default (§9.3). |
@@ -110,7 +110,7 @@ flowchart TB
 
     subgraph jvm["Out-of-process helpers"]
         direction LR
-        resolver["Resolver<br/>Phase 1: cs CLI<br/>Phase 3: native-image sidecar<br/>Runs only when the lock is stale"]
+        resolver["Resolver<br/>Phase 1: cs CLI<br/>Phase 3: JVM sidecar on the coursier API<br/>Runs only when the lock is stale"]
         scpmd["scpmd: Scala on the worker JDK (25+)<br/>Zinc 2.1, scalafmt, scalafix, JS/Native linkers<br/>Shared daemon locally, foreground in CI"]
         testjvm["Forked test/run JVM<br/>project JDK, sbt test-interface"]
     end
@@ -161,12 +161,12 @@ This is the Pants/Bazel shape: a native orchestrator with persistent JVM workers
 | Command | JVM? | Notes |
 |---|---|---|
 | `scpm install` / `scpm ci` with up-to-date lock | No | Rust fetches missing jars by URL + sha256. No POMs, no resolution rounds (§5.2). Phase 1 gets the JDK with `cs java-home` (native, cached). |
-| `scpm install` with stale lock | `cs` (native) | Coursier resolves and downloads. 40–130 ms warm *measured* (cats-effect+circe → spark-sql). |
+| `scpm install` with stale lock | `cs` (native); the resolver sidecar from Phase 3 | Coursier resolves and downloads. 40–130 ms warm *measured* with `cs` (cats-effect+circe → spark-sql); the sidecar's cold and warm costs are in §5.2.1. |
 | `scpm compile` no-op | No | Fingerprint check in Rust; bleep's ctime-manifest trick (5 s → 5 ms per project). |
 | `scpm pipeline` all cache hits | No | Restore outputs + replay logs/annotations from the remote cache. |
 | `scpm compile` with changes | Yes | Daemon locally; foreground worker in CI. |
 | `scpm test` | Yes | Forked JVM per test run (needed for isolation anyway). |
-| `scpm graph`, `scpm why`, `scpm outdated`, `scpm deps --json` | No / `cs` | |
+| `scpm graph`, `scpm why`, `scpm outdated`, `scpm deps --json` | No / `cs` (the sidecar from Phase 3) | |
 
 ---
 
@@ -230,7 +230,9 @@ repositories:
     groups: [com.acme]                     # com.acme* comes only from here, and nothing else does (§5.4)
 
 lock:
-  resolutionContext: { os: linux, arch: x86_64, jdk: 25 }   # the default (jdk = project JDK major); §5.4
+  # systems: [linux-x86_64, macos-aarch64]   # unset: scpm's default set (the standard five from M2); writing a set out
+  #                                          # opts out of default tracking and the M2 upgrade (§5.4 "Systems")
+  jdk: 25                        # the default: the project JDK's major version
 
 ide: { metals: true }            # regenerate .metals/mbt.json on every `scpm install` (also `idea: true`); §10
 
@@ -469,7 +471,7 @@ Unknown keys are **errors** with did-you-mean suggestions, matching pnpm 12's `E
 | Option | Verdict |
 |---|---|
 | Spawn native `cs` and parse `fetch -j` JSON | **Phase 1.** Zero build cost. `cs fetch` gives the graph as JSON; `cs resolve` is text only; versions come via `cs complete-dep org:name:` (text). There are hidden but real flags: `--bom`, `-V`, `--intransitive`, `--reconciliation`, `--strict`, `--rule`, `--checksum`, `-m offline`. The limitation is that errors are only stderr text. |
-| Own resolver sidecar: a small Scala app on the coursier API, built with GraalVM native-image, JSON-lines over stdio | **Phase 3.** Structured errors, sha256 and repository per artifact, metadata-only resolution, version listing, and it can stay alive for a session. It uses coursier's own native-image configuration. |
+| Own resolver sidecar: a small Scala 3 app on the coursier API (`worker/resolver`), JSON lines over stdio | **Phase 3, as a JVM jar** (its jars from GitHub Releases for now, through a list built into scpm); GraalVM native-image is a later swap behind the same protocol. Structured errors, the repository and file of every artifact, `groups` enforced inside resolution, the whole resolution context (OS, arch, JDK) for every system of a universal lock, version listing and the dependency graph; it can stay alive for a session. Design and measurements: §5.2.1. |
 | Host the resolver inside `scpmd` | A fine alternative once the daemon exists; but resolution should not *require* a warm JVM in CI, so keep the sidecar. |
 | JNI or GraalVM `--shared` C library | Possible but adds little over a sidecar process. Skip. |
 | Reimplement in Rust | **No.** The long tail costs months: profiles, BOM import cycles, relocations, Gradle variant matching, coursier's deliberate latest-wins semantics. The result would also diverge from sbt/Mill/scala-cli on the same inputs. Existing Rust crates (`jbuild`, `deps-maven`, `mvn`) are immature. |
@@ -493,7 +495,7 @@ There are two cases, and **no single command chains a coursier resolve into a Ru
 | Case | When | Who does it | Requests |
 |---|---|---|---|
 | **Lock is stale** | `scpm add`, `scpm update`, a manifest edit | Coursier, resolving *and* downloading in one `cs fetch`. Rust only hashes the jars it got (local disk, no network) to write sha256 into the lock. | All POMs (with parent and BOM chains), then all jars |
-| **Lock is fresh** | CI, a fresh clone, a new worktree, switching branches | Rust alone, from the coordinates, repository ids and sha256 values in the lock. No resolution at all. | Jars only, in one parallel burst |
+| **Lock is fresh** | CI, a fresh clone, a new worktree, switching branches | Rust alone, from the coordinates, repository ids and sha256 values in the lock. No resolution at all. | The host system's jars only (§5.4, "Systems"), in one parallel burst |
 
 **What coursier actually does** (verified in the 2.1.27 source: `Fetch.scala`, `ResolutionProcess.scala`):
 
@@ -516,25 +518,259 @@ The POMs Rust skipped are not missing from anything that needs them. Coursier fe
 
 **Optional optimisation for the stale-lock case: speculative prefetch.** When the lock is stale, most entries in the *old* lock are still right. Rust can start downloading those jars while coursier resolves, and whatever coursier then asks for is already cached. Wrong guesses cost bandwidth but never correctness.
 
-**Why not have coursier do the fresh-lock case too?** It can't do it without POMs from the CLI. It could through the library (`cache.file(artifact)` for each artifact, gathered), which a native-image sidecar could expose. But Rust already has the lock in memory, needs the sha256 checks anyway, and starting the fetch costs it no process spawn. The Phase 0 spike should measure a cold `cs fetch` against a Rust lock restore on a GitHub runner to quantify the gap.
+**Why not have coursier do the fresh-lock case too?** It can't do it without POMs from the CLI. It could through the library (`cache.file(artifact)` for each artifact, gathered), which the resolver sidecar (§5.2.1) could expose. But Rust already has the lock in memory, needs the sha256 checks anyway, and starting the fetch costs it no process spawn. The Phase 0 spike should measure a cold `cs fetch` against a Rust lock restore on a GitHub runner to quantify the gap.
+
+#### 5.2.1 The resolver sidecar
+
+> Status: **design (Phase 3)**, with a measurement spike (2026-11-26, below). Nothing is implemented yet. Decided: a **JVM jar first**; native-image later. The user's decisions of 2026-11-27 (bootstrap, distribution, bearer tokens, TLS trust, cold cost, M1 scope) are recorded where they apply and listed at the end.
+
+The sidecar replaces `cs` for everything that resolves: re-locks, boot entries, `why`, and version listing. The Rust fetcher keeps restoring from the lock (§5.2), and no frozen CI run starts the sidecar.
+
+**Why not keep `cs`.** Phase 1 gets correct results from `cs` 2.1.27, but only with workarounds that exist because a CLI reads its own configuration and takes only flags:
+
+| `cs` limitation | Phase 1 workaround | With the sidecar |
+|---|---|---|
+| Reads ambient config: env, `settings.xml`, mirror files, Scala CLI config | Sealed environment: an allowlist of `COURSIER_*`/`CS_*` variables, `CS_MAVEN_HOME` pointing at an empty directory, `SCALA_CLI_CONFIG` and `COURSIER_MIRRORS` naming missing files (§5.9) | A minimal environment, and every setting passed explicitly to the API (below) |
+| Two launcher kinds take JVM options differently | A launcher probe: `-J-D…` arguments for the native launcher, `JAVA_TOOL_OPTIONS` for the jpackage one | scpm starts the JVM itself |
+| Credentials only from files | A private 0600 credentials file (§5.7) | Credentials in the request, never on disk; matched by origin as today (below) |
+| No per-repository group filter | Grouped repositories first; violations are refused after the fact (§5.4) | `groups` enforced during resolution |
+| Profile activation by OS/arch follows the machine | One system per lock, and only the JDK part of its context applies (§5.4) | OS, arch and JDK come from the request, for every system in the lock: the universal lock (§5.4, "Systems") depends on this |
+| Text output (`resolve`, `complete-dep`), stderr errors | Parsing trees and ANSI codes; errors are stderr text | Structured results and error codes |
+
+**Packaging.**
+
+| | Decision | Why |
+|---|---|---|
+| Project | `worker/resolver`, a third sbt project in `worker/build.sbt`; Scala 3.9 like the compile worker; main class `scpm.resolver.Main`; runtime dependencies in `worker/deps/resolver.txt` | One build and one dependency-file convention for all JVM helpers |
+| Coursier | `io.get-coursier:coursier_3:2.1.27` | The same version as the pinned `cs`, so the compatibility test (Migration, below) compares coursier with itself. 2.1.25 was the first release with `_3` artifacts, so no Scala 2.13 module is needed (only `scala-library` 2.13.18, which Scala 3 uses anyway). Its closure already has `jsoniter-scala-core_3` 2.43.0, the version the compile worker uses, so the JSON code comes free. Coursier is upgraded by changing `deps/resolver.txt` and the compatibility pin together; once `cs` is gone, by the golden-lock tests alone |
+| Distribution | **GitHub Releases assets on `gatorcse/scpm`**, for now: every jar of the resolver's closure is uploaded to the scpm release, and the built-in list (below) holds each jar's URL, sha256 and size. The Rust fetcher downloads them with the machine's proxy and verifies the sha256 | Public, no authentication, one host. GitHub Packages' Maven registry (`maven.pkg.github.com`) needs a token even to download public packages, so every user would need a PAT; Releases assets are used instead. **Later:** publish to Maven Central, which changes only the built-in list's URLs (repositories, mirrors and `groups` then apply as for any artifact) |
+| JDK | The JDK the compile worker detects (`detect_java`: `SCPM_JAVA`, then `JAVA_HOME`, then `PATH`, reading the JDK's `release` file). **Minimum JDK 17** (Scala 3.9's minimum); 25 or newer for the AOT cache. An older JDK fails with a message naming the version found and how to point `SCPM_JAVA` at another | No JDK download and no `cs java-home` |
+| Development | `SCPM_RESOLVER_CLASSPATH` overrides the closure, for running a local build | Like the worker's local jars |
+
+**Bootstrap: who resolves the resolver?** Today `cs` resolves every boot closure, and the lock pins it afterwards; a pinned closure needs no resolver. The resolver's own closure can't be resolved by the resolver, so **each scpm release carries that closure as a built-in list** (decided): URL, sha256 and size per jar, generated when the release is built. Only the list is compiled in; the jars stay on the release.
+
+- The list is restored directly and is **not stored in the lock**. It belongs to the scpm binary, not the workspace, so an scpm upgrade causes no lock churn and `bootInputs` doesn't cover it. Frozen CI never fetches it, because it never starts the sidecar.
+- The jars go into scpm's cache (`~/.cache/scpm/resolver/<sha256>.jar`), not the coursier cache: they aren't Maven artifacts at a repository URL. The fetcher re-hashes nothing it has already verified. `SCPM_RESOLVER_CLASSPATH` replaces the whole list for development, or for a network that can't reach GitHub.
+- **The download never sends credentials**, whatever the user config's entries match: the assets are public.
+- **Hosts:** `github.com` and the host it redirects asset downloads to (`release-assets.githubusercontent.com`, formerly `objects.githubusercontent.com`). Users behind a proxy, `noProxy` rules or a host allowlist need both. Risk 4 and `scpm config explain` name them.
+- **`resolverMirror:`** in the user config (§5.9) is an optional base URL that replaces the release URL; the jar file names are appended to it (default; user may revisit). It is safe because every jar stays pinned by the list's sha256. It must allow anonymous access, because no credentials are sent to it.
+- **`SCPM_RESOLVER_CLASSPATH`** drops the pins, so scpm prints a notice on every command that uses it.
+- **Release order.** The release workflow publishes the GitHub release, with its assets, before any binary that names those assets is distributed: a draft release's assets answer 404.
+- The chain is then: built-in list → Rust fetcher → resolver JVM → every other closure (compiler, bridges, worker, test runner, tools, variants).
+- Rejected: keeping `cs` only to resolve the resolver (that keeps all of `cs`'s sealing), and bundling the jars in the binary (against distributing JVM helpers as jars).
+
+**JVM start-up.** The one-shot sidecar starts with the worker spike's recipe (JDK 25 AOT cache, C1 only):
+
+- **AOT cache** (JEP 483/514/515). The first run with a new key is the training run (`-XX:AOTCacheOutput`), which writes to a temporary path that is renamed into place, so concurrent scpm processes never read a half-written cache. Training costs about 1 s once (1.25 s through `mise exec` against 0.37 s without training, M2 Pro), and the cache is about 28 MB. It lives in `~/.cache/scpm/aot/resolver-<key>.aot`. The key covers the scpm build, the **exact classpath string**, the JDK build and the JVM flags, as for the worker. The `setup-scpm` action caches it. A detected JDK older than 25 runs without a cache. M1 runs without an AOT cache (an M1 cut, below); it arrives with M2.
+- **`-XX:TieredStopAtLevel=1`** (C1 only) for one-shot runs. A kept-alive sidecar runs tiered by default. In the spike C1 was faster even on the 10th warm request, so the default should be revisited after measuring a large graph (spark-sql).
+- Always `-XX:+DisplayVMOutputToStderr -Xlog:disable -Xlog:all=warning:stderr -XX:+ExitOnOutOfMemoryError` (stdout carries protocol JSON only, as for the worker), a modest `-Xmx` (512m to start with), and probably `-XX:-UsePerfData` (no `hsperfdata` file) and `-XX:+DisableAttachMechanism` (no attach socket while it holds credentials). The stable private `user.home` (below) is also part of what the AOT cache sees.
+
+**Native-image later.** The protocol is the only contract, so a native-image build of the same sources (coursier ships its own native-image configuration) can replace the jar without any Rust change except how the process starts. It would be published per OS and arch, a classifier per `os-arch` with type `exe`. The spike says when that is worth it: native `cs` answers in 31 ms on the Mac, where a cold JVM sidecar with the AOT cache and C1 needs 164–194 ms (table below), so the gap is about 160 ms on every command that re-locks. Frozen CI never pays it. **Decided:** that cold cost is acceptable for now, so native-image waits.
+
+**Protocol.** It uses the [worker protocol](worker-protocol.md)'s envelope: JSON lines on stdin/stdout, `{"id", "method", "params"}` → exactly one `{"id", "result"}` or `{"id", "error"}`, `event` notifications, unknown fields ignored, and free-form logs on stderr only. Requests may run concurrently.
+
+| Method | Params | Result |
+|---|---|---|
+| `initialize` | `protocolVersion` (1), `proxy`, `trust` (`{pemBundle}`: on Linux the system PEM bundle's path, below; `null` on macOS and Windows, which use their OS stores) | `resolverVersion`, `coursierVersion`, `javaVersion`, `pid`. A version mismatch is `unsupported_protocol`; Rust and the resolver ship together, so that only happens with a development override |
+| `resolve` | `repositories`, `cache`, `ttl`, `refresh`, `offline`, and `requests`: one per classpath to resolve, each with a `label` (`core@jvm-3 testRuntime`, `boot scala-compiler@3.9.0`), `systems` (a list), `jdk`, `natives`, `roots` (`{module, version, classifier?, type?, exclusions[], transitive}`), `boms`, `forced` (`org:name:version`) and `artifactTypes` | One entry per request, in order: either `classpath`, merged across the request's systems (below), or `error` (below). One bad variant doesn't hide the others |
+| `listVersions` | `repositories`, `cache`, `ttl`, `refresh`, `module` (`org:name`) | `versions` (ascending) and, per allowed repository, `{id, versions}` |
+| `graph` | as one `resolve` request, with a single `system`; resolves metadata only, downloads no artifacts | The resolved graph: `nodes` (`{module, version}`) and `edges` (`{from, to, requested, excluded?}`), with evictions (`requested` ≠ selected). `why` computes chains in Rust, which replaces parsing `--what-depends-on` trees, and can also say "requested 2.9.0, got 2.13.0" |
+| `shutdown` | — | `{}`, then exit. End of stdin exits too, so the sidecar never outlives scpm |
+
+- **A classpath entry** is structured: `{group, artifact, version, classifier?, extension, url, file, size, repository}` (`size` is not in M1). Rust keeps its single key function (`artifact_key`, which uses the file's extension rather than the Maven type) to build the lock's `group:artifact:version[:classifier][@type]`, so `cs` and the sidecar can't disagree about keys. `repository` is the id of the repository that served the module (below).
+- **`repositories`** is the whole configured list, in declared order: `{id, url, groups?, auth?}`. `url` is the URL actually contacted, with mirrors already applied by scpm (§5.9). `auth` is `{user, password, realm?}` after scpm's plain-HTTP and origin policy (§5.7, §5.9). A bearer token still goes out as basic auth for the user `token`, as in Phase 1 (decided), so the cache path coursier derives from the user (`https/token@host/…`, §5.2) stays the same for `cs`, the fetcher and the sidecar; `realm` carries a realm-scoped entry imported from coursier's credential sources, which is otherwise sent only after a challenge naming that realm, as today. The sidecar applies `groups` itself (below), so Rust doesn't send a pre-filtered list. Repositories that share a URL become one coursier repository; `repository` in a result is then the first of them allowed for the module, and scpm's existing hint rule applies (§5.4).
+- **Several systems in one call** (part of M1, not a cut). `systems` and `jdk` are per request. The sidecar resolves the request once per system, concurrently, with that system's OS and arch (below), and returns one merged `classpath`.
+  - Entries on every system carry no `systems`, and the others list theirs, sorted: §5.4's lock form, so Rust writes it as it comes.
+  - The sidecar does §5.4's canonical merge itself, identifying entries by `(group, artifact, version, classifier, extension)` (the fields `artifact_key` uses). It returns `bySystem` lists for the whole classpath only when the merge finds a cycle.
+  - `natives` (`[{module, versions?, natives: {<system>: <classifier>}}]`) are the native mappings that apply, built-in and configured, sent by Rust. The sidecar applies them to any node, direct or transitive, through `Fetch`'s extra-artifacts hook, from the repository that served the module.
+  - A request with one system is the single-system case `cs` can also do.
+- **`proxy`** (`{http?, https?, noProxy[]}`, already resolved and normalised by scpm, §5.9) is set once in `initialize`, because the JVM's `ProxySelector` is global. A kept-alive sidecar is restarted when the proxy settings change.
+- **Cache policy.** `ttl` and `refresh` are explicit. The defaults are what coursier's `CacheEnv` yields with no environment: checksums `[SHA-1, none]`, a 24 h TTL for changing metadata, and the policies `LocalUpdateChanging` then `FetchMissing`. `refresh: true` re-checks changing metadata (`maven-metadata.xml`) regardless of the TTL; `scpm update` and `scpm outdated` use it.
+- **sha256 is computed by Rust**, from `file`, as today: Rust already hashes what coursier downloaded (§5.2), and the spike shows that hashing in a C1-only JVM is slow (19 MB of jars: about +130 ms with C1 against +15 ms with C2). `size` lets Rust check it read the file coursier wrote.
+- **`listVersions`** is implemented with coursier's `Versions` over the routed repositories, never with `Complete`, so `completeOpt` can't bypass routing. A 404 or a missing listing counts as no versions from that repository. **Any 401, 403 or transport failure on an allowed repository fails the request** (`unauthorized`/`transport`), so a missing token can't silently select a lower version. Release ages (§5.6) are per version, and `maven-metadata.xml`'s `<lastUpdated>` is per artifact, so `minimumReleaseAge` is checked by the Rust fetcher with HEAD requests on the candidate versions, not by the sidecar. The compatibility test compares version **sets** with `cs complete-dep`.
+- **Errors** carry `code`, `message` and `data`. The worker's codes (`bad_request`, `unknown_method`, `unsupported_protocol`, `internal`) plus:
+
+  | Code | Meaning | `data` |
+  |---|---|---|
+  | `not_found` | No allowed repository has the module or version | `module`, `version`, `tried: [{repository, url, status}]` |
+  | `no_artifact` | A root with a classifier or non-jar type resolved to no file (§5.4) | `root` |
+  | `unauthorized` | 401/403 | `repository`, `url`, `status` |
+  | `transport` | Network failure after coursier's retries | `repository`, `url`, `cause` |
+  | `checksum` | A served checksum didn't match | `url`, `expected`, `actual` |
+  | `offline_miss` | `offline` and not cached | `url` |
+  | `bad_environment` | Start-up found a setting it must not inherit (below) | `what` |
+
+  `tried` comes from a recording wrapper around the cache's `fetch`, which logs each URL and status per request. `bad_environment` is detected at start-up, before any request has an id: the sidecar answers the `initialize` request with it and exits, and if stdin closes first it exits with status 2 and the reason on stderr.
+
+**No ambient configuration.** The sidecar reads nothing but its request. Coursier's library defaults read the environment and system properties (`CacheDefaults`, `CacheEnv`, `CoursierEnv` in 2.1.27): `COURSIER_CACHE`, `COURSIER_CREDENTIALS` with `credentials.properties`, `SCALA_CLI_CONFIG`, `COURSIER_CONFIG_DIR`, `COURSIER_TTL`, `COURSIER_MODE`, `COURSIER_CHECKSUMS`, `COURSIER_CACHE_SERVER*`, `COURSIER_REPOSITORIES`, `COURSIER_MIRRORS`, `COURSIER_EXTRA_MIRRORS`, `COURSIER_MAVEN_SETTINGS`, `CS_MAVEN_HOME`, `MAVEN_HOME`, `coursier.*` properties, `CI` (user agent), and `os.*`/`java.version` (profile activation). The `@data` case classes evaluate their default arguments **at construction**, before any `with…` call: `Resolve(cache)` evaluates `Resolve.defaultRepositories` and `defaultMirrors`, `Versions(cache)` evaluates `defaultMirrorConfFiles`, `Fetch(cache)` does both, and a malformed file then throws even though its result would be replaced. So the sidecar never relies on a default and never calls the convenience constructors:
+
+- **Every object is built with each defaulted field given**: `FileCache(location, …)`, `Resolve(cache, repositories = routed, mirrors = Nil, mirrorConfFiles = Nil, resolutionParams = …, …)`, `Artifacts(cache, …)`, `new Fetch(resolve, artifacts, None)`, and `Versions(cache, Some(module), routed, mirrorConfFiles = Nil, mirrors = Nil)`. A unit test fails when a coursier upgrade adds a defaulted field the sidecar doesn't set.
+- **`FileCache`**, one per request, gets: `credentials` (the request's, below), `cachePolicies`, `checksums` and `ttl` (above), retry and timeout settings, `userAgent` (§5.7), a pool sized by scpm (below), and `allowCacheSubstitution = false`, which turns off the `COURSIER_CACHE_SERVER` path. `CacheDefaults.credentials`, which reads the credential files and the Scala CLI config, is then never evaluated.
+- **Credentials** become `DirectCredentials` on that per-request `FileCache` (host, user, password, `realm`, `httpsOnly` per the plain-HTTP policy), not `Authentication` on each repository: coursier matches them by origin on every request, including after redirects, which is what `cs` and the reqwest fetcher do today. Per-repository `Authentication` would need `passOnRedirect` and would behave differently from the fetcher on a redirect.
+- **TLS trust: the OS trust store** (decided), as for the Rust fetcher (reqwest with rustls, which verifies against the OS's store **[verify for reqwest 0.13]**). The sidecar builds its own `SSLContext` and passes it to each `FileCache` (`sslSocketFactoryOpt`) instead of setting `javax.net.ssl.*` properties:
+  - on macOS, the Keychain (`KeychainStore-ROOT` and `KeychainStore`);
+  - on Windows, `Windows-ROOT`;
+  - on Linux, the system PEM bundle, whose path Rust finds the same way its own TLS stack does and sends in `initialize`.
+
+  The JDK's own `cacerts` is not used, so a corporate root CA installed in the OS works on both paths.
+- **`ResolutionParams`** gets the request's `osInfoOpt` and `jdkVersionOpt0`, plus `useSystemOsInfo = false` and `useSystemJdkVersion = false`.
+- **Proxy.** `coursier.proxy.SetupProxy` (what the `cs` CLI calls to read `settings.xml` proxies) is never called. Coursier opens connections with `URL.openConnection()`, which asks the JVM-wide `ProxySelector`, so the sidecar installs its own from `initialize`'s `proxy`, with scpm's `noProxy` rules (§5.9). That matches the fetcher better than translating to `http.nonProxyHosts`. `java.net.useSystemProxies` stays off.
+- **The process is sealed too.** scpm starts the JVM with a cleared environment plus a short allowlist: the parent's `LANG`/`LC_*` (so non-ASCII cache paths decode as they do for scpm), and on Windows `SystemRoot`, `SystemDrive`, `windir`, `TEMP` and `TMP`. That removes the JVM option variables (`JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, `JDK_JAVA_OPTIONS`) and every `COURSIER_*`/`CS_*` variable in one step, without a list to maintain. The command line also sets `-Duser.home=<stable private directory>` (stable so the AOT cache stays valid), `-Dcoursier.config-dir=<private empty directory>` and `-Dscala-cli.config=<missing file>`, so a stray `~/.m2`, coursier config directory or Scala CLI config lookup finds nothing. On Windows, coursier finds its config directory through the Known Folders API (dirs-dev), which ignores `user.home`; there the `coursier.config-dir` property is the guard, and the Windows run of the hostile suite must cover it.
+- **Start-up check.** The sidecar answers `bad_environment` when any `coursier.*` property other than `coursier.config-dir`, any `scala-cli.*` other than `scala-cli.config`, any `*.proxyHost`, or `java.net.useSystemProxies` is set.
+
+**`groups` inside resolution.** Each configured repository is wrapped in a delegating `Repository`, `Routed(underlying, id, allows: Module => Boolean)`:
+
+- For a module it may not serve, it answers not-found (`Left("org:name is not routed to acme")`) **without making a request**. It overrides `find0`, the deprecated `find`, and both `versions` overloads, all routed.
+- It does **not** override `findFromVersionConstraint`: the inherited implementation calls the routed `versions` and `find0`.
+- It forwards `versionsCheckHasModule`. `completeOpt` returns `None`, because nothing in the sidecar uses `Complete` and it must not bypass routing.
+- `find0` returns the **underlying** repository as the `ArtifactSource`. `Resolution.artifacts` matches on `ArtifactSource.ModuleBased`, so returning the wrapper would make Gradle-module artifacts vanish. The spike already did this, and got the same 14 artifacts in the same order as `cs`.
+- Because results name the underlying repository, the sidecar keeps a map from each underlying instance to its configured id, which is how a classpath entry gets its `repository`.
+- Coursier 2.1.27 type-tests `MavenRepositoryLike` in three places only. When it applies mirrors, scpm applies them instead. When it parses repository strings, the sidecar doesn't use it. When it toggles Gradle module support, the sidecar sets that on the underlying repository before wrapping it. The compatibility test confirms nothing else depends on the concrete type.
+
+`allows` is the §5.4 rule computed for that repository, which covers both directions: a grouped repository serves only the groups for which it has the longest covering prefix; a repository without `groups` serves only groups that no rule covers. Repositories go to coursier in declared order, not grouped ones first. The matcher (dot boundaries, longest prefix wins) then exists in both Rust (`allowed_repos`, used by the fetcher) and Scala, so both test suites run one shared fixture file of `(repositories, group) → allowed ids`.
+
+The wrapper takes a predicate, not a list, so it can support both forms in §5.4's "Later" note. With an **exclusive** form (today's `groups`), a covered group is served only by its repositories. With a **non-exclusive** form (e.g. `alsoServes:`, like Gradle's plain `includeGroup`), the repository is added to a group's candidates without taking the group away from the others: `allows(m)` is true for a repository without `groups`, or one whose `alsoServes` covers the group, as long as no exclusive rule covers the group. Order stays the declared order.
+
+What this changes in §5.4's resolution limit: a re-lock no longer asks any repository about a module it may not serve, in either direction. That covers version listings for ranges inside POMs (coursier takes the first allowed repository whose listing succeeds) and the `graph` behind `why`. An internal module missing from its own repository is a `not_found` naming that repository, not a copy found elsewhere and then refused. The refusal after the fact stays as a cheap second check, and as the only check for restores behind a shared mirror. What `groups` can't see stays as it is: a machine's catch-all mirror forwarding a request upstream.
+
+**Resolution context.** Each system is turned into the system properties a JVM on it would report, and coursier's own `Activation.Os.fromProperties` derives the activation values from them. That covers the family (`unix`, `mac`, `windows`), the name and the arch:
+
+| System | `os.name` | `os.arch` | `path.separator` |
+|---|---|---|---|
+| `linux-x86_64` | `Linux` | `amd64` | `:` |
+| `linux-aarch64` | `Linux` | `aarch64` | `:` |
+| `macos-aarch64` | `Mac OS X` | `aarch64` | `:` |
+| `macos-x86_64` | `Mac OS X` | `x86_64` | `:` |
+| `windows-x86_64` | `Windows 11` | `amd64` | `;` |
+| `windows-aarch64` | `Windows 11` | `aarch64` | `;` |
+
+`os.version` is left unset, so profiles that test a version never activate. The JDK goes in as `jdkVersionOpt0`. The lock then no longer depends on the resolving machine, which removes §5.4's Phase 1 limit; `resolvedOn` and its warning go away. Every variant the sidecar writes carries `fullContext: true`. A variant without it (written by `cs`, or converted from Phase 1) may hold the resolving machine's OS-profile choices, so the next non-frozen sidecar run re-locks just those variants (§5.4, "Systems").
+
+This is what makes the **universal lock** (§5.4, "Systems") possible and cheap. Each classpath becomes one request with several systems, and each extra system costs about one warm resolve (≈10–25 ms for the spike's graph). Comparing the per-system results shows exactly which artifacts are system-specific; those are the only entries that carry `systems` in the lock.
+
+**Lifecycle.**
+
+| Front-end | Sidecar lifetime |
+|---|---|
+| `scpm install`, `add`, `update`, `why`, `outdated` | Started at the first resolve, used for the rest of the command, `shutdown` at the end. All of a command's requests go to one process concurrently (today: up to 8 `cs` processes) |
+| `scpm bsp`, `scpm mcp` (from M2; M1 is one-shot only) | One sidecar per front-end and workspace, kept alive and stopped after 10 minutes idle (its own timer, plus end of stdin). A manifest edit then re-locks in about 20 ms instead of about 200 |
+| The shared daemon (`scpmd`, §6.3) | None for now: it serves every workspace, so a sidecar it owned would hold several workspaces' credentials |
+| `--frozen` / CI restore | Never started |
+
+- **Concurrency.** Requests run in parallel. Each has its own `FileCache` for credentials, and all share one download pool and the on-disk cache. Coursier's in-process locking and its cache file locks coordinate with other scpm processes, sbt and Mill, as `cs` does today. Today a re-lock runs about 48 downloads at once (8 `cs` processes × coursier's 6), so the pool is sized for **total** concurrency, with a per-host limit, rather than coursier's per-process 6. Coursier also runs resolution work on `cache.ec`, so the pool can't simply be the download limit. A cold-cache, many-variant re-lock is among the measurements still to do. Timeouts are scpm's job (it kills the process). A `cancel` method can follow when BSP needs it.
+- **Not a shared per-user daemon**, unlike `scpmd`. Resolution is rare, and warm it is cheap. A process shared across workspaces would also hold several workspaces' credentials; a per-workspace child holds only one workspace's, and only for the request.
+- **Not inside `scpmd`** for now, for the same credentials reason, plus crash and heap isolation and §5.2's rule that resolving must not need a warm daemon.
+
+**Tests** (beyond the golden locks):
+
+- **Routing**, against a recording fixture server: zero disallowed requests, in both directions, per resolution path. Cases: an internal artifact with a public parent POM, a public BOM imported by an internal POM, a relocation across groups, a range in a third-party POM, `latest.release`, `listVersions` and `graph`.
+- **Concurrency**: two requests with different system sets running in parallel in one sidecar must give the same results as when run alone.
+- **Universal lock**:
+  - each system's projection equals a single-system resolve for that system;
+  - the canonical merge gives the same bytes whatever order the per-system results arrive in;
+  - a fixture with a cycle produces `bySystem` for the whole classpath;
+  - built-in and overridden native mappings, on direct and transitive nodes;
+  - a mapping-table change: M > N re-locks only the variants holding a module inside a touched range of a change or tombstone (including a range an entry was narrowed away from), and raises the header whenever the lock is written; M < N stops any re-lock; a frozen run only notes it;
+  - a `cs`-written variant (no `fullContext`) next to sidecar-written ones: the sidecar re-locks only the unmarked one;
+  - a jar-only fixture has no `systems` entry;
+  - a host outside the set, with and without system-specific entries;
+  - a frozen restore downloads only the host's files.
+- **Hostile environment** (§5.9), on Linux, macOS and **Windows** CI.
+- **Compatibility fixtures** served from a local fixture repository, so results don't drift with Central.
+
+**Migration.**
+
+| Step | What | `cs` |
+|---|---|---|
+| M0 (done) | The spike below | Default |
+| M1 | The minimum: `worker/resolver`, the Rust client and the bootstrap list; `resolve` (with multi-system resolution) and `listVersions`; lockfile version 2 from both resolvers; `SCPM_RESOLVER=sidecar` opts in, and a project may then set several `lock.systems` | Default, single system only; also `why` |
+| M2 | Sidecar is the default; the **standard system set becomes the default** for new locks and for locks whose header came from the old default, at their first non-frozen install (§5.4, "Systems") | Fallback for one release, for single-system workspaces only |
+| M3 | The `cs` resolve path is deleted | Gone, unless something else still calls it |
+
+- **M1 scope (decided): the minimum, except multi-system resolution.** M1 leaves out:
+  - the kept-alive sidecar (BSP, MCP);
+  - `alsoServes`;
+  - release-age data from the sidecar;
+  - `size` in results;
+  - the AOT cache;
+  - `graph`: `why` stays on `cs` in M1, so it explains only the host system's classpath. `why --system <s>` for any other system is an error in M1 that names the sidecar's `graph` method (M2); it never prints the host's graph as if it were another system's.
+
+  All of these follow in M2. Multi-system resolution is in M1, so projects can opt into universal locks before M2 makes them the default.
+- **M1 prerequisites.** The implementation lands after #14 (machine settings) and #5 (the compile worker launcher and `detect_java`) have merged, so its branch has both. The Rust CLI on `machine-config` doesn't start any JVM yet. In M1 the sidecar runs on the JDK the compile worker detects: no JDK download, and no `cs java-home`.
+- **Compatibility test.** Every golden-lock fixture is resolved both ways on one warm cache and must give a **byte-identical `scpm-lock.yaml`**, identical `why` chains, and equal version sets. These fixtures are single-system, with the system equal to the host, and use no module with a native mapping, so `cs` can agree. `fullContext` and `nativeMappings`, which only the sidecar writes, are stripped before comparing. Multi-system fixtures are tested against the sidecar alone (Tests, above). The known differences each have a test of their own where only the sidecar is right: a non-host context, and a `groups` violation (`not_found` instead of a refusal).
+- **Deleted from `coursier.rs`** at M3, once nothing else calls `cs`:
+  - the sealing: `seal`, `unsealed_env`, `KEPT_COURSIER_ENV`, `JVM_OPTION_ENV`;
+  - the launcher probe: `launcher_jvm_options`, `JvmOptions`;
+  - the credentials file: `credential_properties`, `credentials_env_value`, `escape_property`;
+  - `add_common_args*` and `CommonArgs`, `clean_stderr`, the `cs fetch` report parsing (`Report`, `report_parts`, `artifact_types`), and the tree parsing for `why` (`reverse_tree_chains`, `strip_ansi`);
+  - the proxy-to-JVM-properties translation and its `http.nonProxyHosts` test.
+
+  `foreign.rs` keeps its notices but no longer needs `unsealed_env`: the sidecar ignores every inherited variable. If anything still calls `cs`, its sealing stays until that caller is gone.
+- **Stays:**
+  - the Rust fetcher (`fetch.rs`) and the cache layout (`cache_path`, `escape`, `maven_path`);
+  - `artifact_key`, the single key function;
+  - `repositories()`, the plain-HTTP and credential policy, and the origin rule with its clash error (§5.9);
+  - `machine.rs`, whose resolved settings now go into the request instead of `cs`'s environment;
+  - `allowed_repos` for restores.
+
+**Spike** (2026-11-26, *measured*). A throwaway coursier-API resolver (Scala 3.9, `coursier_3` 2.1.27, a `Routed`-style wrapper over Central, a Linux context) resolved `org.typelevel:cats-effect_3:3.5.7` + `org.scalameta:munit_3:1.3.6` (14 jars) with a warm cache. Each figure is the median of 7 runs after one discarded warm-up, wall clock from spawn to exit; kept-alive figures are timed inside the sidecar. JDK Temurin 25.0.5.1 on both. The Linux container is arm64 Docker on the same Mac with `--cpus=2`, so it reproduces a 2-vCPU runner's core count, not its x86 cores.
+
+| Configuration (ms) | M2 Pro, 10 CPUs | Linux, 2 CPUs |
+|---|---|---|
+| `cs fetch`, native launcher | **31** | not measured |
+| `cs fetch`, JVM (`coursier-cli_3` on JDK 25) | 717 | 712 |
+| Sidecar cold, plain | 443 | 439 |
+| Sidecar cold, C1 only | 368 | 336 |
+| Sidecar cold, AOT cache | 222 | 264 |
+| Sidecar cold, AOT + C1 | 194 | **168** |
+| Sidecar cold, AOT + C1 + SerialGC | 191 | 164 |
+| Kept alive, 2nd request (tiered / C1) | 26 / 20 | 23 / 18 |
+| Kept alive, 10th request (tiered / C1) | 12 / 8 | 12 / 8 |
+
+Read: AOT + C1 cuts a cold sidecar by 56% (Mac) to 62% (Linux), matching the worker spike. That leaves it 163 ms behind native `cs` on the Mac, and about 4× faster than `cs`'s own JVM launcher. Of the AOT + C1 total, the first request takes about 100 ms and JVM start-up the rest. A kept-alive sidecar beats native `cs` from the second request. The sidecar resolved the same artifacts as `cs`, in the same order.
+
+**Risks.**
+
+1. **Coursier API drift.** The design relies on `@data` fields (`allowCacheSubstitution`, `useSystemOsInfo`, `jdkVersionOpt0`) and constructor defaults. The defaulted-field test, the cleared environment, the private directories and the hostile-environment suite catch a new default being read.
+2. **Duplicate matchers** (`groups` routing, `noProxy`) in Rust and Scala, kept in step by shared fixtures.
+3. **A Java is needed for `scpm add`** in a project that has never compiled: JDK 17 or newer, found by `detect_java` as for compiling. Its absence, or an older JDK, fails with a clear message.
+4. **The bootstrap list needs GitHub reachable**: `github.com` and the host it redirects asset downloads to (`release-assets.githubusercontent.com`, formerly `objects.githubusercontent.com`), through the machine's proxy. A network that blocks them can set `resolverMirror` (still sha256-pinned), or wait for the Central move. `SCPM_RESOLVER_CLASSPATH` also works, but without the pins.
+5. **Universal-lock costs.**
+   - A native-heavy project's lock grows by one entry per system for each native module.
+   - A re-lock does one resolve per system, and downloads every system's files to hash them: JavaFX or LWJGL natives five times over.
+   - The built-in mapping table needs maintaining as libraries rename classifiers.
+6. **Unmeasured:** large graphs (heap, C1 against C2, AOT training on a spark-sql-sized resolve), a cold-cache many-variant re-lock against today's 48 parallel downloads, native `cs` on the 2-CPU container, and AOT cache portability across machines with the same JDK build (also open in §6.3).
+
+**Decisions (user, 2026-11-27).**
+
+1. **Bootstrap:** the resolver's own jars are restored from a list built into scpm, not from the lock.
+2. **Distribution:** GitHub Releases assets on `gatorcse/scpm` for now, not Maven Central. GitHub Packages Maven needs auth even for public packages, so Releases assets are used instead. Moving to Central later changes only the built-in list's URLs.
+3. **Bearer tokens:** keep sending them as basic auth for the user `token`.
+4. **TLS trust:** the OS trust store.
+5. **Cold cost:** about 160 ms more than native `cs` per re-lock is acceptable; native-image waits.
+6. **M1 scope:** the minimum, except that multi-system resolution is not cut (Migration, above).
+7. **Naming:** an OS and arch pair is a *system* (`lock.systems`, `--system`, `--all-systems`, `natives:`, `lock.nativeClassifiers`); *platform* stays `jvm`/`js`/`native` (§5.4, "Systems").
+
+**Still open.** Host the resolver inside `scpmd` later, as a separate class loader, once per-workspace credentials can be kept apart there?
 
 ### 5.3 Cache sharing
 
 Use the user's existing coursier cache (`COURSIER_CACHE` or the platform default), so downloads are shared with sbt, Mill, scala-cli and bleep, and worktrees cost nothing extra.
 
-In CI, the `setup-scpm` action caches it, keyed by the lockfile hash.
+In CI, the `setup-scpm` action caches it, keyed by the lockfile hash and the runner's host system (a frozen restore fetches only that system's files, §5.4).
 
 ### 5.4 Lockfile: `scpm-lock.yaml`
 
 Design goals, taking lessons from pnpm 12's experimental v13 lockfile format: few merge conflicts, one entry per artifact, sorted, stable.
 
 ```yaml
-lockfileVersion: 1
-resolutionContext: { os: linux, arch: x86_64, jdk: 25 }   # see below; a change re-locks every variant
-bootInputs: sha256:…             # repositories + resolution context; a change re-resolves every boot entry
+lockfileVersion: 2               # Phase 1 writes version 1, with a single `resolutionContext` instead of `systems` + `jdk`
+systems: [linux-aarch64, linux-x86_64, macos-aarch64, macos-x86_64, windows-x86_64]   # see "Systems" (also defaultSystems and nativeMappings)
+jdk: 25
+bootInputs: sha256:…             # repositories + systems + jdk; a change re-resolves every boot entry
 
 boot:                            # everything needed before a JVM starts; lists reference `artifacts`
-  jdk:                           # planned format (not written by Phase 1): project JDK per os-arch, a JVM index id
+  jdk:                           # planned format (not written by Phase 1): project JDK per system, a JVM index id
     linux-x86_64:  { id: temurin:25.0.1 }
     macos-aarch64: { id: temurin:25.0.1 }
   scala-compiler@3.9.0: [org.scala-lang:scala3-compiler_3:3.9.0, org.scala-lang:scala3-library_3:3.9.0, …]
@@ -590,32 +826,155 @@ Each variant locks four ordered classpaths:
 - **Resolution is joint over the variant's transitive workspace closure.** A variant's external dependencies are resolved in one coursier call together with those of every upstream variant, so if A depends on B, A's classpaths hold one version of each library for both A's and B's code.
 - **Catalog ranges are resolved once per (platform, Scala binary version) for the whole workspace**, so every variant that uses that catalog entry on that platform and Scala binary version gets the same version. The selection lives in the lock's top-level `catalogs` section, keyed `<catalog>/<key>@<platform>-<scala binary>`. Re-locking a stale variant reuses an existing selection whose range is unchanged; only `scpm update` re-selects, and it then re-locks every variant that uses the entry.
 - **`specifiers`** records each direct dependency's spec as written and the version scpm selected for it (§5.5), before coursier's reconciliation, like pnpm's importers. `workspace:*` entries have no version. BOMs (the workspace's and the module's) are recorded too, keyed `bom:<coordinate>` so they never collide with a dependency on the same coordinate. A joint resolution applies one version per BOM coordinate: the variant's own, else the nearest upstream variant's (§5.4). A Java-only module skips workspace BOMs written `org::name`; its own are errors.
-- **`inputsHash`** is a sha256 over every effective input that affects the variant's resolution, after presets and `variants` (§4.4): platform and full Scala version, dependencies of every scope (catalog references replaced by their entries), `compilerPlugins`, BOMs, overrides, repositories (ids, URLs and `groups`), the resolution context and `policy.minimumReleaseAge` / `minimumReleaseAgeExclude`, plus what joint resolution consumes from each upstream variant in its workspace closure: its compile and runtime dependencies, BOMs and Scala version. An upstream variant's test or provided dependencies and compiler plugins don't affect downstream variants, so editing them re-locks only that variant.
+- **`inputsHash`** is a sha256 over every effective input that affects the variant's resolution, after presets and `variants` (§4.4): platform and full Scala version, dependencies of every scope (catalog references replaced by their entries), `compilerPlugins`, BOMs, overrides, repositories (ids, URLs and `groups`), the system set, `lock.jdk`, the configured native overrides (`natives:`, `lock.nativeClassifiers`; built-in mappings are versioned in the header instead, "Systems", below) and `policy.minimumReleaseAge` / `minimumReleaseAgeExclude`, plus what joint resolution consumes from each upstream variant in its workspace closure: its compile and runtime dependencies, BOMs and Scala version. An upstream variant's test or provided dependencies and compiler plugins don't affect downstream variants, so editing them re-locks only that variant.
 - A variant with `compilerPlugins` also has an ordered `compilerPlugins` list.
 
 **Artifacts** are keyed `group:artifact:version[:classifier][@type]`, with `@type` omitted for `jar`. Each file has one entry, shared by every variant that uses it, holding `repo`, `sha256` and `size`. The lock records no dependency graph between artifacts: it would depend on the order variants happened to be locked in, so `scpm why` asks coursier instead (below). Declared classifiers and types (`classifier: sources`, `type: exe`, `aar`, `test-jar`, `bundle`, …) are locked like any other file, and a direct dependency that resolves to no file is an error naming it, except a plain POM-packaged aggregator (no classifier or non-jar type, such as `groovy-all`), which contributes only its transitive artifacts. **IDE sources jars are not in the lock.** They are fetched on demand and verified against the repository's checksum.
 
-**Boot** holds the closures of the Scala compiler, compiler bridge, scpm worker, test runner and tools (scalafmt, scalafix), each a list of references into `artifacts`. A CI run can then fetch everything it needs in parallel from Rust before any JVM starts. `boot.jdk` is the project JDK (§6.3), keyed by `os-arch` (`linux-x86_64`, `macos-aarch64`, …). In Phase 1 it records only the JVM index id, which `cs java-home --jvm <id>` turns into a cached JDK; the Rust JDK fetcher (Phase 3) adds a URL and sha256 per entry. Boot entries re-resolve when their inputs change: a Scala 2 compiler bridge's key carries the Zinc version (`compiler-bridge@2.13.18+zinc-2.1.0`), and the top-level `bootInputs` hash covers the repositories and the resolution context, so changing either re-resolves every boot entry.
+**Boot** holds the closures of the Scala compiler, compiler bridge, scpm worker, test runner, and tools (scalafmt, scalafix), each a list of references into `artifacts`. The resolver sidecar's own jars are not in the lock: scpm restores them from a list built into each release (§5.2.1). A CI run can then fetch everything it needs in parallel from Rust before any JVM starts. `boot.jdk` is the project JDK (§6.3), keyed by `os-arch` (`linux-x86_64`, `macos-aarch64`, …). In Phase 1 it records only the JVM index id, which `cs java-home --jvm <id>` turns into a cached JDK; the Rust JDK fetcher (Phase 3) adds a URL and sha256 per entry. Boot entries re-resolve when their inputs change: a Scala 2 compiler bridge's key carries the Zinc version (`compiler-bridge@2.13.18+zinc-2.1.0`), and the top-level `bootInputs` hash covers the repositories, the system set and the JDK, so changing any of them re-resolves every boot entry.
+
+#### Systems: a universal lock
+
+> The default from M2 of the resolver sidecar (§5.2.1). Until then a new lock covers one system (below).
+
+**Terms.** A **system** is an OS and CPU architecture pair (`linux-x86_64`, `macos-aarch64`), following Nix's use of the word. **Platform** keeps its §4.5 meaning: `jvm`, `js` or `native`. The names `lock.systems`, `--system`, `--all-systems`, `natives:` and `lock.nativeClassifiers` were confirmed by the user.
+
+**The lock covers every system the project supports, and each machine uses its own.**
+
+- **The system set** is `lock.systems`. For a new lock the default is the standard set: `linux-aarch64`, `linux-x86_64`, `macos-aarch64`, `macos-x86_64` and `windows-x86_64`. A project can narrow it (`lock.systems: [linux-x86_64, macos-aarch64]`), or extend it with any other system scpm knows the JVM properties for (§5.2.1's table, e.g. `windows-aarch64`).
+- **The JDK** is `lock.jdk`, by default the project JDK's major version.
+- **Sorting.** The lock's header, every entry's system list and the default set are all sorted, so the same set always serializes the same way.
+- **Every variant is resolved per system**, Scala.js and Scala Native ones too. Their artifacts depend on the platform rather than the OS, but an OS-activated POM profile anywhere in the graph still applies, and one resolution would hand some systems the wrong dependencies. In practice their per-system results are identical, so the merge writes plain strings and the lock looks as if they were resolved once; the cost is a few warm resolves on metadata already in memory. Native mappings apply only to JVM variants.
+
+This is the *universal lock* other ecosystems settled on:
+- npm, pnpm and Yarn platform packages with `os`/`cpu`: installs skip the other systems, and `supportedArchitectures` fetches them;
+- Cargo's `[target.'cfg(...)'.dependencies]`;
+- uv and Poetry locks, which record every system's wheel.
+
+scpm needs no change from library authors: the system-specific jars and profiles already exist on Maven Central.
+
+| What differs by system | How scpm handles it | Config |
+|---|---|---|
+| A dependency a POM switches on with an OS/arch profile (e.g. JavaFX: OS-activated profiles set `javafx.platform`, which picks the classifier jar) | Every classpath is resolved once per system, with that system's OS and arch (§5.2.1) | None |
+| A native published as a classifier (Netty's `netty-transport-native-epoll`/`-kqueue`, LWJGL's `natives-*`) | A system → classifier mapping per module adds that system's jar | scpm's built-in mappings; a `natives:` entry overrides one |
+| One jar with every native inside (sqlite-jdbc, JNA) | Nothing to do | None |
+
+**Native mappings.** An override looks like this:
+
+```yaml
+dependencies:
+  - dep: io.netty:netty-transport-native-epoll:4.1.115.Final
+    natives:                         # system -> classifier; replaces scpm's built-in mapping
+      linux-x86_64: linux-x86_64
+      linux-aarch64: linux-aarch_64
+      # other systems in the set: no native jar for this module
+```
+
+- **Built-in mappings.** scpm ships a mapping table keyed by module, with a version range where a library renamed its classifiers: for example Netty's epoll, kqueue and io_uring transports, and LWJGL's modules. A mapping applies wherever its module appears in a JVM variant's graph, direct or transitive. The sidecar then adds the mapped classifier jar at the resolved version, from the repository that served the module. Most projects never write a mapping.
+- **Versioned table.** The table has a version number. Each entry keeps a short change log: for every table version that changed it, the **touched range**, the union of the entry's version range before and after that change. A deleted entry leaves a tombstone whose touched range is its last range. So the binary can list, for any (N, M], every version range whose mapping changed, including the parts a newer range dropped (an entry narrowed from 1–3 to 2–3 has touched range 1–3), without shipping old tables.
+- **Mapped modules contribute a jar.** A mapping applies only to a module that has an entry on the variant's locked classpaths; the native jar is added next to that entry. A module that is only a POM in the graph (a parent, a BOM, a `type: pom` dependency) gets no native jar. Every library in the built-in table publishes its natives next to a regular jar, so this costs nothing, and it is what makes "affected" decidable from the lock alone.
+- **Overrides.**
+  - A `natives:` map on a direct dependency replaces the built-in mapping for that module.
+  - `lock.nativeClassifiers` in the workspace does the same for a module that only arrives transitively, as `[{module: org:name, natives: {…}}]`.
+  - `natives: {}` turns a mapping off.
+- **Systems a mapping doesn't list** get no native jar for that module. `scpm install` notes this in its summary. Built-in mappings list only the systems a library supports, so for those it is a note, not a warning.
+- **Boot closures** are resolved per system too, because profiles apply there as well. Mappings don't apply to them: none of scpm's boot tools uses classifier natives.
+
+**What decides the system set and the mappings.** A lock must not go stale just because a newer scpm binary has a different default set or a newer mapping table. So both are recorded in the lock's header, and **built-in mappings are not part of `inputsHash`**:
+
+- **The system set.**
+  - When `lock.systems` is unset and the header carries `defaultSystems: <set version>`, **the header governs** (default; user may revisit).
+  - The binary's default set applies only to a new lock, to `scpm install --reset-systems`, and to a header without `defaultSystems`: one written from an explicit `lock.systems` that has since been removed falls back to the current default.
+- **`nativeMappings: <table version>`** in the header (N) is compared with the binary's table (M). The non-frozen rows apply to sidecar runs only: `cs` skips the table comparison, re-locks no variant because of mappings, and keeps the header.
+
+  | Run | N vs M | What happens |
+  |---|---|---|
+  | Frozen | any difference | Never stale because of mappings. The lock is used as it is, with a note: "lock uses mapping table N, this scpm has M" |
+  | Non-frozen | M > N | Re-lock, in this same run, every **affected** variant: one whose locked classpaths have a module at a version inside a **touched range** of a change in (N, M] (entries and tombstones alike). A change to the Netty 4.2 entry doesn't re-lock 4.1 users; narrowing an entry from 1–3 to 2–3 does re-lock 1.x users, so they lose the old mapping. **Whenever the install writes the lock at all**, the header becomes M: every affected variant was re-locked in the same run, so all variants match M. An install that writes nothing leaves the header alone, so jar-only projects see no churn |
+  | Non-frozen | M < N | Never downgrade. An install that would re-lock anything (a manifest edit, a variant without `fullContext`, …) stops with "lock uses mapping table N; upgrade scpm". One with nothing to re-lock only restores |
+
+  So every variant marked `fullContext` matches the header's table; unmarked variants have no mappings, and the next sidecar run re-locks them. A mapping for a module that first arrives in a re-lock is applied by that re-lock. A lock without `nativeMappings` holds no sidecar-written variants (below), so the first sidecar re-lock sets it.
+- **`inputsHash`** covers the system set and `lock.jdk`, and the configured overrides (`natives:`, `lock.nativeClassifiers`), which live in the manifest like any other dependency setting. Absent overrides hash as they did before the keys existed. The **whole** workspace-level `lock.nativeClassifiers` list is in every JVM variant's hash, not just the entries that apply to it, so any edit to it re-locks every JVM variant. Nothing in it depends on the lock or on the binary's table, so it can be computed before resolving.
+- **`bootInputs`** covers the repositories, the system set and the JDK. No mappings apply to boot closures.
+
+**Lock format.** An entry that is on every system stays a plain string. Only an entry that isn't carries `systems`:
+
+```yaml
+lockfileVersion: 2
+systems: [linux-aarch64, linux-x86_64, macos-aarch64, macos-x86_64, windows-x86_64]
+defaultSystems: 2                    # the header came from scpm's default set, version 2
+nativeMappings: 7                    # the built-in mapping table this lock was written with
+jdk: 25
+variants:
+  server@jvm-3:
+    fullContext: true                # written only by the sidecar (§5.2.1)
+    runtimeClasspath:
+      - org.typelevel:cats-core_3:2.13.0
+      - io.netty:netty-transport-native-epoll:4.1.115.Final
+      - { artifact: io.netty:netty-transport-native-epoll:4.1.115.Final:linux-aarch_64, systems: [linux-aarch64] }
+      - { artifact: io.netty:netty-transport-native-epoll:4.1.115.Final:linux-x86_64, systems: [linux-x86_64] }
+      - …
+artifacts:                           # every system's files, one entry each, all pinned by sha256
+  io.netty:netty-transport-native-epoll:4.1.115.Final:linux-aarch_64: { repo: central, sha256: …, size: … }
+  io.netty:netty-transport-native-epoll:4.1.115.Final:linux-x86_64: { repo: central, sha256: …, size: … }
+```
+
+- **Projection.** A system's classpath is the list filtered to the entries without `systems` or listing that system, in list order. It equals coursier's order for that system.
+- **Canonical merge.** The sidecar merges the per-system orders deterministically, so every machine writes the same bytes:
+  - Entries are identified by `(group, artifact, version, classifier, extension)`, the fields `artifact_key` uses.
+  - The merge is a Kahn topological sort over the union of the per-system orders, with an edge from each entry to the next one in every system's list.
+  - Among the entries ready at each step, the one earliest in the first system of the sorted header goes first (entries absent there come after those present), then the smallest key.
+  - Each system's projection is then exactly its own order.
+- **`bySystem`.** Only when that union has a cycle is the classpath written as `bySystem: {<system>: [...]}`, and it then replaces the whole classpath, not part of it. A cycle needs two systems to order shared entries differently, which can happen whenever a node that appears on only some systems has transitive dependencies shared with the others. Tests cover both forms.
+- **Version differences.** A library that resolves to different versions on different systems (a profile pulls in a newer one) appears as two keys, each with its own `systems`.
+- **No churn for jar-only projects.** A project with no system-specific dependency, which covers most JVM-only Scala projects, has no `systems` entry anywhere. Its classpaths read exactly as a single-system lock's, and only the header differs.
+- Boot closures use the same form. `boot.jdk` already has one entry per system, and now has one for each system in the set.
+- `artifacts` holds every system's files, so any machine can fetch any system's variant without re-resolving: for example, to package for Linux from a Mac.
+
+**Using it.**
+
+- **The host system is the project JDK's system** (default; user may revisit): the JDK of `toolchain.jdk` (§6.3), which runs `run` and `test`, the only tasks that load project natives. It is read from the `OS_NAME` and `OS_ARCH` lines of that JDK's `release` file, not from the OS and arch scpm's own binary was built for. An x86_64 JDK under Rosetta therefore gets x86_64 natives. Every consumer below (classpaths, the restore projection and the CI cache key) uses this one JDK's system, so a task never gets natives for a different JVM than the one it runs on. The compile worker's JDK (the one `detect_java` finds) may be a different JDK, but **it must be the same system**: macros and compiler plugins run inside the worker and can load natives from the compile classpath, and the worker's boot closures are restored for the host system too. A mismatch (say an aarch64 worker JDK next to an x86_64 project JDK) is an error naming both JDKs, their systems and `SCPM_JAVA`, raised before anything is compiled or restored. So one system governs the project's classpaths, the boot closures and the macros alike. If the project JDK isn't available yet, scpm falls back to the OS and arch it runs on, with a note.
+- **Classpaths.** `compile`, `run`, `test`, `classpath`, BSP and `mbt.json` use the host system's projection. `--system <s>` selects another system for `classpath`, `run` and packaging.
+- **A host outside the set** (default; user may revisit) is an error only when the lock has system-specific entries. The error names the host and suggests adding it to `lock.systems`; scpm doesn't guess a nearby system. When the lock has no system-specific entries, scpm uses the common projection and prints a note. `install --frozen` makes this check before downloading anything.
+- **Restores.** A frozen restore downloads only the host system's files: the projection of every variant and boot entry. CI therefore downloads what it runs and no more. `scpm install --system <s>[,…]` or `--all-systems` also fetches others. The `setup-scpm` cache key includes the host system, computed by the same rule (the project JDK's `release` file, else scpm's own OS and arch), so the project JDK must be set up before that step.
+- **Packaging** (Phase 4) uses the target system's projection.
+- **`why`** explains the host system's classpath, or the one `--system` names (from M2; in M1 only the host's, §5.2.1).
+- **Cost.**
+  - A re-lock resolves every classpath once per system, concurrently, in one sidecar call (§5.2.1). Each extra system costs about one warm resolve: ≈10–25 ms for the spike's graph, still to be measured on a large workspace.
+  - A re-lock also **downloads every system's files**, because Rust hashes them for the lock. JavaFX or LWJGL natives are then fetched five times over (once per system), on a re-lock only. Restores still fetch only the host's.
+
+**This needs the resolver sidecar.** `cs` takes only `--jdk-version`. OS and arch profile activation follow the machine running it, so it can't resolve for another system. The native mappings also need per-node control over artifacts that its flags don't offer.
+
+- **Both resolvers write lockfile version 2 from M1.**
+  - `cs` writes only a single-system set. With `cs`, a set of more than one system is an error that names the sidecar.
+  - **`cs` applies no native mappings and writes neither `fullContext` nor `nativeMappings`.** It doesn't strip them either: a `cs` re-lock keeps the existing `nativeMappings` header, and the markers on the variants (and the boot section) it didn't re-lock.
+- **`fullContext: true` is per variant**, and written only by the sidecar, which applies the declared OS and arch. The boot section carries one such flag for all its entries, because `bootInputs` re-resolves them together.
+  - A `cs` re-lock writes its variants without the marker, because under `cs` OS and arch profile activation follow the host (the Phase 1 limit below).
+  - The next non-frozen sidecar run re-locks **only the variants without the marker** and sets it on them. That covers a single-system workspace whose profiles followed the host under `cs` and follow the declared system under the sidecar. It is also how native mappings first come into a lock that `cs` wrote.
+  - The **boot section** follows the same rule: a non-frozen sidecar run re-resolves an unmarked boot section, whatever `bootInputs` says, and marks it. A `cs`-written boot closure may hold the host's profile choices, and `bootInputs` alone would never notice.
+  - A frozen run uses unmarked variants and an unmarked boot section as they are, with a note.
+- **Converting a v1 lock** (Phase 1: one `resolutionContext: {os, arch, jdk}`) gives `systems: [<os-arch>]` and `jdk`, plus `defaultSystems: 1` when the context was Phase 1's default. Conversion **keeps every `inputsHash`**: a single-system set is hashed exactly as v1's context was, absent overrides add nothing, and built-in mappings aren't in the hash, so converting alone re-locks nothing. Converted variants carry no `fullContext`, so the first sidecar run re-locks them. Phase 1's workspace key `lock.resolutionContext` is replaced by `lock.systems` and `lock.jdk` (scpm is unreleased, so there is no alias).
+- **Until M2 (§5.2.1) the default set for new locks is one system, `[linux-x86_64]`** (default set version 1). With `SCPM_RESOLVER=sidecar` (M1), a project can set more systems.
+  - **Phase 1 limit:** `cs` applies only the JDK part of the context. The lock doesn't record the resolving machine, because that would make otherwise identical locks differ by who resolved them. `scpm install` reports it instead (`resolvedOn` in `--json`) and warns when it differs from the declared system, only when it actually re-locked something.
+  - **Local-runtime trade-off:** with the single `linux-x86_64` system, a macOS developer's `run` and `test` get the artifacts a Linux profile selects, including OS-classifier natives. Natives that differ by OS have to be declared by hand, one classifier per OS, in `runtimeDependencies`, and every one of them lands on every classpath.
+- **At M2 the default set becomes the standard set** (version 2).
+  - A new lock gets it.
+  - An existing lock whose header came from default set 1 (`defaultSystems: 1`, `lock.systems` unset) is upgraded by **the first non-frozen `scpm install`** with an M2 binary, which says so in its summary (default; user may revisit). That keeps the low-effort default the user asked for, shows up as a reviewed lock diff, and never happens in CI (frozen). A lock with an explicit `lock.systems` is left alone.
+  - That same install suggests removing hand-declared native classifiers that a built-in mapping now covers.
+  - Under `SCPM_RESOLVER=cs`, the M2 default-set upgrade, and any change to more than one system, is skipped with a note. `cs` then works only for a workspace whose set has a single system.
+  - **Version skew:** an M1 binary on `cs` running a non-frozen install over a lock that already has several systems (written by an M2 binary, or by the sidecar in M1) stops with the "needs the sidecar" error. A frozen run with it works, because restores need no resolver.
 
 #### Resolution context and repositories
 
-- **Resolution uses a fixed, declared context**, never the machine's own: by default `{os: linux, arch: x86_64, jdk: <project JDK major>}`, configurable as `lock.resolutionContext` in the workspace. It is passed to coursier, so a lock made on macOS equals one made on Linux. The lock records it, and a change re-locks every variant.
-  - **Phase 1 limit:** the native `cs` CLI exposes only `--jdk-version`, so Phase 1 applies the JDK part of the context; OS and architecture profile activation follows the machine running `cs` until the resolver sidecar (Phase 3) passes them through the coursier API. The Phase 0 resolve spike checks how often this matters in practice. The lock does not record the resolving machine (that would make otherwise identical locks differ by who resolved them); `scpm install` reports it (`resolvedOn` in `--json`) and warns when it differs from the declared context, only when it actually re-locked something.
-  - **Local-runtime trade-off:** with the default `linux-x86_64` context, a macOS developer's `run` and `test` get the artifacts a Linux profile selects (for example OS-classifier natives). Libraries whose natives differ by OS should be declared explicitly, one classifier per OS, in `runtimeDependencies`.
-  - **Future: per-platform variants.** Declaring one classifier per OS works, but by hand, and every variant lands on every classpath. That is harmless for Netty, which loads the matching native at runtime, and untidy for per-OS jars meant to be used alone, such as JavaFX. Other ecosystems settled on a *universal lock*: npm/pnpm/Yarn platform packages with `os`/`cpu` (installs skip the rest; `supportedArchitectures` fetches other platforms), Cargo's `[target.'cfg(...)'.dependencies]`, and uv/Poetry locks that record every platform's wheel. scpm would copy that from the project file alone, with no change for library authors (the classifier jars already exist on Maven Central):
-    ```yaml
-    runtimeDependencies:
-      - dep: io.netty:netty-transport-native-epoll:4.1.115.Final
-        platforms:                     # platform -> classifier; every variant is locked
-          linux-x86_64: linux-x86_64
-          linux-aarch64: linux-aarch_64
-    ```
-    Every listed variant is locked, so the lock stays identical on every machine. `run`, `test` and IDE classpaths get only the current machine's variant (an unlisted platform gets none, with a warning). Packaging picks the variant for the target platform. Possible extras: catalogs or shared configs carrying the mapping for common libraries, and reading Gradle module metadata (`.module` platform variants) where a library publishes it. Not designed further yet.
+- **Resolution context:** the system set and `lock.jdk` (above), never the machine's own. The sidecar passes them to coursier once per system (§5.2.1).
 - **Mirrors** are applied at fetch time and never recorded. They are machine settings (§5.9).
 - **Which repositories serve which artifacts comes from config rules, never from discovering where bytes came from.** An artifact's identity is its key and sha256; where the bytes come from doesn't change what is built. This is the pattern of npm/pnpm scopes (scope → registry), Cargo (a logical source, with source replacement), Gradle (`content { includeGroup }`) and Maven 3.9 (repository filtering by group prefix).
   - **`groups:`** on a repository (`- {id: acme, url: …, groups: [com.acme, org.acme.internal]}`) lists group-id prefixes, matched at a dot boundary: `com.acme` covers `com.acme` and `com.acme.util`, not `com.acmes`. An artifact whose group a repository's `groups` covers comes only from the repositories with the **longest** covering prefix (several, in declared order, when they list the same one): it is resolved, locked and restored from them and never requested from any other repository, so internal names don't reach Central. That holds for the repositories scpm is configured with: a machine's catch-all mirror (a Nexus group proxying Central, say) can still forward a request for an internal name upstream, which is that machine's choice and outside what `groups` can see. Artifacts no rule covers use the repositories **without** `groups`, in declared order; a repository with `groups` never serves them, and an artifact it does serve anyway is refused (below). If every repository has `groups` and none covers an artifact, that is an error naming the group. `central` is an ordinary repository here: the built-in name has no `groups`, a full `{id: central, url: …, groups: […]}` may, and scpm always passes `--no-default`, so coursier's own default repositories never take part. An empty `groups` list and anything but dot-separated names are config errors. `groups` are part of `inputsHash` and `bootInputs`, so changing them re-locks (a repository without `groups` hashes as it did before `groups` existed).
-  - **Vendor repositories with mixed groups.** Some vendor repositories host forks of public groups next to their own, such as Confluent's `org.apache.kafka:kafka-clients:*-ccs` builds beside `io.confluent`. Because `groups` route both ways, no `groups` setup says "this group from Central *or* the vendor": `groups: [org.apache.kafka]` on the vendor would keep every Kafka artifact away from Central. Leave such a vendor repository **without** `groups`: it is then one of the repositories for uncovered (public) names, in declared order, while internal grouped names are never restored from it (a re-lock can still ask it about one; see the resolution limit below). A non-exclusive form (like Gradle's plain `includeGroup` next to `exclusiveContent`), which would add a repository for a group without taking the group away from the others, is a possible future addition.
-  - **Resolution limit (`cs` 2.1.27):** `cs` has no per-repository group filter. scpm hands it the repositories with `groups` first, and `cs` takes each module from the first repository that has it, so an internal artifact is found in its own repository before any other is asked. Version listing for a range (§5.5) is scpm's own and asks only the allowed repositories, in both directions. Putting the repositories with `groups` first means `cs` asks them about public names too (direction 2), until they answer 404; that can't be avoided with `cs`, but what they answer is refused, never locked. `scpm why` runs `cs` the same way and records nothing. IDE sources jars (fetched on demand, above) aren't fetched by this version yet; they will follow the same rule. A re-lock can still ask another repository about an internal name when its own repository lacks that version, or when coursier itself merges version metadata across repositories (a range inside a POM). Restores never do. The resolver sidecar (Phase 3) can apply the rule inside resolution.
+  - **Vendor repositories with mixed groups.** Some vendor repositories host forks of public groups next to their own, such as Confluent's `org.apache.kafka:kafka-clients:*-ccs` builds beside `io.confluent`. Because `groups` route both ways, no `groups` setup says "this group from Central *or* the vendor": `groups: [org.apache.kafka]` on the vendor would keep every Kafka artifact away from Central. Leave such a vendor repository **without** `groups`: it is then one of the repositories for uncovered (public) names, in declared order, while internal grouped names are never restored from it (with `cs`, a re-lock can still ask it about one; see the resolution limit below). A non-exclusive form (like Gradle's plain `includeGroup` next to `exclusiveContent`), which would add a repository for a group without taking the group away from the others, is a possible future addition (see "Later" below).
+  - **Later** (tracked, not designed further):
+    1. Rename `groups:` to a name that says it is exclusive. Candidates: `exclusiveGroups`, `owns`, `onlyGroups`. Until then the key stays `groups`.
+    2. Add the non-exclusive form above, e.g. `alsoServes:`, for vendor repositories such as Confluent's (`-ccs` Kafka builds). The resolver sidecar's repository wrapper takes a routing predicate, so it can support both forms (§5.2.1, "`groups` inside resolution").
+  - **Resolution limit (`cs` 2.1.27):** `cs` has no per-repository group filter. scpm hands it the repositories with `groups` first, and `cs` takes each module from the first repository that has it, so an internal artifact is found in its own repository before any other is asked. Version listing for a range (§5.5) is scpm's own and asks only the allowed repositories, in both directions. Putting the repositories with `groups` first means `cs` asks them about public names too (direction 2), until they answer 404; that can't be avoided with `cs`, but what they answer is refused, never locked. `scpm why` runs `cs` the same way and records nothing. IDE sources jars (fetched on demand, above) aren't fetched by this version yet; they will follow the same rule. A re-lock can still ask another repository about an internal name when its own repository lacks that version, or, for a range inside a POM, when its own repository has no listing for the module: coursier then takes the first other repository whose listing succeeds (it merges listings across repositories only for `latest.integration`). Restores never do. The resolver sidecar (Phase 3) applies the rule inside resolution: each repository is wrapped so it answers not-found, without a request, for modules it may not serve, in both directions and for coursier's own version listing too. That removes everything in this paragraph except the refusal, which stays as a second check (§5.2.1).
 - **`repo`** in the lock is a **hint**: the repository a restore asks first, one request instead of N, and a privacy aid (public repositories aren't asked about internal names). It is derived on every re-lock from the artifact's URL, matched against the configured repository URLs (and their mirrors) by prefix, longest match first, among the repositories allowed for its group: an artifact already in the lock keeps its id if that is still one of them (repositories sharing a mirror can't be told apart by URL), else the first in declared order. `groups` route both ways, for every request about a dependency, so a file that came from a repository its group may not come from is **refused, not locked**: the re-lock fails before the lock is written. For a group a rule covers, its own repository lacked it and `cs` found a copy elsewhere, which may be dependency confusion; the error names the key, the repository it came from (and the user config mirror it came through, which is then what to fix) and the repositories its group is restricted to. For a group no rule covers, a repository with `groups` served it, typically because its URL is a combined one that also proxies Central; locking those bytes under Central's name would let a tampered public jar uploaded to the internal side pass as Central's. The error names the artifact and the grouped repository, and gives the two correct setups: point the grouped repository at the internal-only repository URL (`…/repository/acme-releases/`, not the combined group URL), and reach Central through the company server with a mirror of `central` (user config today; project-level `required` mirrors later, §5.9). A URL that matches no configured repository is an error. Nothing is probed and nothing fails because of a shared mirror.
   - **Restore** asks the recorded repository first, if the artifact's group may come from it; on a 404 (or 410), or when a source can't be asked at all (its credential variable is unset, or its scheme's proxy is unusable), it asks the other allowed repositories, in declared order, each with its own credentials, cache path and proxy route; any other answer, such as a 401 or 403, ends the search, and a source's problem is reported only if no source has the file; the sha256 decides that the file is the locked one. A recorded id that is no longer configured is simply not asked, instead of being an error. A copy already cached from the first of them is used as is (like any cache hit); one cached from another allowed repository is used once its sha256 matches the lock, and classpaths then name it.
   - **Trade-off:** after a wrong hint, a restore may ask a later repository about the name once. `groups:` is how internal names are kept from repositories that must not see them.
@@ -633,7 +992,7 @@ A variant is **stale** when its recomputed `inputsHash` differs from the lock's.
 - `scpm ci` — `scpm install --frozen`, then `compile` and `test` over the whole workspace; from Phase 3, `scpm install --frozen` then `scpm pipeline`.
 - `scpm update [selector]` — re-resolve within the declared ranges.
 - `scpm outdated` — list newer versions.
-- `scpm why <coord>` — explain why a coordinate is on the classpath. It asks coursier: it rebuilds the variant's widest request (the test runtime classpath) at the locked versions and runs `cs resolve --what-depends-on org:name`, printing each chain from a direct dependency (and which variant declared it). If the artifact is on the classpath but coursier reports no chain, it says so.
+- `scpm why <coord>` — explain why a coordinate is on the classpath. It asks coursier: it rebuilds the variant's widest request (the test runtime classpath) at the locked versions and runs `cs resolve --what-depends-on org:name` (the sidecar's `graph` request from Phase 3, §5.2.1), printing each chain from a direct dependency (and which variant declared it). If the artifact is on the classpath but coursier reports no chain, it says so.
 - `scpm dedupe` — collapse duplicate versions.
 
 ### 5.5 Version ranges without breaking the ecosystem
@@ -706,7 +1065,7 @@ The trust anchor is the advisory database's "fixed in" data (curated GHSA/OSV), 
 
 ### 5.7 Enterprise repositories (optional fast paths)
 
-**Credentials.** A repository's `credentials` is either `env:VAR` (sent as a bearer token) or `{user: env:U, password: env:P}` (basic auth). Phase 1's Rust fetcher reads those, plus coursier's `COURSIER_CREDENTIALS` / `credentials.properties` for matching hosts. Coursier's credential sources only express basic auth, so when `cs` resolves a stale lock scpm passes a bearer token as a basic-auth password of the user `token` (which Artifactory and GitHub Packages accept) **[verify per repository type in Phase 1]**. Secrets never go on `cs`'s command line (a repository URL with `user@` is rejected): scpm writes them to a private (0600) temporary file that `COURSIER_CREDENTIALS` names for the `cs` process, scoped to the repository's scheme, host and port (coursier 2.1.27's `scheme://host:port` form). Coursier's own entries are read by scpm, matched the same way (a realm-scoped one only after a challenge naming its realm) and passed to `cs` through that file, so both paths apply one policy. Credentials in the Scala CLI config (`scala-cli config repositories.credentials`) are not used: coursier would read them alongside that file, so `cs` gets a `SCALA_CLI_CONFIG` that names no file. Where machine-local credentials, mirrors and proxies come from, and how `cs` is kept from reading other sources, is §5.9.
+**Credentials.** A repository's `credentials` is either `env:VAR` (sent as a bearer token) or `{user: env:U, password: env:P}` (basic auth). Phase 1's Rust fetcher reads those, plus coursier's `COURSIER_CREDENTIALS` / `credentials.properties` for matching hosts. Coursier's credential sources only express basic auth, so when `cs` resolves a stale lock scpm passes a bearer token as a basic-auth password of the user `token` (which Artifactory and GitHub Packages accept) **[verify per repository type in Phase 1]**. Secrets never go on `cs`'s command line (a repository URL with `user@` is rejected): scpm writes them to a private (0600) temporary file that `COURSIER_CREDENTIALS` names for the `cs` process, scoped to the repository's scheme, host and port (coursier 2.1.27's `scheme://host:port` form). Coursier's own entries are read by scpm, matched the same way (a realm-scoped one only after a challenge naming its realm) and passed to `cs` through that file, so both paths apply one policy. Credentials in the Scala CLI config (`scala-cli config repositories.credentials`) are not used: coursier would read them alongside that file, so `cs` gets a `SCALA_CLI_CONFIG` that names no file. Where machine-local credentials, mirrors and proxies come from, and how `cs` is kept from reading other sources, is §5.9. From Phase 3 the resolver sidecar takes credentials in its request, so no credentials file is needed. A bearer token keeps going out as basic auth for the user `token`, so cache paths stay the same on every path (§5.2.1).
 
 **Plain HTTP.** Credentials only go over HTTPS by default. Configured `credentials` on an `http://` repository are a config error unless the repository sets `allowInsecureCredentials: true`; coursier entries that would go over plain HTTP (`https-only=false`, or an `http://` host) are dropped for every repository that hasn't opted in. With the opt-in, credentials go to exactly that repository's scheme, host and port, never to the rest of the host. The opt-in is per repository, but coursier scopes credentials by origin only, so it can't cover a peer: when another repository reached at the same `http://` origin doesn't opt in, no coursier or user config entry goes to that origin, and a repository there with its own credentials is an error for a re-lock (the fetcher sends them to that repository alone). A user config mirror may opt in too (`allowInsecureCredentials: true` on the mirror entry, §5.9): it covers exactly the mirror's own origin, for the repositories reached through that mirror, and nothing else.
 
@@ -787,7 +1146,7 @@ Some settings legitimately differ between a laptop and CI: a developer reaches A
 
 | Kind | Examples | Where it lives | Can it change the lock? |
 |---|---|---|---|
-| **Project**: *what* resolves | repositories, catalogs, BOMs, overrides, `lock.resolutionContext`, release-age policy | `scpm.yaml`, recorded in `scpm-lock.yaml` | Yes, and that is the point: it is reviewed and committed |
+| **Project**: *what* resolves | repositories, catalogs, BOMs, overrides, `lock.systems` and `lock.jdk`, native overrides (`natives:`, `lock.nativeClassifiers`), release-age policy | `scpm.yaml`, recorded in `scpm-lock.yaml` | Yes, and that is the point: it is reviewed and committed |
 | **Machine**: *how the bytes are reached* | credentials, mirrors, proxies, the cache directory | the environment and the user config (below) | **Not a fresh lock**: changing one never makes the lock stale, a frozen restore downloads exactly what the lock pins (repository ids and sha256 values, §5.4), and mirror URLs are never recorded. A re-lock that goes through a mirror can still pick different versions (below) |
 
 A machine setting therefore decides whether a download *succeeds*, not *what* a restore downloads: the lock's sha256 values settle that. A difference between a laptop and CI fails loudly (a 401 naming the repository) instead of silently building something else. One caveat for re-locking: a mirror is another server and may not hold exactly what the repository does. A mirror for one id that points at a Nexus group can serve artifacts the real repository lacks (the lock then names a repository that, reached directly, answers 404; a restore without the mirror then asks the other repositories allowed for the artifact, §5.4, and fails only if none has it), and stale mirror metadata can change which version a range or `latest` picks. The re-lock is reviewed like any other lock change. sbt draws this line less firmly: `~/.sbt/1.0/global.sbt` can add plugins and change settings, so the same commit builds differently per machine. scpm has no user-level file that can do that.
@@ -816,7 +1175,7 @@ A mirror from `settings.xml` with `<mirrorOf>*</mirrorOf>`, common in companies,
 - `SCALA_CLI_CONFIG` and `COURSIER_MIRRORS` naming files that don't exist, `CS_MAVEN_HOME` naming an empty directory, `COURSIER_MAVEN_SETTINGS=false`, and every other inherited `COURSIER_*` and `CS_*` variable (`COURSIER_CACHE_SERVER`, `COURSIER_EXTRA_MIRRORS`, `COURSIER_REPOSITORIES`, `COURSIER_TTL`, …; all but `COURSIER_PROGRESS` and `COURSIER_NO_TERM`) and the JVM option variables removed: an allowlist, so a variable scpm doesn't know about can't leak in;
 - the resolved proxy as JVM properties (`https.proxyHost`, `http.nonProxyHosts`, …), in the one form the launcher takes. Coursier ships two kinds of `cs`, and neither takes the other's: the native launcher sets `-J-Dname=value` arguments itself and reads no Java option variable, while the JVM launcher (a jpackage image, e.g. `cs-x86_64-pc-linux-jvm`, which is what mise installs on Linux) hands every argument to coursier, which rejects `-J…`, but its JVM reads `JAVA_TOOL_OPTIONS`. scpm asks once per run, only when a proxy applies: if `cs version -J-Dscpm.probe=true` succeeds, the properties go in as `-J-D…` arguments (coursier's `sh` launcher passes those to `java` too); otherwise `JAVA_TOOL_OPTIONS` is set to exactly them, and the JVM's `Picked up JAVA_TOOL_OPTIONS` line is dropped from `cs` errors.
 
-The Rust fetcher gets the same resolved values: the same mirror URL, the same credentials and an explicit proxy, instead of reqwest's own environment lookup. Both paths see identical inputs by construction. The compatibility suite (§5.2) runs a re-lock and a restore under a hostile environment (every source above set to something wrong) and checks they still agree.
+The Rust fetcher gets the same resolved values: the same mirror URL, the same credentials and an explicit proxy, instead of reqwest's own environment lookup. Both paths see identical inputs by construction. The compatibility suite (§5.2) runs a re-lock and a restore under a hostile environment (every source above set to something wrong) and checks they still agree. From Phase 3 the resolver sidecar replaces this sealing (§5.2.1): scpm starts it with a cleared environment (a short allowlist), private `user.home`, coursier config directory and Scala CLI config, and passes every setting to the coursier API explicitly, so nothing in the table above reaches it.
 
 **Where machine settings come from**, highest precedence first:
 
@@ -833,6 +1192,7 @@ The Rust fetcher gets the same resolved values: the same mirror URL, the same cr
      - url: https://nexus.example.com/repository/maven-public
        mirrorOf: [central]            # repository ids, URL prefixes, or "*"
        # allowInsecureCredentials: true   # only for an http:// mirror; covers exactly its origin (below)
+   resolverMirror: https://artifacts.example.com/scpm-releases/   # optional; base URL for the resolver sidecar's own jars (§5.2.1), still sha256-pinned; anonymous access
    proxy:
      https: http://proxy.example.com:3128
      noProxy: [localhost, .example.com]
@@ -843,7 +1203,7 @@ The Rust fetcher gets the same resolved values: the same mirror URL, the same cr
    - The file is parsed strictly (an unknown key is an error, like the workspace files); a missing file, even one `SCPM_CONFIG` names, means no settings (with a warning when `SCPM_CONFIG` names it). `scpm schema user-config` prints its JSON Schema.
    - Item 1's `credentials` live on the repository definitions in `scpm-workspace.yaml`.
    - When several credential entries match a URL, the longest path wins. A `file:` value is read without one trailing newline; `~` is the home directory and a relative path is relative to the user config's directory.
-   - **One origin, one set of credentials.** `cs` scopes credentials by scheme, host and port only (default ports ignored), so a path can choose which credentials a repository gets but can't keep them from another URL on the same origin. A repository or mirror without credentials of its own therefore gets its origin's, on both paths: the Rust fetcher sends what `cs` would. Credentials that can't be read (an unset variable) count as none, and only matter once a download fails. When two repositories or mirrors on one origin have different readable credentials, scpm refuses to run `cs` (exit code 2) and names both URLs; two GitHub Packages organisations with different tokens hit this, one token for both doesn't. A restore isn't affected: the fetcher then sends each repository its own.
+   - **One origin, one set of credentials.** `cs` scopes credentials by scheme, host and port only (default ports ignored), so a path can choose which credentials a repository gets but can't keep them from another URL on the same origin. A repository or mirror without credentials of its own therefore gets its origin's, on both paths: the Rust fetcher sends what `cs` would. Credentials that can't be read (an unset variable) count as none, and only matter once a download fails. When two repositories or mirrors on one origin have different readable credentials, scpm refuses to run `cs` (exit code 2) and names both URLs; two GitHub Packages organisations with different tokens hit this, one token for both doesn't. A restore isn't affected: the fetcher then sends each repository its own. The resolver sidecar (Phase 3, §5.2.1) keeps this rule: its credentials are coursier `DirectCredentials` matched by origin and re-matched after redirects, like `cs` and the fetcher, so the clash error stays for re-locks.
    - A mirror whose `mirrorOf` names the repository's id or a prefix of its URL wins over one for `*`; otherwise the first entry wins.
    - **A mirrored repository's workspace credentials are not sent to the mirror**, which is another host: they were declared for the repository. Its credentials are the user config's entry for the mirror's URL, else coursier's for the mirror's host.
    - **Plain HTTP:** user config credentials for an `http://` URL need the repository's `allowInsecureCredentials`, or the mirror's it is reached through, as coursier's entries do (§5.7). For a mirrored repository the opt-in covers the mirror's scheme, host and port, the origin actually contacted, and nothing else. One repository's opt-in can't cover a peer: coursier scopes credentials by origin, so every repository reached at a plain-HTTP origin that gets credentials must opt in itself. A user config mirror of `central` onto a plain-HTTP Nexus that also hosts an opted-in private repository therefore needs an opt-in for `central` too; otherwise a re-lock is refused, and the error says how. The natural one is the mirror's: `mirrors: [{url: 'http://nexus.local:8081/repository/group/', mirrorOf: [central], allowInsecureCredentials: true}]`. It covers exactly that mirror's scheme, host and port, for the repositories reached through it: credentials for that origin (from the user config, or coursier's own sources) may then go there, on both paths and for restore fallbacks. It covers no other origin, and doesn't opt in those repositories anywhere else. It belongs to the machine because the mirror does: the workspace never chose to send anything over plain HTTP, the machine that routes Central through an `http://` server did. Without it, credentials stay off plain HTTP as before. The no-peer-cover rule still holds for a repository reached at that origin directly, not through the mirror: it must opt in itself (`cs` would send it the origin's credentials). `central` written out in full with its own `allowInsecureCredentials: true` works too. `scpm config explain` shows where an opt-in comes from (`repository`, or `user config, mirror <url>`).
@@ -856,7 +1216,7 @@ The Rust fetcher gets the same resolved values: the same mirror URL, the same cr
 
 **Ignored on purpose:** Maven `settings.xml`, coursier's mirror files and variables, the Scala CLI config, and JVM proxy properties. They belong to other tools, live in places nobody looks (coursier's macOS config directory is `~/Library/Application Support/Coursier`), and reading them live is how the two paths drifted. When one of them configures something for a repository or host the current command uses, scpm prints one notice naming the file and the setting, and how to move it (a planned `scpm config import maven` would convert `settings.xml` mirrors, servers and proxies into the user config, once and explicitly). There is no notice for sources that don't touch the repositories in use.
 
-**Seeing it: `scpm config explain`.** Prints, per configured repository, the URL, the effective URL after mirrors, where its credentials come from (the variable or file name, never the value), and the proxy that applies, then every ignored foreign source it found that would have applied. `--json` gives the same for scripts and agents (§9.3).
+**Seeing it: `scpm config explain`.** Prints, per configured repository, the URL, the effective URL after mirrors, where its credentials come from (the variable or file name, never the value), and the proxy that applies, then every ignored foreign source it found that would have applied. From Phase 3 it also names the hosts the resolver sidecar's own jars come from (`github.com` and the host it redirects asset downloads to (`release-assets.githubusercontent.com`, formerly `objects.githubusercontent.com`), or `resolverMirror`) and the proxy that applies to them. `--json` gives the same for scripts and agents (§9.3).
 
 ```text
 $ scpm config explain
@@ -1345,7 +1705,7 @@ Rust.
 
 **Can we call coursier from Rust?**
 - Not directly: there is no C ABI.
-- Spawn the native `cs` (~40–130 ms per warm resolve), then move to a native-image sidecar.
+- Spawn the native `cs` (~40–130 ms per warm resolve), then move to a resolver sidecar on the coursier API: a JVM jar first, native-image later (§5.2.1).
 - Skipping coursier means reimplementing Maven resolution: months of edge cases, with results that diverge from the rest of the ecosystem. Don't.
 
 **Rust CLI with a Scala daemon?**
