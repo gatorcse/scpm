@@ -1188,7 +1188,7 @@ fn from_value<T: DeserializeOwned>(value: &Value, file: &Path) -> Result<T, Diag
     serde_path_to_error::deserialize(value.clone()).map_err(|e| Diagnostic::from_value_error(file, e).into())
 }
 
-fn valid_module_name(name: &str) -> bool {
+pub(crate) fn valid_module_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_.".contains(c))

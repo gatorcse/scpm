@@ -16,6 +16,8 @@ Milestones land as a stack of PRs; see [docs/roadmap.md](docs/roadmap.md).
 
 - **M1:** the Rust CLI, config model and module graph:
   `scpm ls`, `scpm config`, `scpm graph`, `scpm schema`, and `-F` filters.
+  `scpm init [DIR]` starts a workspace with one app module (Scala 3.9.0, munit), or, inside a
+  workspace, adds a library module at DIR. It never overwrites a file and needs no network.
 - **M2:** dependencies: `scpm install [--frozen]` locks every variant into
   `scpm-lock.yaml` with coursier (joint resolution, ranges, catalog selections, BOMs,
   exclusions, compiler boot closures) and restores locked jars into the coursier cache with
@@ -57,6 +59,31 @@ Milestones land as a stack of PRs; see [docs/roadmap.md](docs/roadmap.md).
   - Compile, test and run go through the same code as `scpm compile`, `scpm test` and `scpm run`, on the shared daemon. Diagnostics, task progress and test results are reported back to the client, and cancellation is supported.
   - The run and test environments (`jvmRunEnvironment`, `jvmTestEnvironment`) let IntelliJ and Metals start their own runners.
   - The supported methods and the deviations from the spec are listed in [design §10.3](docs/design.md#103-bsp-scope).
+
+## Try it from a checkout
+
+There are no releases yet. A development build finds its JVM helpers (compile worker, test
+runner, resolver) in the checkout's `worker/` build output, so build both:
+
+```bash
+mise install
+cargo build --release
+(cd worker && sbt "package; resolver/stage")
+export PATH="$PWD/target/release:$PATH"   # or symlink target/release/scpm onto your PATH
+```
+
+Then start a workspace and run it:
+
+```bash
+scpm init hello && cd hello
+scpm run app -- you      # resolves, compiles and runs modules/app
+scpm test
+scpm init modules/core   # adds a library module; depend on it with `core: workspace:*`
+```
+
+`SCPM_RESOLVER=sidecar` resolves with the resolver sidecar instead of `cs`, which can lock
+for several systems at once (`lock: {systems: [linux-x86_64, macos-aarch64]}` in
+`scpm-workspace.yaml`).
 
 ## Development
 

@@ -42,6 +42,22 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Start a workspace with one app module, or add a module to the workspace around DIR. Never
+    /// overwrites a file; needs no network.
+    Init {
+        /// The directory to initialize (created if missing). Inside a workspace, it becomes a
+        /// new library module, and the workspace's `modules:` must match it.
+        // Not `dir`: that id is the global `-C/--dir`, and clap would fill both.
+        #[arg(default_value = ".", value_name = "DIR")]
+        path: PathBuf,
+        /// The module's name: default `app` in a new workspace, else the directory's name.
+        #[arg(long)]
+        name: Option<String>,
+        /// A full Scala version, e.g. `2.13.18`: the new workspace's (default `3.9.0`), or the
+        /// new module's own.
+        #[arg(long, value_name = "VERSION")]
+        scala: Option<String>,
+    },
     /// List modules and their variants.
     Ls,
     /// Print the resolved configuration of modules or variants.
@@ -372,6 +388,26 @@ fn run(cli: Cli) -> Result<(), Failure> {
         None => cwd,
     };
     match cli.command {
+        Command::Init { path, name, scala } => {
+            let target = start.join(&path);
+            let report = crate::init::init(&target, &crate::init::InitOptions { name, scala }).map_err(|e| {
+                let message = e.to_string();
+                match e {
+                    // Said first, then the diagnostics that explain it.
+                    crate::init::InitError::Invalid(d) | crate::init::InitError::Workspace(d) => {
+                        eprintln!("error: {message}");
+                        Failure::Config(d)
+                    }
+                    _ => Failure::Usage(message),
+                }
+            })?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                print_init(&report, &start)?;
+            }
+            Ok(())
+        }
         Command::Schema { file } => {
             let schema = match file {
                 SchemaFile::Workspace => schemars::schema_for!(WorkspaceFile),
@@ -1006,6 +1042,31 @@ fn print_install_summary(s: &InstallSummary) -> io::Result<()> {
         writeln!(out, "All {} artifacts cached", s.fetch.present)?;
     }
     out.flush()
+}
+
+/// What `scpm init` wrote, and what to run next (with `-C` when the root isn't the current
+/// directory).
+fn print_init(report: &crate::init::InitReport, start: &std::path::Path) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    let what = match report.kind {
+        "workspace" => format!("Created a workspace with module `{}`", report.module),
+        _ => format!("Added module `{}` ({})", report.module, report.variants.join(", ")),
+    };
+    writeln!(out, "{what} in {}", report.root.display())?;
+    for f in &report.created {
+        writeln!(out, "  + {f}")?;
+    }
+    for f in &report.updated {
+        writeln!(out, "  ~ {f}")?;
+    }
+    let here = start.canonicalize().is_ok_and(|s| s == report.root);
+    let c = if here { String::new() } else { format!("-C {} ", report.root.display()) };
+    if report.kind == "workspace" {
+        writeln!(out, "\nNext:\n  scpm {c}run {}      compile and run it\n  scpm {c}test", report.module)?;
+    } else {
+        writeln!(out, "\nNext: depend on it with `{}: workspace:*`, then `scpm {c}compile`", report.module)?;
+    }
+    Ok(())
 }
 
 fn print_json<T: Serialize + ?Sized>(value: &T) -> io::Result<()> {

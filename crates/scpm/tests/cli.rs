@@ -1312,3 +1312,25 @@ fn workspace_bom_errors_are_reported_once() {
     let err = config_error(dir.path(), &["ls"]);
     once(&err, "scpm-workspace.yaml: boms.a:bom: `a:bom` is not in the default catalog");
 }
+
+#[test]
+fn init_writes_a_workspace_that_loads_then_adds_a_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    // DIR is relative to -C (and is not mistaken for -C itself).
+    let report = json(tmp.path(), &["init", "hello"]);
+    assert_eq!(report["kind"], "workspace");
+    assert_eq!(report["variants"], serde_json::json!(["app@jvm-3"]));
+    let root = tmp.path().join("hello");
+    assert!(root.join("scpm-workspace.yaml").is_file());
+    assert!(!root.join("hello").exists());
+    assert_eq!(stdout(&root, &["ls"]).split_whitespace().collect::<Vec<_>>(), ["app@jvm-3", "modules/app"]);
+
+    let text = stdout(&root, &["init", "modules/core"]);
+    assert!(text.starts_with("Added module `core` (core@jvm-3)"), "{text}");
+    assert!(text.contains("depend on it with `core: workspace:*`, then `scpm compile`"), "{text}");
+    scpm(&root)
+        .args(["init", "."])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("is already a workspace: it has an scpm-workspace.yaml"));
+}
