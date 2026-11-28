@@ -1,5 +1,6 @@
-//! IDE integration (design §10): Metals v2's `.metals/mbt.json` ([`metals`]) and native
-//! IntelliJ project files ([`idea`]), both generated from the workspace and the lockfile.
+//! IDE integration (design §10): Metals v2's `.metals/mbt.json` ([`metals`]), native
+//! IntelliJ project files ([`idea`]), both generated from the workspace and the lockfile, and
+//! the BSP connection file `.bsp/scpm.json` ([`bsp`]) for `scpm bsp`.
 //!
 //! Neither generator resolves anything: classpaths are the lock's, and jars resolve into the
 //! coursier cache exactly as for `scpm compile`. Sources jars are not in the lock (design §5.4):
@@ -9,6 +10,7 @@
 //! of the repositories and credentials it was made with. The automatic refresh after installs
 //! ([`refresh`]) only uses sources jars that are already cached, so it never starts `cs`.
 
+pub mod bsp;
 pub mod idea;
 pub mod metals;
 
@@ -249,11 +251,29 @@ pub struct Refreshed {
 /// - `.metals/mbt.json` when scpm wrote its current content (or the workspace sets
 ///   `ide.metals: true`), unless a Metals importer script (`*.mbt.sh`, …) owns it.
 /// - The IntelliJ files when `scpm idea` ran before (or the workspace sets `ide.idea: true`).
+/// - `.bsp/scpm.json` when scpm wrote it (`scpm bsp --setup`), so it names the current binary.
 ///
 /// Only cached sources jars are used, so no `cs` process starts; failures become warnings and
-/// never fail the command. With neither file in play, it returns without reading anything else.
+/// never fail the command. With no file in play, it returns after a few small reads.
 pub fn refresh(ws: &Workspace, lock: &Lockfile) -> Refreshed {
+    refresh_with(ws, lock, RefreshOptions { idea: true })
+}
+
+/// Which IDE files [`refresh_with`] may touch.
+#[derive(Debug, Clone, Copy)]
+pub struct RefreshOptions {
+    /// The native IntelliJ files (`scpm bsp` leaves them alone: IntelliJ imports over BSP then).
+    pub idea: bool,
+}
+
+/// [`refresh`], optionally leaving the IntelliJ files alone.
+pub fn refresh_with(ws: &Workspace, lock: &Lockfile, what: RefreshOptions) -> Refreshed {
     let mut out = Refreshed::default();
+    match bsp::refresh(&ws.root) {
+        Ok(true) => out.written.push(bsp::CONNECTION_FILE.to_string()),
+        Ok(false) => {}
+        Err(e) => out.warnings.push(format!("could not update {}: {e}", bsp::CONNECTION_FILE)),
+    }
     let ide = ws.config.ide.clone().unwrap_or_default();
     let mut metals = ide.metals.unwrap_or(false) || metals::owned(&ws.root);
     if metals && let Some(script) = metals::importer_script(&ws.root) {
@@ -265,7 +285,7 @@ pub fn refresh(ws: &Workspace, lock: &Lockfile) -> Refreshed {
             ));
         }
     }
-    let idea = ide.idea.unwrap_or(false) || idea::generated_before(&ws.root);
+    let idea = what.idea && (ide.idea.unwrap_or(false) || idea::generated_before(&ws.root));
     if !metals && !idea {
         return out;
     }

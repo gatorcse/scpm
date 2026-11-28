@@ -621,6 +621,73 @@ fn boot_roots(full: &str) -> Vec<BootRoot> {
     }
 }
 
+/// The newest scalameta release that publishes `semanticdb-scalac` for a Scala 2 version (the
+/// plugin is published per full Scala version, each release for a window of them), from Maven
+/// Central as of 2026-11. `None` for versions without a 4.x plugin, and for versions newer
+/// than this table.
+pub fn semanticdb_version(scala: &str) -> Option<&'static str> {
+    let parts: Vec<u32> = scala.split(['.', '-']).take(3).filter_map(|p| p.parse().ok()).collect();
+    let [2, minor, patch] = parts[..] else { return None };
+    Some(match (minor, patch) {
+        (13, 0) => "4.6.0",
+        (13, 1..=7) => "4.8.4",
+        (13, 8) => "4.8.10",
+        (13, 9) => "4.9.0",
+        (13, 10) => "4.9.3",
+        (13, 11) => "4.9.9",
+        (13, 12) => "4.12.3",
+        (13, 13) => "4.13.10",
+        (13, 14) => "4.14.1",
+        (13, 15..=18) => "4.17.4",
+        (12, 4..=6) => "4.1.9",
+        (12, 7) => "4.2.3",
+        (12, 8) => "4.5.13",
+        (12, 9..=14) => "4.8.4",
+        (12, 15) => "4.9.0",
+        (12, 16) => "4.9.9",
+        (12, 17) => "4.14.2",
+        (12, 18..=21) => "4.17.4",
+        _ => return None,
+    })
+}
+
+/// Whether the workspace asks for SemanticDB output (`ide.semanticdb`).
+pub fn semanticdb_enabled(ws: &Workspace) -> bool {
+    ws.config.ide.as_ref().and_then(|i| i.semanticdb).unwrap_or(false)
+}
+
+/// Boot entry name of the SemanticDB compiler plugin for a Scala 2 version (`None` if no
+/// plugin is published for it).
+pub fn semanticdb_boot(scala: &str) -> Option<String> {
+    semanticdb_version(scala).map(|v| format!("semanticdb@{scala}+{v}"))
+}
+
+/// The SemanticDB plugin closures (`ide.semanticdb`): one per Scala 2 version of a Scala
+/// variant (Scala 3 compilers write SemanticDB themselves). A Scala 2 version without a
+/// published plugin is an error naming it, rather than a resolution failure.
+fn semanticdb_roots(ws: &Workspace) -> Result<Vec<BootRoot>, InstallError> {
+    if !semanticdb_enabled(ws) {
+        return Ok(Vec::new());
+    }
+    let versions: BTreeSet<&str> =
+        ws.variants().filter_map(|v| v.scala.as_ref()).filter(|s| s.binary != "3").map(|s| s.full.as_str()).collect();
+    versions
+        .into_iter()
+        .map(|full| {
+            let version = semanticdb_version(full).ok_or_else(|| {
+                InstallError::Unsupported(format!(
+                    "`ide.semanticdb` needs the semanticdb-scalac plugin, which scpm knows for Scala 2.12.4–2.12.21 and 2.13.0–2.13.18, not Scala {full}\n  help: use a supported Scala version or turn `ide.semanticdb` off"
+                ))
+            })?;
+            Ok(BootRoot {
+                name: format!("semanticdb@{full}+{version}"),
+                roots: vec![format!("org.scalameta:semanticdb-scalac_{full}:{version}")],
+                transitive: false,
+            })
+        })
+        .collect()
+}
+
 /// Boot entry name for a JVM helper: keyed by a hash of its dependency list, so changing the
 /// list (a new scpm version) re-locks it.
 pub fn helper_boot_name(helper: &str, deps: &str) -> String {
@@ -706,7 +773,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     let boot: Vec<BootRoot> = if std::env::var_os("SCPM_TEST_SKIP_BOOT").is_some() {
         Vec::new()
     } else {
-        scala_versions.iter().flat_map(|v| boot_roots(v)).chain(helper_roots()).collect()
+        scala_versions.iter().flat_map(|v| boot_roots(v)).chain(helper_roots()).chain(semanticdb_roots(ws)?).collect()
     };
     let boot_inputs = (!boot.is_empty()).then(|| boot_inputs_hash(&repos, &ctx));
     let boot_inputs_changed = previous.boot_inputs != boot_inputs;
@@ -1355,6 +1422,16 @@ mod tests {
         assert_eq!(rev, vec!["B", "C", "A"]);
     }
     use super::*;
+
+    #[test]
+    fn semanticdb_versions_are_published_ones() {
+        assert_eq!(semanticdb_version("2.13.18"), Some("4.17.4"));
+        assert_eq!(semanticdb_version("2.13.14"), Some("4.14.1"));
+        assert_eq!(semanticdb_version("2.12.17"), Some("4.14.2"));
+        assert_eq!(semanticdb_version("2.12.3"), None);
+        assert_eq!(semanticdb_version("2.13.99"), None, "newer than the table");
+        assert_eq!(semanticdb_version("3.9.0"), None);
+    }
 
     #[test]
     fn jdk_majors() {

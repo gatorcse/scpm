@@ -60,11 +60,12 @@ Kill the riskiest assumptions with throwaway code before committing to the archi
 - `scpm doctor`: environment and config checks (JDKs, cache, credentials, stale daemons, Scala 3 versions below the Metals v2 floor).
 - IDE: `.metals/mbt.json` generation, a narrow BSP server (`scpm bsp`) with solid run/test environments and source jars, and `scpm idea` to generate native IntelliJ project files.
   - [x] **M8:** `scpm ide metals` writes `.metals/mbt.json` (Metals v2 format as of v2.0.0-RC1), and `scpm idea` writes native IntelliJ project files. Sources jars are fetched on demand and are not locked. A non-frozen `scpm install` keeps both up to date when scpm owns them (an importer-owned `mbt.json` and IntelliJ files scpm didn't write are left alone; design §10).
+  - [x] **M9:** `scpm bsp` is a narrow BSP 2.1 server, with `.bsp/scpm.json` written by `scpm bsp --setup`. It covers targets, sources, options, dependency sources and modules, JVM run and test environments, main and test classes, and compile, test and run on the shared daemon with diagnostics and cancellation (design §10.3). It was checked against bsp4j 2.1.1 with strict message validation, but not yet in an IntelliJ or Metals session.
   - [ ] Still to do:
-    - `scpm bsp`;
-    - an end-to-end check in a Metals v2 editor session and in IntelliJ;
+    - an end-to-end check in IntelliJ (BSP import and the generated `.idea/`), in Metals v1 over BSP, and in a Metals v2 editor session;
+    - BSP debugging (`debugSession/start`);
     - per-module javac options for IntelliJ;
-    - run/debug from Metals v2, which needs a launcher or BSP.
+    - run/debug from Metals v2, which needs a build-tool launcher.
 - `scpm worktree add|prune` with copy-on-write seeding of outputs and analysis.
 - Cross-building to Scala.js and Scala Native: `js` and `native` platforms, linking in the worker.
 - `scpm fmt`, `scpm lint` (scalafmt and scalafix in the warm worker), `scpm console`.

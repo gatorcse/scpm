@@ -798,6 +798,13 @@
             "boolean",
             "null"
           ]
+        },
+        "semanticdb": {
+          "description": "Compile Scala sources with SemanticDB output (in each classes directory, under\n`META-INF/semanticdb`), which Metals v1 needs over BSP for references, rename,\nimplementations and code lenses. `scpm compile` and `scpm bsp` both apply it, so they\nshare build outputs. Scala 3 uses the compiler's own `-Xsemanticdb`; Scala 2 the locked\n`semanticdb-scalac` compiler plugin.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "additionalProperties": false

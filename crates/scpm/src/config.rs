@@ -107,6 +107,13 @@ pub struct WorkspaceIde {
     /// Without it, they are regenerated only when scpm generated them before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idea: Option<bool>,
+    /// Compile Scala sources with SemanticDB output (in each classes directory, under
+    /// `META-INF/semanticdb`), which Metals v1 needs over BSP for references, rename,
+    /// implementations and code lenses. `scpm compile` and `scpm bsp` both apply it, so they
+    /// share build outputs. Scala 3 uses the compiler's own `-Xsemanticdb`; Scala 2 the locked
+    /// `semanticdb-scalac` compiler plugin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semanticdb: Option<bool>,
 }
 
 /// `ide` in a module file or a preset.

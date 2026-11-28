@@ -114,6 +114,17 @@ pub enum Command {
     },
     /// Serve the Model Context Protocol on stdio for agents (keeps a compile worker warm).
     Mcp,
+    /// Serve the Build Server Protocol on stdio, for IntelliJ, Metals v1 and other BSP clients
+    /// (they start it through `.bsp/scpm.json`; `--setup` writes that file).
+    Bsp {
+        /// Write `.bsp/scpm.json` (pointing at this scpm binary) instead of serving, so BSP
+        /// clients find scpm. A non-frozen `scpm install` keeps it up to date afterwards.
+        #[arg(long)]
+        setup: bool,
+        /// With --setup: replace a `.bsp/scpm.json` that scpm didn't write.
+        #[arg(long, requires = "setup")]
+        force: bool,
+    },
     /// Explain why an artifact is on the classpath (`org::name`, `org:name_3` or `name`).
     Why { artifact: String },
     /// Print a variant's classpath (installs first if the lockfile is stale).
@@ -515,6 +526,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 filters: suites,
                 test_names: tests,
                 timeout: (timeout > 0).then(|| std::time::Duration::from_secs(timeout)),
+                report_name: None,
             };
             let result = compile::Toolchain::new(&ws, &lock).and_then(|tc| {
                 // Clear every selected variant's report, including ones that no longer have tests.
@@ -659,6 +671,27 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 crate::daemon::serve(crate::daemon::ServeArgs { key, classpath, jvm_options })
                     .map_err(|e| Failure::Command(e.to_string()))
             }
+        },
+        Command::Bsp { setup: true, force } => {
+            let (root, _) = workspace::find_root(&start)?;
+            let exe = ide::bsp::invoked_exe().map_err(|e| Failure::Command(e.to_string()))?;
+            let s = ide::bsp::setup(&root, &exe, force).map_err(|e| Failure::Command(e.to_string()))?;
+            if ide::idea::generated_before(&root) {
+                eprintln!(
+                    "warning: this workspace also has IntelliJ project files from `scpm idea`; importing it over BSP replaces that setup (open one or the other, and delete `.idea/` before a BSP import)"
+                );
+            }
+            if cli.json {
+                print_json(&s)?;
+            } else {
+                println!("{} {} (runs {} bsp)", if s.written { "Wrote" } else { "Up to date:" }, s.path, exe.display());
+            }
+            Ok(())
+        }
+        Command::Bsp { setup: false, .. } => match crate::bsp::serve(start) {
+            Ok(0) => Ok(()),
+            Ok(code) => Err(Failure::Exit(code.clamp(1, 255) as u8)),
+            Err(e) => Err(Failure::Command(e.to_string())),
         },
         Command::Mcp => {
             crate::mcp::Server::new(start).serve().map_err(|e| Failure::Command(e.to_string()))?;

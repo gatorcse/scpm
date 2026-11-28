@@ -5,6 +5,7 @@
 // Diagnostics are deliberately rich values; they are only built on error paths.
 #![allow(clippy::result_large_err)]
 
+pub mod bsp;
 pub mod cli;
 pub mod compile;
 pub mod config;

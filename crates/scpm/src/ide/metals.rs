@@ -186,9 +186,9 @@ pub fn build(
     let mut namespaces = BTreeMap::new();
     for v in ws.variants() {
         let vlock = tc.lock.variants.get(&v.id).ok_or_else(|| InstallError::Stale(vec![v.id.clone()]))?;
-        let opts = compiler_options(tc, v)?;
         let scala_version = v.scala.as_ref().map(|s| s.full.clone());
         for test in [false, true] {
+            let opts = compiler_options(tc, v, test)?;
             let (artifacts, upstream) = if test {
                 classpath(&[ClasspathKind::TestCompile.entries(vlock), ClasspathKind::TestRuntime.entries(vlock)])
             } else {

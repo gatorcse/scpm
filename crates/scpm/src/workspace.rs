@@ -710,6 +710,17 @@ fn depth_of(rel_dir: &Path) -> usize {
     rel_dir.components().filter(|c| matches!(c, Component::Normal(_))).count()
 }
 
+/// The module files the workspace's `modules` globs match right now (absolute paths, sorted),
+/// whether or not they were loaded: a long-running process (`scpm bsp`) compares this list to
+/// notice modules that were added or removed.
+pub fn module_files(ws: &Workspace) -> Vec<PathBuf> {
+    let ws_file = ws.workspace_file.as_ref().map(|p| rel(&ws.root, p));
+    discover_modules(&ws.root, &ws.config, ws_file.as_deref(), &mut Diagnostics::default())
+        .into_iter()
+        .map(|dir| ws.root.join(dir).join(MODULE_FILE))
+        .collect()
+}
+
 /// Module directories, relative to the root, in a stable order.
 fn discover_modules(
     root: &Path,
@@ -1413,7 +1424,7 @@ fn build_variant(
 }
 
 /// `scala-3`, `scala-2.13`, `scala-jvm`, … in the order sbt uses.
-fn source_suffixes(platform: Platform, scala: Option<&ScalaVersion>) -> Vec<String> {
+pub(crate) fn source_suffixes(platform: Platform, scala: Option<&ScalaVersion>) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(s) = scala {
         let major = s.full.split('.').next().unwrap_or_default().to_string();

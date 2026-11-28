@@ -1215,6 +1215,96 @@ So the downgrade is mostly **server quality plus IntelliJ's weaker BSP sync UX**
 
 `scpm bsp` is a Rust front-end that delegates compile, test, run and debug to `scpmd`. The spec has been stagnant since 2.2.0-M3, so we implement a narrow, stable subset well rather than all of it.
 
+**Built (M9): `scpm bsp`**, BSP 2.1.0 over stdio with LSP-style `Content-Length` framing. The subset is what the two clients that matter actually send. That was taken from their sources: intellij-scala `bsp-builtin/bsp` (`BspProjectResolver`, `BspResolverLogic`, `BspTask`, `BspJvmEnvironment`, `BspTestRunner`) and Metals `main` (`BuildServerConnection`, `ImportedBuild`, `Diagnostics`, `ForwardingMetalsBuildClient`, `BuildTargetClasses`).
+
+- **Connection file.**
+  - `scpm bsp --setup` writes `.bsp/scpm.json`: `name`, `version`, `bspVersion`, `languages` (`scala`, `java`), and `argv`, which is scpm plus `bsp`. Clients start that command in the workspace root.
+  - The binary is recorded by the path it was invoked through, made absolute but **not resolved**: `argv[0]` if it is a path, else where `PATH` finds it. A Homebrew or mise shim therefore stays a shim, and upgrades, which delete the versioned target, keep working.
+  - Ownership follows the mbt.json rule. An existing file is replaced only if its sha256 matches `.scpm/ide/bsp.json.sha256` (what scpm last wrote), or with `--force`.
+    - While writing, the marker lists both the old and the new hash, so a write interrupted at any step leaves the file owned and repairable.
+    - `--setup` and install refreshes hold `.scpm/ide/bsp.json.lock` from the ownership check through both writes, so a refresh can't overwrite a concurrent `--setup`.
+  - The automatic IDE refresh after a non-frozen install only repairs an owned file. If the recorded binary no longer exists, it is re-pointed at the scpm running now. If the recorded binary is this same binary (compared after resolving symlinks), only the `version` is brought up to date. Any other scpm binary leaves it alone, so `scpm2 install` doesn't take over the workspace. The refresh never creates the file.
+  - `--setup` warns if the workspace also has native IntelliJ files from `scpm idea`, because the two setups conflict.
+- **Lifecycle.**
+  - `build/initialize` (every capability flag is sent explicitly, because both clients unbox them), `build/initialized`, `build/shutdown`, `build/exit` and `$/cancelRequest`.
+  - Requests before `initialize` get -32002, and requests after `shutdown` get -32600, and so do builds that were still waiting for the build lock when `shutdown` came. `exit` without `shutdown` exits 1. On `exit` (or the end of input) in-flight work is cancelled, and the server waits at most 5 s for it: a request that can't be cancelled, such as a resolve in progress, doesn't hold the exit.
+  - Unknown methods get -32601. Errors are JSON-RPC errors, and a cancelled request is answered with -32800.
+  - **A broken config** (or a failing resolve) doesn't take the server down. The last good model keeps being served, and the client gets one `build/showMessage` (error) with the diagnostic per distinct failure. An invalid config is not reloaded again until a file changes; a transient failure (a resolve or download, e.g. offline) is also retried every 30 s. The server recovers by itself once the problem is gone. The failure is recorded against the revision that was tried: if a file changed during the attempt, the next request tries again. An explicit `workspace/reload` answers with the error. With no good model yet, requests fail with -32603.
+  - Only protocol messages reach stdout. On Unix the real stdout is moved to a private descriptor (close-on-exec), and descriptor 1 is pointed at stderr, so stray output from scpm or from a child process can't corrupt the stream. Logs go to stderr.
+- **Targets** (`workspace/buildTargets`).
+  - Each variant is a target with displayName `core@jvm-3`. Its tests are a second target, `core@jvm-3:test`, if a test source directory exists.
+  - Target ids are `<module dir URI>/?id=<displayName>`.
+  - Both targets have the module directory as `baseDirectory`. IntelliJ merges targets that share a base directory into one module, putting the `test`-tagged one in its test scopes. That is also why the test target is separate: its classpath carries the test-only dependencies. Metals ignores tags and uses `scalaTestClasses`.
+  - The test target lists the main target first in `dependencies`. IntelliJ turns classpath entries that equal a dependency's `classDirectory` into module dependencies.
+  - Tags are `application` (the variant has a `mainClass`), `library` or `test`.
+  - Data:
+    - `scala` for Scala variants: `scalaOrganization`, `scalaVersion`, `scalaBinaryVersion`, platform JVM, `jars` (the locked `scala-compiler@<version>` boot closure), and `jvmBuildTarget` with `javaHome` and `javaVersion`.
+    - `jvm` (`jvmBuildTarget`) for Java-only variants.
+  - **Deviation:** variants of a cross-built module other than its `ide.primary` one carry the spec's `no-ide` tag. Otherwise IntelliJ would merge them into the primary's module and pick the higher Scala version, with both versions' jars on the classpath. This matches `scpm idea`. Metals honours the tag too, so like sbt's BSP it only sees one Scala version per module.
+- **Queries.**
+  - `buildTarget/sources`: source directories, `kind: 2`, `generated: false`, with a trailing slash (IntelliJ needs it).
+  - `buildTarget/resources` and `buildTarget/inverseSources`. The latter also matches files reached through a symlinked source directory, comparing resolved paths.
+  - `buildTarget/outputPaths`: `.scpm/out/<id>/`, or for a module at the workspace root, the whole of `.scpm/`, `.metals/` and `.bsp/`.
+    - IntelliJ applies outputPaths only under the module's own base directory, and only to modules with a source root there (`BspResolverLogic.createModuleNode`). Its synthetic `<dir>-root` module, which covers the workspace root when no module lives there, gets only `.bsp`, `.bloop` and its own output directory excluded.
+    - **Gap:** in a workspace without a root module, IntelliJ indexes `.scpm/`. Mark it excluded once in IntelliJ (Mark Directory as → Excluded), (not verified to survive a re-import). A synthetic root target would fix it, but every client would see that target.
+  - `buildTarget/scalacOptions` (Scala targets only) and `buildTarget/javacOptions` (all targets). Options come from `compiler_options`, and the classpath and `classDirectory` are exactly what `scpm compile` compiles with. A test target's classpath is the main classes directory plus the test-compile classpath.
+  - **SemanticDB** (`ide: {semanticdb: true}` in the workspace file). Metals v1 needs it for references, rename, implementations and run/test code lenses. `compiler_options` adds it, so `scpm compile`, `scpm bsp` and mbt.json all get the same options and fingerprints don't thrash between them.
+    - Output goes to the classes directory, under `META-INF/semanticdb/<path relative to the workspace root>.semanticdb`, which is where Metals looks (`FileSystemSemanticdbs`, `ScalaTarget.targetroot`).
+    - Scala 3: `-Xsemanticdb -sourceroot <root> -semanticdb-target <classes>`.
+    - Scala 2: the `org.scalameta:semanticdb-scalac_<full>` plugin, locked as the boot entry `semanticdb@<full>+<version>`. The plugin is published per Scala patch version, and each scalameta release covers only a window of them, so scpm maps each version to the newest scalameta release publishing it (`4.17.4` for 2.13.15–18 and 2.12.18–21, older ones for older patches). A Scala 2 version outside the table (before 2.12.4, or newer than scpm knows) is an install error naming it, plus `-Yrangepos -P:semanticdb:sourceroot:<root> -P:semanticdb:targetroot:<classes> -P:semanticdb:failures:warning`.
+    - The source and target roots are explicit because the compiler runs in the daemon's directory. They are absolute, so a worktree at another path recompiles once.
+    - `scpm idea` leaves these options out, since IntelliJ's own compiler must not write into scpm's outputs. Java-only modules get no SemanticDB (no semanticdb-javac yet).
+    - When the client is Metals (its `displayName`, or `semanticdbVersion` in the initialize data) and the setting is off, the server sends one `build/showMessage` naming the setting.
+  - `buildTarget/dependencySources`: sources jars as for `scpm ide …`, cached ones plus a single `cs fetch --sources` for missing ones, with the same no-sources memory.
+  - `buildTarget/dependencyModules`: `maven` data with the jar and, if cached, the `sources` artifact.
+  - `buildTarget/jvmRunEnvironment` and `buildTarget/jvmTestEnvironment`, which drive IntelliJ's and Metals' own runners.
+    - The classpath is `scpm run`'s or `scpm test`'s runtime classpath, with outputs listed even before they exist.
+    - Also: the variant's `jvmOptions` and `env`.
+    - The working directory is the module directory for tests (as `scpm test`) and the workspace root for programs.
+    - `mainClasses` (IntelliJ ignores them).
+  - `buildTarget/scalaMainClasses`: the configured `mainClass` first, then every public class with `public static void main(String[])` found by reading the compiled class files' method tables. This covers Scala objects, `@main` methods and Java.
+  - `buildTarget/scalaTestClasses`: the test runner's new `discover` method (worker protocol). It loads the compiled test classes with the same framework fingerprints `scpm test` uses, without running anything, and gives one item per framework. Results are cached per variant until its test-compile fingerprint changes. Uncompiled tests list nothing. Discovery that takes more than 60 s is killed and lists nothing, with a `build/logMessage`.
+- **Builds.** Builds run one at a time on the shared worker slot (the daemon when available, as for `scpm mcp`), holding the workspace's `.scpm/out/.lock`. A cancel also breaks the wait for that lock.
+  - `buildTarget/compile` runs `compile::compile`, with test targets as `--tests`, and returns a `StatusCode`. A compile of no targets, which is Metals' liveness ping, is answered at once without waiting for a running build.
+    - Every request gets a `build/taskStart`/`taskFinish` pair, with `build/taskProgress` after each task. Each scpm task gets `compile-task` / `compile-report` (`errors`, `warnings`, `time`, `noOp` for up-to-date tasks; Metals needs both). `eventTime` is always set.
+    - Each task starts and finishes once per request. A request with both test and main targets compiles in two passes, and the second pass's up-to-date repeats of tasks already reported are dropped.
+    - Tasks stopped by a cancel finish as cancelled (status 3), with no error log. That covers tasks killed mid-compile and those skipped after them.
+    - After each compile task, `build/publishDiagnostics` goes out per file with `reset: true`. Files that had diagnostics and are now clean get an empty reset.
+    - An up-to-date task republishes the diagnostics `scpm compile` persisted for it, so warnings survive a server restart. A skipped or crashed task leaves them alone.
+    - Lines and characters are 0-based. Single-file quick fixes become `scala` diagnostic data (`ScalaAction`).
+  - `buildTarget/test` compiles like `scpm test`, then runs `testing::run_tests` per variant.
+    - `scala-test` (`testClasses`, as IntelliJ's BSP test runner sends), `scala-test-suites` and `scala-test-suites-selection` select suites and cases. A `scala-test` selection whose targets no longer exist is rejected (-32602) instead of running every suite. Cases chosen per suite run as one runner request per suite, each with its own report (`test-reports/junit.xml`, `junit-2.xml`, …).
+    - Output goes out as `build/logMessage`. Each case gets a `test-start`/`test-finish` pair with the failure location, and each variant a `test-task`/`test-report`.
+  - `buildTarget/run` compiles, then runs `scpm run`'s command, with `scala-main-class` data (class, arguments, JVM options, environment), `arguments`, `environmentVariables` and `workingDirectory`. Output lines become `build/logMessage`s, and the exit code becomes the status.
+    - The run ends when the JVM exits. If a process it started keeps its stdout or stderr open, the pipes get a 2 s grace period, then the program's process group is killed (with a warning). The build and workspace locks are never held for such a process.
+    - The target, main class, JVM options and environment are resolved from the same model the build compiles with, even if the model reloads while the request waits for the build lock. `compile` and `test` re-resolve their targets the same way, and fail (status 2, with a message) if one of them no longer exists. A request for no targets stays a no-op.
+  - Cancellation:
+    - Compiles are cancelled in the daemon.
+    - Test JVMs are killed.
+    - A program's process group is killed.
+  - `buildTarget/cleanCache` deletes a target's classes, analysis, fingerprint and saved diagnostics, under the build lock, and answers `cleaned: true` (IntelliJ refuses to rebuild otherwise).
+- **Reloading.** The server keeps the loaded workspace and lock. The automatic IDE refresh that comes with a reload updates `.metals/mbt.json` and `.bsp/scpm.json` but **not** the native IntelliJ files of `scpm idea`, which would fight a BSP import. Before each request it stats the workspace file, the module files the `modules` globs match now (so a new or deleted module counts), the test source directories and the lock.
+  - The stamp is taken after a load. A config file whose modification time is at or after the load's start (less 1 s, for coarse timestamps) is recorded as unknown, so an edit made while loading triggers a reload on the next request. The lock is exempt, because the load writes it itself. If one changed, it reloads, installing a stale lock as every CLI command does, and sends `buildTarget/didChange` for the targets whose answers changed (created, changed or deleted). `workspace/reload` reloads unconditionally, without waiting for a running build (builds keep the model they started with), and also notifies only on real changes: IntelliJ calls `reload` at the start of every import and re-imports on `didChange`, so always notifying would loop.
+- **Deviations and gaps.**
+  - No debugging (`debugProvider` is empty, so Metals runs locally from the JVM environments).
+  - No `buildTarget/wrappedSources`, `jvmCompileClasspath` or `run/readStdin`; a program's stdin is empty.
+  - `arguments` of `compile` and `test` are ignored.
+  - `test`'s `environmentVariables` and `workingDirectory` are not applied: tests run with the variant's own `env` in the module directory, like `scpm test`.
+  - SemanticDB is opt-in (`ide.semanticdb`, above). It is not switched on per client, because the options must stay exactly what `scpm compile` uses.
+  - In a workspace without a root module, IntelliJ indexes `.scpm/` (above).
+- **Validation.**
+  - `crates/scpm/tests/bsp.rs` drives `scpm bsp` over its real stdio against copies of the `app`, `basic` and `java-deps` fixtures. It covers:
+    - the lifecycle;
+    - targets, sources and options, the environments, discovery and `didChange`;
+    - each task finishing exactly once;
+    - diagnostics published and cleared through the daemon;
+    - tests and runs;
+    - cancellation of a running program, of a test request and of a compile mid-way (reported as cancelled);
+    - SemanticDB options and files for Scala 3 and 2.13, with `scpm compile` up to date afterwards, and the Metals hint;
+    - a broken config that keeps the last good model.
+  - A bsp4j 2.1.1 client (the library IntelliJ and Metals use), with lsp4j's strict message validation on, ran every supported request and accepted every response and notification.
+  - IntelliJ and Metals themselves have not been tried yet.
+
 ---
 
 ## 11. Release management

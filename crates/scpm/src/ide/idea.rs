@@ -150,6 +150,17 @@ pub fn java_language_level(release: &str) -> String {
 }
 
 /// The IntelliJ scope of a classpath entry from the lists it is on.
+/// The compiler parameters of a module's Scala compiler profile: scpm's scalac options without
+/// the SemanticDB suffix `compiler_options` appends (IntelliJ's own compiler must not write
+/// SemanticDB into scpm's output directories; it is cut by position, so a user's own
+/// `-sourceroot` stays) and without the `compilerPlugins` (they go to the profile's plugin list;
+/// a `-Xplugin:` written in `scalacOptions` stays a parameter, as scpm passes it).
+fn profile_params(opts: &crate::compile::CompilerOptions) -> Vec<String> {
+    let own = &opts.scalac[..opts.scalac.len().saturating_sub(opts.semanticdb.len())];
+    let plugin_opts: Vec<String> = opts.plugins.iter().map(|p| format!("-Xplugin:{}", p.display())).collect();
+    own.iter().filter(|o| !plugin_opts.contains(o)).cloned().collect()
+}
+
 fn scope(compile: bool, runtime: bool) -> Option<&'static str> {
     match (compile, runtime) {
         (true, true) => None,
@@ -511,12 +522,9 @@ pub fn generate(tc: &Toolchain, opts: &Options) -> Result<Summary, IdeError> {
                 }
             }
         }
-        let opts = compiler_options(tc, v)?;
+        let opts = compiler_options(tc, v, false)?;
         if v.scala.is_some() {
-            // `compilerPlugins` go to the profile's plugin list; a `-Xplugin:` written in
-            // `scalacOptions` stays a parameter, as scpm passes it.
-            let plugin_opts: Vec<String> = opts.plugins.iter().map(|p| format!("-Xplugin:{}", p.display())).collect();
-            let params: Vec<String> = opts.scalac.iter().filter(|o| !plugin_opts.contains(o)).cloned().collect();
+            let params = profile_params(&opts);
             let plugins: Vec<String> = opts.plugins.iter().map(|p| slash_path(p)).collect();
             profiles.entry((params, plugins)).or_default().push(m.name.clone());
         }
@@ -672,6 +680,22 @@ mod tests {
         assert_eq!(language_level("3.10.0-RC1"), "Scala_3_10");
         assert_eq!(java_language_level("8"), "JDK_1_8");
         assert_eq!(java_language_level("17"), "JDK_17");
+    }
+
+    #[test]
+    fn profile_params_drop_only_scpms_semanticdb_suffix_and_plugins() {
+        let semanticdb: Vec<String> =
+            ["-Xsemanticdb", "-sourceroot", "/ws", "-semanticdb-target", "/ws/out"].map(String::from).to_vec();
+        let mut scalac: Vec<String> =
+            ["-sourceroot", "/custom/root", "-Xplugin:/mine.jar", "-Xplugin:/locked.jar"].map(String::from).to_vec();
+        scalac.extend(semanticdb.clone());
+        let opts = crate::compile::CompilerOptions {
+            scalac,
+            plugins: vec![PathBuf::from("/locked.jar")],
+            semanticdb,
+            ..Default::default()
+        };
+        assert_eq!(profile_params(&opts), ["-sourceroot", "/custom/root", "-Xplugin:/mine.jar"]);
     }
 
     #[test]
