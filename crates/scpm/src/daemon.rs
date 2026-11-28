@@ -1017,6 +1017,7 @@ pub fn serve(args: ServeArgs) -> Result<(), WorkerError> {
         initialize: false,
         own_process_group: false,
         clear_env: false,
+        java: None,
     };
     let worker = Worker::spawn(spec, |_| {}).and_then(|w| {
         info.worker_pid = w.pid();

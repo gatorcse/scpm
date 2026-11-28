@@ -139,3 +139,28 @@ class DefaultedFieldsSuite extends munit.FunSuite:
       "HostThrottle.apply"
     )
   }
+
+class TrustSuite extends munit.FunSuite:
+  // Certificates stand in as names: only which stores are combined matters here.
+  private val (root, user, jdk) = (Seq("root"), Seq("user"), Seq("jdk"))
+  private def stores(have: Map[String, Seq[String]]): String => Option[Seq[String]] = have.get
+  private val noPem: String => Option[Seq[String]] = _ => None
+
+  test("macOS: the Keychain's roots, or without KeychainStore-ROOT (JDK 17–22), cacerts") {
+    val withRoot = Trust.select("Mac OS X", stores(Map("KeychainStore-ROOT" -> root, "KeychainStore" -> user)), None, noPem, jdk)
+    assertEquals(withRoot, (root ++ user, None))
+    val (certs, note) = Trust.select("Mac OS X", stores(Map("KeychainStore" -> user)), None, noPem, jdk)
+    assertEquals(certs, jdk ++ user)
+    assert(note.exists(_.contains("KeychainStore-ROOT")), note)
+  }
+
+  test("Windows: Windows-ROOT and cacerts, since Windows fills its roots lazily") {
+    assertEquals(Trust.select("Windows 11", stores(Map("Windows-ROOT" -> root)), None, noPem, jdk), (root ++ jdk, None))
+  }
+
+  test("Linux: the PEM bundle, else cacerts with a note") {
+    assertEquals(Trust.select("Linux", stores(Map.empty), Some("/b.pem"), _ => Some(root), jdk), (root, None))
+    val (certs, note) = Trust.select("Linux", stores(Map.empty), Some("/nonexistent/bundle.pem"), noPem, jdk)
+    assertEquals(certs, jdk)
+    assert(note.exists(_.contains("PEM bundle")), note)
+  }

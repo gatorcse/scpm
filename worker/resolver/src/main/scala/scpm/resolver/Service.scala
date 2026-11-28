@@ -82,8 +82,15 @@ final class Recording(underlying: FileCache[Task]) extends Cache[Task]:
       result
     })
 
-  override def fetch: Cache.Fetch[Task] = recorded(underlying.fetch)
-  override def fetchs: Seq[Cache.Fetch[Task]] = underlying.fetchs.map(recorded)
+  // Only the passes that go to the network are recorded: a cache-only pass that misses (the
+  // first of `LocalUpdateChanging, FetchMissing`) isn't something a repository answered.
+  // Every policy in turn, as `FileCache.fetch` does (`Versions` uses this one).
+  override def fetch: Cache.Fetch[Task] = artifact =>
+    fetchs.tail.foldLeft(fetchs.head(artifact))((acc, f) => acc.orElse(f(artifact)))
+  override def fetchs: Seq[Cache.Fetch[Task]] =
+    underlying.cachePolicies.zip(underlying.fetchs).map { (policy, f) =>
+      if Recording.remote(policy) then recorded(f) else f
+    }
   override def ec: ExecutionContext = underlying.ec
   override def file(artifact: Artifact): EitherT[Task, ArtifactError, File] = underlying.file(artifact)
   override def loggerOpt: Option[CacheLogger] = underlying.loggerOpt
@@ -91,6 +98,11 @@ final class Recording(underlying: FileCache[Task]) extends Cache[Task]:
   def entries: List[(String, Either[String, Unit])] = log.asScala.toList
 
 object Recording:
+  /** Whether a pass with this policy asks repositories (rather than only the cache). */
+  def remote(policy: CachePolicy): Boolean = policy match
+    case CachePolicy.FetchMissing | CachePolicy.Update | CachePolicy.UpdateChanging | CachePolicy.ForceDownload => true
+    case _                                                                                                      => false
+
   /** An HTTP status, or what went wrong, from coursier's error text (`ArtifactError.describe`). */
   def status(error: String): String =
     val e = error.toLowerCase(Locale.ROOT)
@@ -139,23 +151,30 @@ final class Service(proxy: Option[ProxySpec], trust: Option[TrustSpec], userAgen
       mirrors = Nil
     )(using Task.sync)
     val result = await(versions.result())
-    val allowed = Groups.allowed(params.repositories, org).toSet
+    val allowed = Groups.allowed(params.repositories, org)
     val perRepo = result.results.toList.collect {
-      case (r: Routed, outcome) if allowed(r.id) =>
-        // A 404 or a missing listing is no versions; any other failure fails the request, so a
-        // missing token can't silently select a lower version.
-        for (url, e) <- cache.entries if Service.under(url, params.repositories.find(_.id == r.id).map(_.url))
+      case (r: Routed, outcome) if r.allowsModule(module) =>
+        // Repositories sharing this URL: named after the first of them allowed for the group.
+        val id = allowed.find(r.sharing.contains).getOrElse(r.id)
+        // A 404 or a missing listing is no versions. Any other failure of the metadata itself
+        // (`maven-metadata.xml`) fails the request, so a missing token can't silently select a
+        // lower version. Coursier's fallback, a directory listing after a 404, often isn't
+        // allowed (a Nexus without browse rights, S3 without ListBucket): its failures count
+        // as no listing.
+        for (url, e) <- cache.entries if Service.under(url, Some(r.url)) && url.endsWith("/maven-metadata.xml")
         do
           e.left.foreach { err =>
             Recording.status(err) match
-              case "401" | "403" =>
-                throw ResolverError("unauthorized", s"repository `${r.id}` refused $url: $err", UnauthorizedData(r.id, url, Recording.status(err).toInt))
+              case s @ ("401" | "403") =>
+                throw ResolverError("unauthorized", s"repository `$id` refused $url: $err", UnauthorizedData(id, url, s.toInt))
+              case "checksum" =>
+                throw ResolverError("checksum", s"repository `$id`: $err", ChecksumData(url, "", err))
               case "transport" =>
-                throw ResolverError("transport", s"repository `${r.id}`: $err", TransportData(r.id, url, err))
+                throw ResolverError("transport", s"repository `$id`: $err", TransportData(id, url, err))
               case _ => ()
           }
         val list = outcome.toOption.toList.flatMap(_.available0.map(_.repr)).distinct
-        RepoVersions(r.id, list)
+        RepoVersions(id, list)
     }
     val merged = perRepo.flatMap(_.versions).distinct.sortBy(Version(_))
     ListVersionsResult(merged, perRepo)
@@ -171,7 +190,13 @@ final class Service(proxy: Option[ProxySpec], trust: Option[TrustSpec], userAgen
         new MavenRepository(url, None, None, versionsCheckHasModule = true, checkModule = false)
       // Repositories sharing a URL: one coursier repository, allowed for a module when any of
       // them is; results name the first of them allowed for it.
-      Routed(underlying, sharing.head.id, m => sharing.exists(s => Groups.allowed(specs, m.organization.value).contains(s.id)))
+      Routed(
+        underlying,
+        sharing.head.id,
+        m => sharing.exists(s => Groups.allowed(specs, m.organization.value).contains(s.id)),
+        sharing.map(_.id),
+        url
+      )
     }
 
   private def credentials(specs: List[RepoSpec]): Seq[DirectCredentials] =
@@ -190,7 +215,7 @@ final class Service(proxy: Option[ProxySpec], trust: Option[TrustSpec], userAgen
       )
     }
 
-  private def fileCache(spec: CacheSpec): FileCache[Task] =
+  private[resolver] def fileCache(spec: CacheSpec): FileCache[Task] =
     val policies =
       if spec.offline then Seq(CachePolicy.LocalOnly)
       else if spec.refresh then Seq(CachePolicy.UpdateChanging, CachePolicy.FetchMissing)
@@ -278,7 +303,9 @@ final class Service(proxy: Option[ProxySpec], trust: Option[TrustSpec], userAgen
                 url = url,
                 checksumUrls = art.checksumUrls.map((k, v) => k -> (url + v.stripPrefix(art.url))),
                 extra = Map.empty,
-                optional = false
+                // Optional: a mapped jar the repository lacks leaves that system without one
+                // (scpm notes it) instead of failing the whole resolution.
+                optional = true
               )
           }
         case _ => Nil
@@ -319,7 +346,7 @@ final class Service(proxy: Option[ProxySpec], trust: Option[TrustSpec], userAgen
     )(using Task.sync)
     val result =
       try await(new Fetch[Task](resolve, artifacts, None).ioResult)
-      catch case e: CoursierError => throw Service.error(e, spec.repositories, recording)
+      catch case e: CoursierError => throw Service.error(e, spec.repositories, recording, spec.offline)
     val repoIdOf = (url: String, group: String) => Service.repositoryOf(spec.repositories, url, group)
     val main = result.fullDetailedArtifacts0.toList.collect { case (dep, pub, art, Some(file)) =>
       val classifier = pub.toOption.map(_.classifier.value).filter(_.nonEmpty)
@@ -454,40 +481,55 @@ object Service:
     val allowed = Groups.allowed(specs, group).toSet
     candidates.find(s => allowed(s.id)).orElse(candidates.headOption).fold("")(_.id)
 
-  /** A protocol error for a coursier failure; `tried` from what the recording saw. */
-  def error(e: CoursierError, specs: List[RepoSpec], recording: Recording): ResolverError =
-    def tried(prefix: String) = recording.entries.collect {
-      case (url, outcome) if url.contains(prefix) =>
-        Tried(specs.find(s => under(url, Some(s.url))).fold("")(_.id), url, outcome.fold(Recording.status, _ => "200"))
+  /** `(org:name, version)` of an artifact URL in a Maven layout under one of `specs`. */
+  def coordinatesOf(specs: List[RepoSpec], url: String): Option[(String, String)] =
+    specs.find(s => under(url, Some(s.url))).flatMap { s =>
+      url.stripPrefix(normalized(s.url) + "/").split('/').toList.reverse match
+        case _ :: version :: name :: group if group.nonEmpty =>
+          Some((group.reverse.mkString(".") + ":" + name, version))
+        case _ => None
     }
+
+  /** A protocol error for a coursier failure; `tried` from what the recording saw, and
+    * `offline` for whether the request was offline (then a miss is `offline_miss`). */
+  def error(e: CoursierError, specs: List[RepoSpec], recording: Recording, offline: Boolean): ResolverError =
+    def repoOf(url: String) = specs.find(s => under(url, Some(s.url))).fold("")(_.id)
+    // Requests about the module, anchored at a path segment (`/org/acme/name/`, not `xorg/…`).
+    def tried(c: ResolutionError.CantDownloadModule) =
+      val path = "/" + c.module.organization.value.replace('.', '/') + "/" + c.module.name.value + "/"
+      recording.entries.collect {
+        case (url, outcome) if url.contains(path) => Tried(repoOf(url), url, outcome.fold(Recording.status, _ => "200"))
+      }
     e match
       case r: ResolutionError =>
-        val simple = r.errors.collectFirst { case c: ResolutionError.CantDownloadModule => c }
-        simple match
-          case Some(c) =>
-            val path = c.module.organization.value.replace('.', '/') + "/" + c.module.name.value + "/"
-            val attempts = tried(path)
-            attempts.find(t => t.status == "401" || t.status == "403") match
-              case Some(t) =>
-                ResolverError("unauthorized", s"repository `${t.repository}` refused ${t.url} (HTTP ${t.status})", UnauthorizedData(t.repository, t.url, t.status.toInt))
-              case None =>
-                attempts.find(_.status == "transport") match
-                  case Some(t) =>
-                    ResolverError("transport", s"cannot reach ${t.url}: ${c.perRepositoryErrors.mkString("; ")}", TransportData(t.repository, t.url, c.perRepositoryErrors.mkString("; ")))
-                  case None if attempts.exists(_.status == "offline") =>
-                    ResolverError("offline_miss", s"${c.module.repr}:${c.versionConstraint.asString} is not cached", OfflineMissData(attempts.find(_.status == "offline").get.url))
-                  case None =>
-                    ResolverError("not_found", r.getMessage, NotFoundData(c.module.repr, c.versionConstraint.asString, attempts))
-          case None => ResolverError.plain("not_found", r.getMessage)
+        val failures = r.errors.collect { case c: ResolutionError.CantDownloadModule => (c, tried(c)) }
+        // The most telling failure: refused credentials hide behind any other module's 404.
+        val refused = failures.iterator.flatMap((_, ts) => ts.find(t => t.status == "401" || t.status == "403")).nextOption()
+        val checksum = failures.iterator.flatMap((_, ts) => ts.find(_.status == "checksum")).nextOption()
+        val transport = failures.iterator.flatMap((_, ts) => ts.find(_.status == "transport")).nextOption()
+        (refused, checksum, transport, failures.headOption) match
+          case (Some(t), _, _, _) =>
+            ResolverError("unauthorized", s"repository `${t.repository}` refused ${t.url} (HTTP ${t.status})", UnauthorizedData(t.repository, t.url, t.status.toInt))
+          case (_, Some(t), _, _) =>
+            ResolverError("checksum", s"${t.url}: a served checksum didn't match", ChecksumData(t.url, "", "mismatch"))
+          case (_, _, Some(t), Some((c, _))) =>
+            ResolverError("transport", s"cannot reach ${t.url}: ${c.perRepositoryErrors.mkString("; ")}", TransportData(t.repository, t.url, c.perRepositoryErrors.mkString("; ")))
+          case (_, _, _, Some((c, attempts))) if offline =>
+            ResolverError("offline_miss", s"${c.module.repr}:${c.versionConstraint.asString} is not cached", OfflineMissData(attempts.headOption.fold(c.module.repr)(_.url)))
+          case (_, _, _, Some((c, attempts))) =>
+            ResolverError("not_found", r.getMessage, NotFoundData(c.module.repr, c.versionConstraint.asString, attempts))
+          case _ => ResolverError.plain("internal", r.getMessage)
       case f: FetchError.DownloadingArtifacts =>
         val (art, err) = f.errors.head
-        def repoOf(url: String) = specs.find(s => under(url, Some(s.url))).fold("")(_.id)
+        val (module, version) = coordinatesOf(specs, art.url).getOrElse((art.url, ""))
         err match
           case _: ArtifactError.Unauthorized | _: ArtifactError.Forbidden =>
             val status = if err.isInstanceOf[ArtifactError.Forbidden] then 403 else 401
             ResolverError("unauthorized", err.describe, UnauthorizedData(repoOf(art.url), art.url, status))
+          case _: ArtifactError.NotFound | _: ArtifactError.FileTooOldOrNotFound if offline =>
+            ResolverError("offline_miss", err.describe, OfflineMissData(art.url))
           case _: ArtifactError.NotFound =>
-            ResolverError("not_found", err.describe, NotFoundData(art.url, "", List(Tried(repoOf(art.url), art.url, "404"))))
+            ResolverError("not_found", err.describe, NotFoundData(module, version, List(Tried(repoOf(art.url), art.url, "404"))))
           case w: ArtifactError.WrongChecksum =>
             ResolverError("checksum", err.describe, ChecksumData(art.url, w.expected, w.got))
           case _: ArtifactError.FileTooOldOrNotFound =>

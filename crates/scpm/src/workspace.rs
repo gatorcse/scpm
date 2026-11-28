@@ -506,14 +506,8 @@ fn validate_workspace(ctx: &Ctx, diags: &mut Diagnostics) {
         if n.module.split(':').count() != 2 || n.module.split(':').any(str::is_empty) {
             diags.push(ctx.in_ws(Diagnostic::new(format!("expected `org:name`, got `{}`", n.module)).at_key(&at)));
         }
-        for s in n.natives.keys().filter(|s| crate::system::known(s).is_none()) {
-            diags.push(
-                ctx.in_ws(
-                    Diagnostic::new(format!("unknown system `{s}`"))
-                        .at_key(format!("{at}.natives"))
-                        .with_help(format!("known systems: {}", crate::system::known_names())),
-                ),
-            );
+        if let Err(d) = check_natives(&n.natives) {
+            diags.push(ctx.in_ws(d.at_key(format!("{at}.natives"))));
         }
     }
     if let Some(jdk) = &config.lock.jdk
@@ -1514,9 +1508,8 @@ fn external_dependency(
             return Err(Diagnostic::new(format!("invalid exclusion `{pattern}`; expected `org:name` (`*` allowed)")));
         }
     }
-    if let Some(s) = natives.iter().flatten().map(|(s, _)| s).find(|s| crate::system::known(s).is_none()) {
-        return Err(Diagnostic::new(format!("natives: unknown system `{s}`"))
-            .with_help(format!("known systems: {}", crate::system::known_names())));
+    if let Some(n) = &natives {
+        check_natives(n).map_err(|d| Diagnostic { message: format!("natives: {}", d.message), ..d })?;
     }
     Ok(Dependency {
         scope,
@@ -1529,6 +1522,23 @@ fn external_dependency(
         transitive,
         natives,
     })
+}
+
+/// A native mapping (`natives:`, `lock.nativeClassifiers`): known systems, and classifiers that
+/// can be part of a file name (they become one in the cache and the lock key).
+fn check_natives(natives: &std::collections::BTreeMap<String, String>) -> Result<(), Diagnostic> {
+    for (system, classifier) in natives {
+        if crate::system::known(system).is_none() {
+            return Err(Diagnostic::new(format!("unknown system `{system}`"))
+                .with_help(format!("known systems: {}", crate::system::known_names())));
+        }
+        if classifier.trim().is_empty() || classifier.contains(['/', '\\', ':', '@']) || classifier.contains("..") {
+            return Err(Diagnostic::new(format!("invalid classifier `{classifier}` for {system}")).with_help(
+                "a classifier is a plain name such as `linux-x86_64`; leave a system out for no native jar",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A BOM entry (`org:name: <spec>`): its version resolves through catalogs like a dependency's.

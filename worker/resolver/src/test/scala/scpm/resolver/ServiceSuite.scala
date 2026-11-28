@@ -17,22 +17,46 @@ import scala.jdk.CollectionConverters.*
 final class FixtureServer:
   private val files = scala.collection.mutable.Map.empty[String, Array[Byte]]
   val requests = ConcurrentLinkedQueue[String]()
+  /** Every request's path and `Authorization` header. */
+  val headers = ConcurrentLinkedQueue[(String, Option[String])]()
+  /** Paths answered with a status instead of a file. */
+  val statuses = scala.collection.concurrent.TrieMap.empty[String, Int]
+  /** Paths answered with a redirect to a URL. */
+  val redirects = scala.collection.concurrent.TrieMap.empty[String, String]
+  /** Paths under a prefix that need basic auth for a user and password, challenging with a realm. */
+  @volatile var protect: Option[(String, String, String, String)] = None
   private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
   server.createContext(
     "/",
     exchange =>
       val path = exchange.getRequestURI.getPath
+      val auth = Option(exchange.getRequestHeaders.getFirst("Authorization"))
       requests.add(path)
-      files.synchronized(files.get(path)) match
-        case Some(body) =>
-          exchange.sendResponseHeaders(200, body.length.toLong)
-          exchange.getResponseBody.write(body)
-        case None => exchange.sendResponseHeaders(404, -1)
+      headers.add(path -> auth)
+      val expected = protect.collect {
+        case (prefix, user, password, realm) if path.startsWith(prefix) =>
+          ("Basic " + java.util.Base64.getEncoder.encodeToString(s"$user:$password".getBytes), realm)
+      }
+      (redirects.get(path), statuses.get(path), expected) match
+        case (Some(to), _, _) =>
+          exchange.getResponseHeaders.add("Location", to)
+          exchange.sendResponseHeaders(302, -1)
+        case (_, Some(status), _) => exchange.sendResponseHeaders(status, -1)
+        case (_, _, Some((header, realm))) if !auth.contains(header) =>
+          exchange.getResponseHeaders.add("WWW-Authenticate", s"""Basic realm="$realm"""")
+          exchange.sendResponseHeaders(401, -1)
+        case _ =>
+          files.synchronized(files.get(path)) match
+            case Some(body) =>
+              exchange.sendResponseHeaders(200, body.length.toLong)
+              exchange.getResponseBody.write(body)
+            case None => exchange.sendResponseHeaders(404, -1)
       exchange.close()
   )
   server.start()
 
-  def url(repo: String): String = s"http://127.0.0.1:${server.getAddress.getPort}/$repo/"
+  def origin: String = s"http://127.0.0.1:${server.getAddress.getPort}"
+  def url(repo: String): String = s"$origin/$repo/"
 
   /** A module with a POM (`deps` as `org:name:version`, `profiles` as (OS family, deps)) and jars
     * for the given classifiers ("" is the main jar). */
@@ -177,9 +201,121 @@ class ServiceSuite extends munit.FunSuite:
     assert(data.contains("\"repository\":\"public\"") && data.contains("\"status\":\"404\""), data)
   }
 
-  test("a mapped native jar that doesn't exist is an error") {
+  test("a mapped native jar the repository lacks is left out, not an error") {
     val cache = Files.createTempDirectory("resolver-cache").toFile
     val wrong = List(NativeSpec("org.fix:nat", None, Map("linux-x86_64" -> "linux-riscv64")))
     val Seq(r) = resolve(cache, request(List("linux-x86_64"), natives = wrong)): @unchecked
-    assertEquals(r.error.map(_.code), Some("not_found"))
+    assertEquals(keys(r), List("org.fix:app:1.0", "org.fix:base:1.0", "org.fix:nat:1.0"))
+  }
+
+  test("several rows for one module: the first that maps the system at the version") {
+    val cache = Files.createTempDirectory("resolver-cache").toFile
+    val rows = List(
+      NativeSpec("org.fix:nat", Some("[0.1,1.0)"), Map("linux-x86_64" -> "linux-riscv64")),
+      NativeSpec("org.fix:nat", Some("[1.0,)"), Map("macos-aarch64" -> "osx-aarch_64")),
+      NativeSpec("org.fix:nat", Some("[1.0,)"), Map("linux-x86_64" -> "linux-x86_64"))
+    )
+    val Seq(r) = resolve(cache, request(List("linux-x86_64", "macos-aarch64"), natives = rows)): @unchecked
+    assertEquals(
+      keys(r).filter(_.contains("nat")),
+      List("org.fix:nat:1.0", "org.fix:nat:1.0:linux-x86_64 [linux-x86_64]", "org.fix:nat:1.0:osx-aarch_64 [macos-aarch64]")
+    )
+  }
+
+  test("listVersions over repositories sharing one URL names the one allowed for the group") {
+    val cache = Files.createTempDirectory("resolver-cache").toFile
+    // `central` and `acme` (com.acme only) both reached through the acme URL, as a mirror would.
+    val shared = List(RepoSpec("central", server.url("acme")), RepoSpec("acme", server.url("acme"), Some(List("com.acme"))))
+    val r = service.listVersions(ListVersionsParams(shared, cache.getPath, module = "com.acme:lib"))
+    assertEquals(r.versions, List("0.9", "1.0"))
+    assertEquals(r.repositories, List(RepoVersions("acme", List("0.9", "1.0"))))
+  }
+
+  test("listVersions: a refused directory listing is no listing; refused metadata is an error") {
+    val cache = Files.createTempDirectory("resolver-cache").toFile
+    // No maven-metadata.xml for org.fix:app; coursier then tries the directory, which is refused.
+    server.statuses.put("/public/org/fix/app/", 403)
+    val r = service.listVersions(ListVersionsParams(repos, cache.getPath, module = "org.fix:app"))
+    assertEquals(r.versions, Nil)
+    server.statuses.remove("/public/org/fix/app/")
+    server.statuses.put("/public/org/fix/base/maven-metadata.xml", 401)
+    val err = intercept[ResolverError](service.listVersions(ListVersionsParams(repos, Files.createTempDirectory("c").toFile.getPath, module = "org.fix:base")))
+    assertEquals(err.body.code, "unauthorized")
+    server.statuses.remove("/public/org/fix/base/maven-metadata.xml")
+  }
+
+  test("the file cache is built with the sealed settings") {
+    val cache = service.fileCache(CacheSpec(repos, "/tmp/c", None, refresh = false, offline = false))
+    assertEquals(cache.allowCacheSubstitution, false)
+    assertEquals(cache.followHttpsToHttpRedirections, false)
+    assertEquals(cache.checksums, Seq(Some("SHA-1"), None))
+    assertEquals(cache.cachePolicies, Seq(coursier.cache.CachePolicy.LocalUpdateChanging, coursier.cache.CachePolicy.FetchMissing))
+    assertEquals(cache.userAgent, Some("scpm-test"))
+    assertEquals(cache.credentials, Nil)
+    assert(cache.sslSocketFactoryOpt.isDefined)
+    val params = Service.resolutionParams(Systems.osInfo("linux-x86_64"), "25", Map.empty)
+    assertEquals((params.useSystemOsInfo, params.useSystemJdkVersion), (false, false))
+    assertEquals(params.osInfoOpt.flatMap(_.name), Some("linux"))
+  }
+
+/** Credentials: scoped to their repository's origin, realm-scoped ones only after a challenge
+  * naming the realm, and never forwarded on a redirect to another origin. */
+class CredentialsSuite extends munit.FunSuite:
+  private val secure = FixtureServer()
+  private val open = FixtureServer()
+  private val service = Service(None, None, Some("scpm-test"))
+  private val basic = "Basic " + java.util.Base64.getEncoder.encodeToString("alice:pw".getBytes)
+  secure.protect = Some(("/secure/", "alice", "pw", "R"))
+  secure.module("secure", "com.sec", "lib", "1.0", deps = Seq("org.fix:base:1.0"))
+  open.module("public", "org.fix", "base", "1.0")
+  open.module("public", "com.sec", "red", "1.0")
+  for ext <- Seq("pom", "jar") do
+    secure.redirects.put(s"/secure/com/sec/red/1.0/red-1.0.$ext", s"${open.url("public")}com/sec/red/1.0/red-1.0.$ext")
+
+  override def afterAll(): Unit =
+    secure.stop()
+    open.stop()
+
+  private def run(root: String, auth: AuthSpec) =
+    val cache = Files.createTempDirectory("resolver-cache").toFile
+    val repos = List(RepoSpec("secure", secure.url("secure"), auth = Some(auth)), RepoSpec("public", open.url("public")))
+    val req = ResolveRequestSpec("t", List("linux-x86_64"), "25", roots = List(RootSpec(root, "1.0")), artifactTypes = List("jar"))
+    service.resolve(ResolveParams(repos, cache.getPath, requests = List(req))).results.head
+
+  private def clear(): Unit =
+    secure.headers.clear()
+    open.headers.clear()
+
+  test("credentials reach their repository's origin only") {
+    clear()
+    val r = run("com.sec:lib", AuthSpec("alice", "pw"))
+    assert(r.error.isEmpty, r.toString)
+    assert(secure.headers.asScala.exists(_._2.contains(basic)))
+    assert(open.headers.asScala.forall(_._2.isEmpty), open.headers.toString)
+  }
+
+  test("wrong credentials are unauthorized") {
+    val r = run("com.sec:lib", AuthSpec("alice", "nope"))
+    assertEquals(r.error.map(_.code), Some("unauthorized"), r.toString)
+  }
+
+  test("realm-scoped credentials go only after a challenge naming that realm") {
+    clear()
+    val r = run("com.sec:lib", AuthSpec("alice", "pw", Some("R")))
+    assert(r.error.isEmpty, r.toString)
+    val pom = secure.headers.asScala.toList.filter(_._1.endsWith("lib-1.0.pom")).map(_._2)
+    assertEquals(pom.headOption, Some(None), "first anonymous")
+    assert(pom.contains(Some(basic)), s"then with the credentials: $pom")
+    clear()
+    val other = run("com.sec:lib", AuthSpec("alice", "pw", Some("Other")))
+    assertEquals(other.error.map(_.code), Some("unauthorized"), other.toString)
+    assert(secure.headers.asScala.forall(_._2.isEmpty), "never sent for another realm")
+  }
+
+  test("credentials are not forwarded on a redirect to another origin") {
+    clear()
+    val r = run("com.sec:red", AuthSpec("alice", "pw"))
+    assert(r.error.isEmpty, r.toString)
+    assert(open.headers.asScala.exists(_._1.endsWith("red-1.0.pom")), open.headers.toString)
+    assert(open.headers.asScala.forall(_._2.isEmpty), open.headers.toString)
   }

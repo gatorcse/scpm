@@ -201,7 +201,9 @@ order, mirrors applied), `cache`, `ttl` (seconds; absent: 24 h), `refresh`, `off
 `requests`: `[{label, systems[], jdk, natives[], roots[], boms[], forced[], artifactTypes[]}]`.
 A root is `{module: "org:name", version, classifier?, type?, exclusions: ["org:name"],
 transitive}`; a native mapping `{module, versions? (a Maven interval), natives: {<system>:
-<classifier>}}`; `boms` and `forced` are `org:name:version`.
+<classifier>}}`, several per module allowed (the first that maps the system at the resolved
+version applies); `boms` and `forced` are `org:name:version`. A mapped native jar the
+repository lacks is left out, not an error.
 
 Result: `{results: [...]}`, one per request in order: `{classpath: [entry]}`, merged over the
 request's systems (an entry not on every system lists its `systems`, sorted), or `{bySystem:
@@ -221,7 +223,7 @@ fails the request.
 
 ### `shutdown`
 
-Answers `{}` and exits. End of input exits too.
+Lets requests still running finish and answer, then answers `{}` and exits. End of input exits at once.
 
 ## Events
 

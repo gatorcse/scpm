@@ -58,6 +58,9 @@ final class Server(out: Output, badEnvironment: Option[String]):
               out.error(Some(request.id), ResolverError("bad_environment", s"the resolver's environment is not clean: $what", BadEnvironmentData(what)).body)
               code = Some(2)
             case None if request.method == "shutdown" =>
+              // Requests still running are answered first; then `shutdown`'s own response.
+              pool.shutdown()
+              pool.awaitTermination(Long.MaxValue, java.util.concurrent.TimeUnit.NANOSECONDS)
               out.result(request.id, Empty())
               code = Some(0)
             case None => handle(request)

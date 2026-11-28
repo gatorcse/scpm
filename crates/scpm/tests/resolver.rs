@@ -13,19 +13,31 @@ use assert_cmd::Command;
 use serde_json::Value;
 use support::Server;
 
+/// Skips a test whose tools are missing, except in CI, where they must be there.
+fn skip(why: &str) {
+    if std::env::var_os("CI").is_some() {
+        panic!("{why}, and CI must run this test");
+    }
+    eprintln!("skipping: {why}");
+}
+
 fn stage() -> Option<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../worker/target/out/jvm/resolver-stage");
     if dir.join("classpath.txt").is_file() {
         Some(dir)
     } else {
-        eprintln!("skipping: the resolver's jars are not built (run `sbt resolver/stage` in worker/)");
+        skip("the resolver's jars are not built (run `sbt resolver/stage` in worker/)");
         None
     }
 }
 
 fn cs_available() -> bool {
     let bin = std::env::var("SCPM_CS").unwrap_or_else(|_| "cs".into());
-    StdCommand::new(bin).arg("version").output().is_ok_and(|o| o.status.success())
+    let ok = StdCommand::new(bin).arg("version").output().is_ok_and(|o| o.status.success());
+    if !ok {
+        skip("the coursier CLI `cs` is not available");
+    }
+    ok
 }
 
 /// `scpm` with the sidecar, no boot entries (the fixture repositories can't serve them), an
@@ -215,6 +227,14 @@ fn one_lock_holds_every_systems_classpath() {
     assert!(paths.iter().any(|p| p.ends_with("nat-1.0-linux-x86_64.jar")), "{paths:?}");
     assert!(paths.iter().any(|p| p.ends_with("epoll-4.1.115.Final-linux-x86_64.jar")), "{paths:?}");
     assert!(!paths.iter().any(|p| p.contains("osx") || p.contains("winonly") || p.ends_with(".pom")), "{paths:?}");
+    // And it never starts the sidecar: an unusable resolver classpath doesn't matter.
+    scpm(ws.path(), empty.path())
+        .env_remove("SCPM_JAVA")
+        .env("SCPM_JAVA_HOME", &linux)
+        .env("SCPM_RESOLVER_CLASSPATH", "/nonexistent/resolver.jar")
+        .args(["install", "--frozen"])
+        .assert()
+        .success();
 
     // Unchanged, the lock is fresh.
     let again = json_install(ws.path(), cache.path());
@@ -243,6 +263,14 @@ fn mapping_table_changes_relock_only_affected_variants() {
     let summary = json_install(ws.path(), cache.path());
     assert_eq!(summary["relocked"], serde_json::json!(["a@jvm"]), "{summary}");
     assert_eq!(lock(ws.path())["nativeMappings"], 1);
+    // The same with the header edited as text: the re-lock gives the lock it had, and the
+    // header is raised anyway, so the next run re-locks nothing.
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\nnativeMappings: 1\n"), "{text}");
+    fs::write(&path, text.replace("\nnativeMappings: 1\n", "\nnativeMappings: 0\n")).unwrap();
+    assert_eq!(json_install(ws.path(), cache.path())["relocked"], serde_json::json!(["a@jvm"]));
+    assert_eq!(fs::read_to_string(&path).unwrap(), text, "header raised; nothing else changed");
+    assert_eq!(json_install(ws.path(), cache.path())["relocked"], serde_json::json!([]));
     // M < N: nothing to re-lock only restores; anything to re-lock stops.
     edit_header(99);
     let summary = json_install(ws.path(), cache.path());
@@ -359,47 +387,122 @@ fn the_resolvers_jars_come_from_the_pinned_list() {
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect();
+    // Assets are named by their sha256.
     let mut files = HashMap::new();
     let mut list = String::from("release none\n");
     for n in &names {
         let bytes = fs::read(stage.join(n)).unwrap();
-        list.push_str(&format!("{} {} {n}\n", scpm::fetch::hex(&sha2_digest(&bytes)), bytes.len()));
-        files.insert(format!("/jars/{n}"), bytes);
+        let sha = scpm::fetch::hex(&sha2_digest(&bytes));
+        list.push_str(&format!("{sha} {} {n}\n", bytes.len()));
+        files.insert(format!("/jars/{sha}.jar"), bytes);
     }
-    let jars = Server::maven(files, None);
+    let jars = Server::maven(files.clone(), None);
     let fixture = fixture();
     let ws = tempfile::tempdir().unwrap();
     workspace(ws.path(), &fixture, "  jdk: 25\n");
     fs::write(ws.path().join("list.txt"), &list).unwrap();
-    fs::write(ws.path().join(".user-config.yaml"), format!("resolverMirror: {}\n", jars.url("/jars/"))).unwrap();
+    // Credentials that match the mirror's origin, from the user config and from coursier's own
+    // file: neither may be sent there.
+    let origin = jars.url("/");
+    let user_config = |mirror: &str| {
+        format!("resolverMirror: {mirror}\ncredentials:\n  - {{url: '{origin}', user: alice, password: s3cret}}\n")
+    };
+    fs::write(ws.path().join(".user-config.yaml"), user_config(&jars.url("/jars/"))).unwrap();
+    let coursier_credentials = ws.path().join("credentials.properties");
+    fs::write(
+        &coursier_credentials,
+        "m.host=127.0.0.1\nm.username=bob\nm.password=hunter2\nm.auto=true\nm.https-only=false\n",
+    )
+    .unwrap();
     // A private cache home for `<cache>/scpm/resolver`.
     let home = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let with_home = |cmd: &mut Command| {
-        cmd.env("HOME", home.path()).env("XDG_CACHE_HOME", home.path().join(".cache"));
+    let in_home = |cmd: &mut Command, home: &Path| {
+        cmd.env("HOME", home)
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("COURSIER_CREDENTIALS", &coursier_credentials)
+            .env("SCPM_TEST_RESOLVER_LIST", ws.path().join("list.txt"));
     };
     let mut cmd = scpm(ws.path(), cache.path());
-    with_home(&mut cmd);
-    cmd.env("SCPM_TEST_RESOLVER_LIST", ws.path().join("list.txt")).arg("install").assert().success();
+    in_home(&mut cmd, home.path());
+    cmd.arg("install").assert().success();
     let reqs = jars.requests.lock().unwrap().clone();
     assert_eq!(reqs.iter().filter(|r| r.method == "GET").count(), names.len(), "{reqs:?}");
-    assert!(reqs.iter().all(|r| r.authorization.is_none()), "no credentials on the resolver's jars");
+    assert!(reqs.iter().all(|r| r.authorization.is_none()), "no credentials on the resolver's jars: {reqs:?}");
     let resolver_cache = walk(home.path());
     assert!(resolver_cache.iter().filter(|p| p.to_string_lossy().contains("scpm/resolver/")).count() >= names.len());
 
-    // A jar that doesn't match its pin is refused.
-    let bad = list.replacen(&list.lines().nth(1).unwrap()[..64], &"0".repeat(64), 1);
-    fs::write(ws.path().join("list.txt"), bad).unwrap();
-    let mut cmd = scpm(ws.path(), cache.path());
-    with_home(&mut cmd);
+    // A served jar that doesn't match its pin is refused.
+    let mut tampered = files;
+    let (first, bytes) = tampered.iter_mut().next().unwrap();
+    bytes.reverse();
+    let first = first.clone();
+    let tampered = Server::maven(tampered, None);
+    fs::write(ws.path().join(".user-config.yaml"), user_config(&tampered.url("/jars/"))).unwrap();
     fs::remove_file(ws.path().join("scpm-lock.yaml")).unwrap();
-    cmd.env("SCPM_TEST_RESOLVER_LIST", ws.path().join("list.txt")).arg("install").assert().failure();
+    let fresh = tempfile::tempdir().unwrap();
+    let mut cmd = scpm(ws.path(), cache.path());
+    in_home(&mut cmd, fresh.path());
+    let out = cmd.arg("install").assert().failure();
+    let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(err.contains("sha256") || err.contains("checksum") || err.contains(&first[6..20]), "{err}");
+    assert!(!walk(fresh.path()).iter().any(|p| p.ends_with(&first[6..])), "a mismatching jar is never kept");
 
     // SCPM_RESOLVER_CLASSPATH replaces the pins, with a notice.
     let cp = std::env::join_paths(names.iter().map(|n| stage.join(n))).unwrap();
     let out = scpm(ws.path(), cache.path()).env("SCPM_RESOLVER_CLASSPATH", cp).arg("install").assert().success();
     let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
     assert!(err.contains("SCPM_RESOLVER_CLASSPATH replaces the resolver's jars"), "{err}");
+}
+
+/// A stand-in `scpm.resolver.Main` compiled from `body` (Java), on a classpath of its own.
+fn fake_resolver(dir: &Path, body: &str) -> Option<PathBuf> {
+    let Some(home) = scpm::worker::detected_java_home() else {
+        skip("no JDK home to compile a fake resolver with");
+        return None;
+    };
+    let src = dir.join("src/scpm/resolver/Main.java");
+    fs::create_dir_all(src.parent().unwrap()).unwrap();
+    fs::write(
+        &src,
+        format!(
+            "package scpm.resolver;\nimport java.io.*;\npublic class Main {{ public static void main(String[] a) throws Exception {{ {body} }} }}\n"
+        ),
+    )
+    .unwrap();
+    let classes = dir.join("classes");
+    let javac = home.join("bin").join(if cfg!(windows) { "javac.exe" } else { "javac" });
+    let ok = StdCommand::new(javac).arg("-d").arg(&classes).arg(&src).status().is_ok_and(|s| s.success());
+    assert!(ok, "javac failed");
+    Some(classes)
+}
+
+/// A sidecar that doesn't answer is stopped after its timeout, and the command fails saying
+/// so: at start-up (`initialize`), and in a request (`resolve`).
+#[test]
+fn a_sidecar_that_does_not_answer_is_stopped() {
+    let server = fixture();
+    let ws = tempfile::tempdir().unwrap();
+    workspace(ws.path(), &server, "  jdk: 25\n");
+    let cache = tempfile::tempdir().unwrap();
+    let silent = "Thread.sleep(Long.MAX_VALUE);";
+    // Answers `initialize` (id 1), then nothing.
+    let init_only = "BufferedReader in = new BufferedReader(new InputStreamReader(System.in)); in.readLine(); \
+        System.out.println(\"{\\\"id\\\":1,\\\"result\\\":{\\\"protocolVersion\\\":1}}\"); System.out.flush(); \
+        Thread.sleep(Long.MAX_VALUE);";
+    for (name, body, method) in [("silent", silent, "initialize"), ("init-only", init_only, "resolve")] {
+        let Some(classes) = fake_resolver(&ws.path().join(name), body) else { return };
+        let started = std::time::Instant::now();
+        let out = scpm(ws.path(), cache.path())
+            .env("SCPM_RESOLVER_CLASSPATH", &classes)
+            .env("SCPM_TEST_RESOLVER_TIMEOUT_MS", "1500")
+            .arg("install")
+            .assert()
+            .failure();
+        let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+        assert!(err.contains(&format!("did not answer `{method}`")), "{name}: {err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "{name}: stopped in time");
+    }
 }
 
 fn sha2_digest(bytes: &[u8]) -> Vec<u8> {

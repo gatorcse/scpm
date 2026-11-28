@@ -7,7 +7,9 @@
 //! release (or `resolverMirror`) into `<cache>/scpm/resolver/<sha256>.jar`.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -95,14 +97,16 @@ impl BootstrapList {
         Ok(BootstrapList { release, jars })
     }
 
-    /// Where each jar is downloaded from: `resolverMirror` + name, else the release's asset.
+    /// Where each jar is downloaded from: `resolverMirror`, else the release's assets, plus the
+    /// asset name `<sha256>.jar`. Content-addressed, so one mirror directory serves every
+    /// release, and an asset can never be replaced by other bytes under the same name.
     pub fn urls(&self, mirror: Option<&str>) -> Option<Vec<String>> {
         let base = match (mirror, &self.release) {
             (Some(m), _) => m.to_string(),
             (None, Some(r)) => format!("{RELEASE_BASE}/{r}/"),
             (None, None) => return None,
         };
-        Some(self.jars.iter().map(|j| format!("{base}{}", j.name)).collect())
+        Some(self.jars.iter().map(|j| format!("{base}{}.jar", j.sha256)).collect())
     }
 }
 
@@ -123,31 +127,45 @@ pub fn classpath(machine: &Machine) -> Result<(Vec<PathBuf>, Option<String>), Re
         );
         return Ok((jars, Some(notice)));
     }
-    let list = match std::env::var_os(TEST_LIST_ENV).filter(|c| !c.is_empty()) {
-        Some(path) => std::fs::read_to_string(&path)
+    // The hidden test list exists in debug builds only, so a release binary's pins can't be
+    // swapped by an environment variable.
+    let test_list =
+        if cfg!(debug_assertions) { std::env::var_os(TEST_LIST_ENV).filter(|c| !c.is_empty()) } else { None };
+    let text = match &test_list {
+        Some(path) => std::fs::read_to_string(path)
             .map_err(|e| ResolverError::Setup(format!("{}: {e}", Path::new(&path).display())))?,
-        None => {
-            if let Some(jars) = local_build() {
-                return Ok((jars, None));
-            }
-            BOOTSTRAP_LIST.to_string()
-        }
+        None => BOOTSTRAP_LIST.to_string(),
     };
-    let list = BootstrapList::parse(&list)
+    let list = BootstrapList::parse(&text)
         .map_err(|e| ResolverError::Setup(format!("the resolver's built-in jar list is invalid: {e}")))?;
+    // A source checkout's own jars stand in for a development list, which names no release; a
+    // binary with a released list keeps its pins, unless the checkout's jars are used anyway, which
+    // is then said as for SCPM_RESOLVER_CLASSPATH.
+    if test_list.is_none()
+        && let Some((dir, jars)) = local_build()
+    {
+        if list.release.is_none() {
+            return Ok((jars, None));
+        }
+        let notice = format!(
+            "using the resolver jars built in {}, which are not checked against the sha256 values built into scpm",
+            dir.display()
+        );
+        return Ok((jars, Some(notice)));
+    }
     Ok((restore(&list, machine)?, None))
 }
 
 /// A source checkout's locally built jars (`sbt resolver/stage` in `worker/`), as the compile
 /// worker finds its own: `worker/target/out/jvm/resolver-stage` above the running binary.
-fn local_build() -> Option<Vec<PathBuf>> {
+fn local_build() -> Option<(PathBuf, Vec<PathBuf>)> {
     let exe = std::env::current_exe().ok()?;
     exe.ancestors().find_map(|dir| {
         let stage = dir.join("worker/target/out/jvm/resolver-stage");
         let names = std::fs::read_to_string(stage.join("classpath.txt")).ok()?;
         let jars: Vec<PathBuf> =
             names.lines().map(str::trim).filter(|l| !l.is_empty()).map(|n| stage.join(n)).collect();
-        jars.iter().all(|j| j.is_file()).then_some(jars)
+        jars.iter().all(|j| j.is_file()).then_some((stage, jars))
     })
 }
 
@@ -210,11 +228,12 @@ fn pem_bundle() -> Option<PathBuf> {
 /// The variables a sealed sidecar keeps: locale (so non-ASCII cache paths decode as for scpm),
 /// and on Windows what the OS needs. Everything else (`JAVA_TOOL_OPTIONS`, `COURSIER_*`, …)
 /// is cleared.
-fn allowed_env(inherited: impl Iterator<Item = (String, String)>) -> Vec<(String, String)> {
+/// Values are kept as they are (not necessarily UTF-8); names that aren't UTF-8 are none of these.
+fn allowed_env(inherited: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
     const WINDOWS: &[&str] = &["SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "TEMP", "TMP"];
     inherited
         .filter(|(k, _)| {
-            let upper = k.to_ascii_uppercase();
+            let Some(upper) = k.to_str().map(str::to_ascii_uppercase) else { return false };
             upper == "LANG" || upper.starts_with("LC_") || (cfg!(windows) && WINDOWS.contains(&upper.as_str()))
         })
         .collect()
@@ -236,6 +255,7 @@ pub struct Sidecar {
     worker: Worker,
     /// Set when the jars aren't pinned (`SCPM_RESOLVER_CLASSPATH`).
     pub notice: Option<String>,
+    timeouts: Timeouts,
 }
 
 #[derive(Serialize)]
@@ -251,7 +271,22 @@ struct ProxyParam<'a> {
 impl Sidecar {
     /// Starts the sidecar on the JDK `detect_java` finds (JDK 17 or newer) and initializes it.
     pub fn start(machine: &Machine) -> Result<Sidecar, ResolverError> {
+        // The JDK's own binary, the one whose `release` file was read: a shim or wrapper on PATH
+        // (asdf, jenv, mise, a site script) may not work in the sealed environment, or pick
+        // another JDK there.
+        let home = crate::system::worker_jdk().ok_or_else(|| {
+            ResolverError::Setup(format!(
+                "the resolver sidecar needs a JDK {}+, and no JDK home was found (only a `java` without one, or \
+                 none)\n  help: set SCPM_JAVA_HOME to a JDK",
+                crate::worker::MIN_JAVA
+            ))
+        })?;
+        let java = crate::worker::java_in_home(&home, "the detected JDK home")?;
         let (classpath, notice) = classpath(machine)?;
+        // Said when the sidecar starts, so a failing command shows it too.
+        if let Some(n) = &notice {
+            eprintln!("note: {n}");
+        }
         let dir = cache_dir()?;
         let home = dir.join("home");
         let config = dir.join("empty-config");
@@ -271,12 +306,13 @@ impl Sidecar {
             classpath: &classpath,
             main: MAIN_CLASS,
             jvm_options: &jvm_options,
-            env: allowed_env(std::env::vars()),
+            env: allowed_env(std::env::vars_os()),
             cwd: Some(&home),
             log_file: None,
             initialize: false,
             own_process_group: false,
             clear_env: true,
+            java: Some(java),
         };
         let worker = Worker::spawn(spec, |_| {})?;
         // A scheme whose environment proxy is unusable goes to a host that never resolves, as
@@ -293,7 +329,8 @@ impl Sidecar {
             https: https.as_ref(),
             no_proxy,
         });
-        let init = worker.request(
+        let sidecar = Sidecar { worker, notice, timeouts: Timeouts::get() };
+        let init = sidecar.call(
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
@@ -301,6 +338,7 @@ impl Sidecar {
                 "trust": {"pemBundle": pem_bundle()},
                 "userAgent": coursier::user_agent(),
             }),
+            sidecar.timeouts.initialize,
         )?;
         if init["protocolVersion"].as_u64() != Some(PROTOCOL_VERSION) {
             return Err(ResolverError::Setup(format!(
@@ -308,7 +346,18 @@ impl Sidecar {
                 init["protocolVersion"]
             )));
         }
-        Ok(Sidecar { worker, notice })
+        Ok(sidecar)
+    }
+
+    /// A request that must be answered within `limit`; otherwise the sidecar is killed.
+    fn call(&self, method: &str, params: Value, limit: Duration) -> Result<Value, ResolverError> {
+        match self.worker.request_timeout(method, params, Some(limit)) {
+            Err(e @ WorkerError::Timeout(_)) => {
+                self.worker.kill("was stopped: it did not answer in time");
+                Err(e.into())
+            }
+            other => Ok(other?),
+        }
     }
 
     /// Resolves every request in one call (the sidecar runs them concurrently). Each result is
@@ -338,9 +387,11 @@ impl Sidecar {
                 })
             })
             .collect();
-        let result = self
-            .worker
-            .request("resolve", json!({"repositories": repositories, "cache": cache, "requests": requests}))?;
+        let result = self.call(
+            "resolve",
+            json!({"repositories": repositories, "cache": cache, "requests": requests}),
+            self.timeouts.request,
+        )?;
         let results: Vec<RequestResult> = serde_json::from_value(result["results"].clone())
             .map_err(|e| ResolverError::Setup(format!("the resolver sidecar answered `resolve` with {e}")))?;
         Ok(results.into_iter().map(RequestResult::resolution).collect())
@@ -348,16 +399,43 @@ impl Sidecar {
 
     /// The versions of `org:name` in the repositories its group may come from, ascending.
     pub fn list_versions(&self, module: &str, repos: &[Repo], cache: &Path) -> Result<Vec<String>, ResolverError> {
-        let result = self.worker.request(
+        let result = self.call(
             "listVersions",
             json!({"repositories": repository_params(repos)?, "cache": cache, "module": module}),
+            self.timeouts.request,
         )?;
         Ok(result["versions"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect())
     }
 
-    /// Asks the sidecar to exit and waits for it.
+    /// Asks the sidecar to exit, and kills it if it doesn't within the shutdown timeout.
     pub fn shutdown(self) {
-        self.worker.shutdown();
+        let _ = self.worker.request_timeout("shutdown", json!({}), Some(self.timeouts.shutdown));
+        self.worker.close(Some(self.timeouts.shutdown));
+    }
+}
+
+/// How long the sidecar may take: to start and answer `initialize`, to answer one `resolve` or
+/// `listVersions` (a whole cold re-lock), and to exit after `shutdown`.
+#[derive(Debug, Clone, Copy)]
+struct Timeouts {
+    initialize: Duration,
+    request: Duration,
+    shutdown: Duration,
+}
+
+impl Timeouts {
+    fn get() -> Timeouts {
+        // Hidden, debug builds only: one short limit for everything, for tests.
+        #[cfg(debug_assertions)]
+        if let Some(ms) = std::env::var("SCPM_TEST_RESOLVER_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()) {
+            let d = Duration::from_millis(ms);
+            return Timeouts { initialize: d, request: d, shutdown: d };
+        }
+        Timeouts {
+            initialize: Duration::from_secs(60),
+            request: Duration::from_secs(30 * 60),
+            shutdown: Duration::from_secs(10),
+        }
     }
 }
 
@@ -521,8 +599,8 @@ mod tests {
     fn lists_name_their_urls() {
         let sha = "a".repeat(64);
         let list = BootstrapList::parse(&format!("# c\nrelease v1.2.0\n{sha} 12 x-1.jar\n")).unwrap();
-        assert_eq!(list.urls(None).unwrap(), [format!("{RELEASE_BASE}/v1.2.0/x-1.jar")]);
-        assert_eq!(list.urls(Some("https://m.example/r/")).unwrap(), ["https://m.example/r/x-1.jar"]);
+        assert_eq!(list.urls(None).unwrap(), [format!("{RELEASE_BASE}/v1.2.0/{sha}.jar")]);
+        assert_eq!(list.urls(Some("https://m.example/r/")).unwrap(), [format!("https://m.example/r/{sha}.jar")]);
         let dev = BootstrapList::parse(&format!("release none\n{sha} 12 x-1.jar\n")).unwrap();
         assert_eq!(dev.release, None);
         assert!(dev.urls(None).is_none() && dev.urls(Some("https://m/")).is_some());
@@ -543,9 +621,26 @@ mod tests {
             ("HOME", "/h"),
             ("PATH", "/bin"),
         ]
-        .map(|(k, v)| (k.to_string(), v.to_string()));
-        let kept: Vec<String> = allowed_env(inherited.into_iter()).into_iter().map(|(k, _)| k).collect();
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let kept: Vec<OsString> = allowed_env(inherited.into_iter()).into_iter().map(|(k, _)| k).collect();
         assert_eq!(kept, ["LANG", "LC_ALL"]);
+    }
+
+    /// Values that aren't UTF-8 pass through as they are, and never panic.
+    #[cfg(unix)]
+    #[test]
+    fn environment_values_need_not_be_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let odd = OsString::from_vec(vec![b'C', b'.', 0xff]);
+        let inherited = [(OsString::from("LC_CTYPE"), odd.clone()), (OsString::from_vec(vec![0xfe]), odd.clone())];
+        assert_eq!(allowed_env(inherited.into_iter()), [(OsString::from("LC_CTYPE"), odd)]);
+    }
+
+    #[test]
+    fn released_lists_name_assets_by_sha256() {
+        let sha = "b".repeat(64);
+        let list = BootstrapList::parse(&format!("release v2.0.0\n{sha} 1 scpm-resolver_3-2.0.0.jar\n")).unwrap();
+        assert_eq!(list.urls(None).unwrap(), [format!("{RELEASE_BASE}/v2.0.0/{sha}.jar")]);
     }
 
     #[test]

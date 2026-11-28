@@ -54,8 +54,6 @@ pub struct Table {
     pub changes: &'static [Change],
 }
 
-const NETTY_EPOLL: &[(&str, &str)] = &[("linux-aarch64", "linux-aarch_64"), ("linux-x86_64", "linux-x86_64")];
-const NETTY_KQUEUE: &[(&str, &str)] = &[("macos-aarch64", "osx-aarch_64"), ("macos-x86_64", "osx-x86_64")];
 const LWJGL: &[(&str, &str)] = &[
     ("linux-aarch64", "natives-linux-arm64"),
     ("linux-x86_64", "natives-linux"),
@@ -66,16 +64,37 @@ const LWJGL: &[(&str, &str)] = &[
 ];
 /// LWJGL publishes `natives-macos-arm64` and the other arm64 classifiers from 3.3.0.
 const LWJGL_RANGE: Range = Range { from: Some("3.3.0"), to: None };
-const NETTY_41: Range = Range { from: Some("4.1.0"), to: None };
-const NETTY_42: Range = Range { from: Some("4.2.0"), to: None };
 
-/// scpm's built-in table. Start small: the transports and libraries people hit first.
+// Netty, as published on Maven Central: epoll's x86_64 jar exists from 4.1.0; an aarch64 one
+// from 4.1.50, named `linux-aarch64` until 4.1.54 and `linux-aarch_64` from 4.1.55. kqueue
+// starts at 4.1.11 (`osx-x86_64`), with `osx-aarch_64` from 4.1.68. io_uring left the
+// incubator in 4.2.0. Bounds carry `.Final`, as Netty's versions do.
+const EPOLL: &str = "io.netty:netty-transport-native-epoll";
+const KQUEUE: &str = "io.netty:netty-transport-native-kqueue";
+const IO_URING: &str = "io.netty:netty-transport-native-io_uring";
+const FROM_4_1_0: Range = Range { from: Some("4.1.0.Final"), to: None };
+const AARCH64_4_1_50: Range = Range { from: Some("4.1.50.Final"), to: Some("4.1.55.Final") };
+const FROM_4_1_55: Range = Range { from: Some("4.1.55.Final"), to: None };
+const FROM_4_1_11: Range = Range { from: Some("4.1.11.Final"), to: None };
+const FROM_4_1_68: Range = Range { from: Some("4.1.68.Final"), to: None };
+const FROM_4_2_0: Range = Range { from: Some("4.2.0.Final"), to: None };
+
+/// scpm's built-in table. Start small: the transports and libraries people hit first. A module
+/// may have several rows, each for a version range and the systems it covers there; a system no
+/// row covers at a version gets no native jar.
 pub const BUILT_IN: Table = Table {
     version: 1,
     mappings: &[
-        Mapping { module: "io.netty:netty-transport-native-epoll", range: NETTY_41, natives: NETTY_EPOLL },
-        Mapping { module: "io.netty:netty-transport-native-kqueue", range: NETTY_41, natives: NETTY_KQUEUE },
-        Mapping { module: "io.netty:netty-transport-native-io_uring", range: NETTY_42, natives: NETTY_EPOLL },
+        Mapping { module: EPOLL, range: FROM_4_1_0, natives: &[("linux-x86_64", "linux-x86_64")] },
+        Mapping { module: EPOLL, range: AARCH64_4_1_50, natives: &[("linux-aarch64", "linux-aarch64")] },
+        Mapping { module: EPOLL, range: FROM_4_1_55, natives: &[("linux-aarch64", "linux-aarch_64")] },
+        Mapping { module: KQUEUE, range: FROM_4_1_11, natives: &[("macos-x86_64", "osx-x86_64")] },
+        Mapping { module: KQUEUE, range: FROM_4_1_68, natives: &[("macos-aarch64", "osx-aarch_64")] },
+        Mapping {
+            module: IO_URING,
+            range: FROM_4_2_0,
+            natives: &[("linux-aarch64", "linux-aarch_64"), ("linux-x86_64", "linux-x86_64")],
+        },
         Mapping { module: "org.lwjgl:lwjgl", range: LWJGL_RANGE, natives: LWJGL },
         Mapping { module: "org.lwjgl:lwjgl-glfw", range: LWJGL_RANGE, natives: LWJGL },
         Mapping { module: "org.lwjgl:lwjgl-jemalloc", range: LWJGL_RANGE, natives: LWJGL },
@@ -84,9 +103,9 @@ pub const BUILT_IN: Table = Table {
         Mapping { module: "org.lwjgl:lwjgl-stb", range: LWJGL_RANGE, natives: LWJGL },
     ],
     changes: &[
-        Change { version: 1, module: "io.netty:netty-transport-native-epoll", touched: NETTY_41 },
-        Change { version: 1, module: "io.netty:netty-transport-native-kqueue", touched: NETTY_41 },
-        Change { version: 1, module: "io.netty:netty-transport-native-io_uring", touched: NETTY_42 },
+        Change { version: 1, module: EPOLL, touched: FROM_4_1_0 },
+        Change { version: 1, module: KQUEUE, touched: FROM_4_1_11 },
+        Change { version: 1, module: IO_URING, touched: FROM_4_2_0 },
         Change { version: 1, module: "org.lwjgl:lwjgl", touched: LWJGL_RANGE },
         Change { version: 1, module: "org.lwjgl:lwjgl-glfw", touched: LWJGL_RANGE },
         Change { version: 1, module: "org.lwjgl:lwjgl-jemalloc", touched: LWJGL_RANGE },
@@ -128,6 +147,16 @@ pub fn specs(table: &Table, overrides: &[(String, BTreeMap<String, String>)]) ->
     out
 }
 
+/// The classifier of `module`'s native jar for `system` at `version`, if a row maps one. The
+/// sidecar applies the same rule to the specs it gets (the first row that maps the system).
+pub fn classifier<'t>(table: &'t Table, module: &str, version: &str, system: &str) -> Option<&'t str> {
+    table
+        .mappings
+        .iter()
+        .filter(|m| m.module == module && m.range.contains(version))
+        .find_map(|m| m.natives.iter().find(|(s, _)| *s == system).map(|(_, c)| *c))
+}
+
 /// Whether a lock key (`g:a:v[:classifier][@type]`) is a module at a version inside a touched
 /// range of a change in `(from, to]` (design §5.4, the M > N rule).
 pub fn touched(table: &Table, from: u32, to: u32, key: &str) -> bool {
@@ -143,12 +172,32 @@ mod tests {
 
     #[test]
     fn ranges_and_intervals() {
-        assert!(NETTY_41.contains("4.1.115.Final") && NETTY_41.contains("4.2.0.Final"));
-        assert!(!NETTY_42.contains("4.1.115.Final"));
-        assert_eq!(NETTY_41.interval().as_deref(), Some("[4.1.0,)"));
+        assert!(FROM_4_1_0.contains("4.1.115.Final") && FROM_4_1_0.contains("4.2.0.Final"));
+        assert!(!FROM_4_2_0.contains("4.1.115.Final"));
+        assert_eq!(FROM_4_1_0.interval().as_deref(), Some("[4.1.0.Final,)"));
+        assert_eq!(AARCH64_4_1_50.interval().as_deref(), Some("[4.1.50.Final,4.1.55.Final)"));
         assert_eq!(Range::ALL.interval(), None);
         let narrow = Range { from: Some("2"), to: Some("3") };
         assert!(narrow.contains("2.5") && !narrow.contains("3.0") && !narrow.contains("1.9"));
+    }
+
+    /// Netty's classifiers as published on Maven Central, per version.
+    #[test]
+    fn netty_classifiers_follow_what_central_publishes() {
+        let c = |module, version, system| classifier(&BUILT_IN, module, version, system);
+        assert_eq!(c(EPOLL, "4.1.30.Final", "linux-x86_64"), Some("linux-x86_64"));
+        assert_eq!(c(EPOLL, "4.1.30.Final", "linux-aarch64"), None, "no aarch64 jar before 4.1.50");
+        assert_eq!(c(EPOLL, "4.1.52.Final", "linux-aarch64"), Some("linux-aarch64"));
+        assert_eq!(c(EPOLL, "4.1.55.Final", "linux-aarch64"), Some("linux-aarch_64"));
+        assert_eq!(c(EPOLL, "4.1.115.Final", "linux-aarch64"), Some("linux-aarch_64"));
+        assert_eq!(c(EPOLL, "4.1.115.Final", "macos-aarch64"), None);
+        assert_eq!(c(KQUEUE, "4.1.10.Final", "macos-x86_64"), None, "kqueue starts at 4.1.11");
+        assert_eq!(c(KQUEUE, "4.1.20.Final", "macos-x86_64"), Some("osx-x86_64"));
+        assert_eq!(c(KQUEUE, "4.1.60.Final", "macos-aarch64"), None, "osx-aarch_64 from 4.1.68");
+        assert_eq!(c(KQUEUE, "4.1.68.Final", "macos-aarch64"), Some("osx-aarch_64"));
+        assert_eq!(c(IO_URING, "4.2.1.Final", "linux-aarch64"), Some("linux-aarch_64"));
+        assert_eq!(c("org.lwjgl:lwjgl", "3.3.6", "windows-aarch64"), Some("natives-windows-arm64"));
+        assert_eq!(c("org.lwjgl:lwjgl", "3.2.3", "linux-x86_64"), None);
     }
 
     #[test]
@@ -171,7 +220,8 @@ mod tests {
         let specs = specs(&BUILT_IN, &[(epoll.clone(), mine.clone()), (epoll.clone(), BTreeMap::new())]);
         let found: Vec<&NativeSpec> = specs.iter().filter(|s| s.module == epoll).collect();
         assert_eq!(found, [&NativeSpec { module: epoll, versions: None, natives: mine }], "first wins, all versions");
-        assert_eq!(specs.len(), BUILT_IN.mappings.len());
+        // epoll's three rows became the one override.
+        assert_eq!(specs.len(), BUILT_IN.mappings.len() - 2);
     }
 
     /// Design §5.4's M > N rule, with a table that changed and deleted entries.

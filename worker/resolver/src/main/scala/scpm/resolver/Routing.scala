@@ -28,8 +28,18 @@ object Groups:
  * asked for a module and for its versions. `find0` returns the underlying repository as the
  * `ArtifactSource`, so artifacts (Gradle module ones included) come from it.
  */
-final class Routed(val underlying: Repository, val id: String, allows: Module => Boolean) extends Repository:
+final class Routed(
+    val underlying: Repository,
+    val id: String,
+    allows: Module => Boolean,
+    /** The ids of the configured repositories sharing this URL (one coursier repository). */
+    val sharing: Seq[String] = Nil,
+    /** The URL contacted. */
+    val url: String = ""
+) extends Repository:
   override def repr: String = underlying.repr
+
+  def allowsModule(module: Module): Boolean = allows(module)
 
   private def denied[F[_], A](module: Module)(using F: Monad[F]): EitherT[F, String, A] =
     EitherT(F.point(Left(s"${module.repr} is not routed to $id")))

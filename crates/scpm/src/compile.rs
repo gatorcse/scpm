@@ -607,6 +607,7 @@ impl WorkerSlot {
             initialize: false,
             own_process_group: false,
             clear_env: false,
+            java: None,
         };
         let w = install(&mut slot, Worker::spawn(spec, on_event)?, false)?;
         if let Err(e) = w.initialize(None) {

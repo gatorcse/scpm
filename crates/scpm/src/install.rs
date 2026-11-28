@@ -506,12 +506,11 @@ impl<'a> LazySidecar<'a> {
         Ok(self.cell.get())
     }
 
-    /// Stops the sidecar if it was started; its notice (unpinned jars), if any.
-    fn finish(self) -> Option<String> {
-        let sidecar = self.cell.into_inner()?;
-        let notice = sidecar.notice.clone();
-        sidecar.shutdown();
-        notice
+    /// Stops the sidecar if it was started.
+    fn finish(self) {
+        if let Some(sidecar) = self.cell.into_inner() {
+            sidecar.shutdown();
+        }
     }
 }
 
@@ -1182,6 +1181,16 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     .map_err(|e| with_notice(e, &repos, true))?;
 
     record_artifacts(&mut lock, all.iter().flat_map(|req| results[*req].artifacts()), &repos)?;
+    // Systems a mapped module gets no native jar on (design §5.4): a note, never an error.
+    if resolver.full_context() {
+        for req in requests.values() {
+            for note in native_notes(req, &results[req], &ctx.systems) {
+                if !notes.contains(&note) {
+                    notes.push(note);
+                }
+            }
+        }
+    }
     for (name, req) in &boot_requests {
         lock.boot.insert(name.clone(), results[req].classpath(Vec::new()));
     }
@@ -1234,16 +1243,17 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
 
     // Whenever a sidecar install writes the lock at all, every variant was re-locked against
     // this scpm's mapping table (affected ones in this run), so the header becomes its version;
-    // a newer header (only possible when nothing re-locked) stays (design §5.4).
+    // a newer header (only possible when nothing re-locked) stays (design §5.4). A re-lock
+    // always raises it, even one whose result equals the lock: otherwise it would repeat.
     if resolver.full_context()
         && !opts.frozen
         && previous.native_mappings.is_none_or(|n| n <= table.version)
-        && std::fs::read_to_string(ws.root.join(crate::lockfile::LOCK_FILE)).ok() != Some(lock.to_yaml())
+        && (relocks || std::fs::read_to_string(ws.root.join(crate::lockfile::LOCK_FILE)).ok() != Some(lock.to_yaml()))
     {
         lock.native_mappings = Some(table.version);
     }
     let lockfile_written = if opts.frozen { false } else { lock.write(&ws.root)? };
-    let sidecar_notice = sidecar.finish();
+    sidecar.finish();
     // `cs` applies only the JDK part of the context (design §5.4, "Phase 1 limit").
     let resolved_on =
         (resolver == Resolver::Cs && (!stale.is_empty() || !missing_boot.is_empty())).then(HostPlatform::current);
@@ -1265,9 +1275,8 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     let fetch = fetch::fetch_all(items, FetchOptions { verify: opts.verify, proxy: machine.proxy.clone() })
         .map_err(|f| with_notice(InstallError::Fetch(f), &repos, ran_cs))?;
     let contacted = resolved_any || fetch.downloaded > 0;
-    let mut notices: Vec<String> =
+    let notices: Vec<String> =
         if contacted { crate::foreign::take_notice(&repos, ran_cs).into_iter().collect() } else { Vec::new() };
-    notices.extend(sidecar_notice);
     warnings.extend(fetch.warnings.iter().cloned());
     if fetch.repaired > 0 {
         warnings.push(format!(
@@ -1364,6 +1373,88 @@ impl Resolver {
             Resolver::Sidecar => true,
         }
     }
+}
+
+/// The systems a mapped module on a classpath got no native jar for (design §5.4): no mapping
+/// row covers the system at the resolved version (a library that doesn't support it, or a
+/// version older than its native jars), or the repository lacks the mapped jar, which the
+/// sidecar leaves out rather than failing the resolution. One note per module and version.
+fn native_notes(req: &ResolveRequest, res: &Resolution, systems: &[String]) -> Vec<String> {
+    if req.natives.is_empty() {
+        return Vec::new();
+    }
+    // Keys on each system.
+    let on: BTreeMap<&str, BTreeSet<&str>> = systems
+        .iter()
+        .map(|s| {
+            let keys: BTreeSet<&str> = match res {
+                Resolution::Merged(list) => list
+                    .iter()
+                    .filter(|(_, sys)| sys.as_ref().is_none_or(|l| l.contains(s)))
+                    .map(|(a, _)| a.key.as_str())
+                    .collect(),
+                Resolution::BySystem(m) => m.get(s).into_iter().flatten().map(|a| a.key.as_str()).collect(),
+            };
+            (s.as_str(), keys)
+        })
+        .collect();
+    let mains: BTreeSet<&str> =
+        on.values().flatten().copied().filter(|k| k.split(':').count() == 3 && !k.contains('@')).collect();
+    let mut notes = Vec::new();
+    for key in mains {
+        let mut parts = key.split(':');
+        let (Some(g), Some(a), Some(v)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        let module = format!("{g}:{a}");
+        let rows: Vec<&crate::natives::NativeSpec> = req.natives.iter().filter(|n| n.module == module).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        let mut unmapped = Vec::new();
+        let mut absent = Vec::new();
+        for s in systems.iter().filter(|s| on[s.as_str()].contains(key)) {
+            let classifier = rows
+                .iter()
+                .filter(|r| r.versions.as_deref().is_none_or(|i| interval_contains(i, v)))
+                .find_map(|r| r.natives.get(s));
+            match classifier {
+                None => unmapped.push(s.as_str()),
+                Some(c) if !on[s.as_str()].contains(format!("{key}:{c}").as_str()) => absent.push(format!("{s} ({c})")),
+                Some(_) => {}
+            }
+        }
+        if !unmapped.is_empty() {
+            notes.push(format!(
+                "{key} gets no native jar on {}: no native mapping covers {} at this version",
+                unmapped.join(", "),
+                if unmapped.len() == 1 { "that system" } else { "those systems" }
+            ));
+        }
+        if !absent.is_empty() {
+            notes.push(format!(
+                "{key} gets no native jar on {}: its repository doesn't have the mapped classifier",
+                absent.join(", ")
+            ));
+        }
+    }
+    notes
+}
+
+/// Whether a Maven interval (`[a,b)`, `[a,)`, …) contains `version`.
+fn interval_contains(interval: &str, version: &str) -> bool {
+    use crate::semver::MavenVersion;
+    let t = interval.trim();
+    let (Some(open), Some(close)) = (t.chars().next(), t.chars().last()) else { return false };
+    let Some((lo, hi)) = t.get(1..t.len() - 1).and_then(|inner| inner.split_once(',')) else { return false };
+    let v = MavenVersion::parse(version);
+    let lo_ok = lo.trim().is_empty() || {
+        let b = MavenVersion::parse(lo.trim());
+        if open == '[' { v >= b } else { v > b }
+    };
+    let hi_ok = hi.trim().is_empty() || {
+        let b = MavenVersion::parse(hi.trim());
+        if close == ']' { v <= b } else { v < b }
+    };
+    lo_ok && hi_ok
 }
 
 /// Resolves every request in one sidecar call (it runs them concurrently, each for every
@@ -1945,6 +2036,64 @@ mod tests {
                 jdk: "21".into()
             }
         );
+    }
+
+    #[test]
+    fn native_classifiers_must_be_plain_names() {
+        for bad in ["''", "'../x'", "'a/b'", "'a\\b'"] {
+            let (dir, _, _) = workspace(&[("a", "{}\n")]);
+            std::fs::write(
+                dir.path().join("modules/a/scpm.yaml"),
+                format!("dependencies:\n  g:x: {{version: '1', natives: {{linux-x86_64: {bad}}}}}\n"),
+            )
+            .unwrap();
+            let err = crate::workspace::load(dir.path()).unwrap_err().to_string();
+            assert!(err.contains("natives: invalid classifier"), "{bad}: {err}");
+            std::fs::write(dir.path().join("modules/a/scpm.yaml"), "{}\n").unwrap();
+            std::fs::write(
+                dir.path().join("scpm-workspace.yaml"),
+                format!(
+                    "modules: ['modules/*']\ntoolchain:\n  scala: 3.9.0\nlock:\n  nativeClassifiers:\n    - {{module: 'g:x', natives: {{linux-x86_64: {bad}}}}}\n"
+                ),
+            )
+            .unwrap();
+            let err = crate::workspace::load(dir.path()).unwrap_err().to_string();
+            assert!(err.contains("lock.nativeClassifiers[0].natives") && err.contains("invalid classifier"), "{err}");
+        }
+    }
+
+    /// Systems a mapped module gets no native jar on are noted, whether no row maps them at the
+    /// version or the repository lacked the mapped jar.
+    #[test]
+    fn missing_native_jars_are_noted() {
+        let art = |k: &str| ResolvedArtifact { key: k.into(), file: PathBuf::from(k), url: String::new() };
+        let systems: Vec<String> = ["linux-aarch64", "linux-x86_64", "macos-aarch64"].map(String::from).to_vec();
+        let epoll = "io.netty:netty-transport-native-epoll";
+        let req =
+            ResolveRequest { natives: crate::natives::specs(&crate::natives::BUILT_IN, &[]), ..Default::default() };
+        // 4.1.30: no aarch64 jar exists, and macOS has no epoll at all.
+        let old = Resolution::Merged(vec![
+            (art(&format!("{epoll}:4.1.30.Final")), None),
+            (art(&format!("{epoll}:4.1.30.Final:linux-x86_64")), Some(vec!["linux-x86_64".into()])),
+        ]);
+        assert_eq!(
+            native_notes(&req, &old, &systems),
+            [format!(
+                "{epoll}:4.1.30.Final gets no native jar on linux-aarch64, macos-aarch64: no native mapping covers those systems at this version"
+            )]
+        );
+        // 4.1.115 maps linux-aarch_64, which this repository lacked.
+        let new = Resolution::Merged(vec![
+            (art(&format!("{epoll}:4.1.115.Final")), Some(vec!["linux-aarch64".into(), "linux-x86_64".into()])),
+            (art(&format!("{epoll}:4.1.115.Final:linux-x86_64")), Some(vec!["linux-x86_64".into()])),
+        ]);
+        assert_eq!(
+            native_notes(&req, &new, &systems),
+            [format!(
+                "{epoll}:4.1.115.Final gets no native jar on linux-aarch64 (linux-aarch_64): its repository doesn't have the mapped classifier"
+            )]
+        );
+        assert!(native_notes(&ResolveRequest::default(), &new, &systems).is_empty());
     }
 
     #[test]
