@@ -12,8 +12,14 @@ Two helpers speak this protocol:
 | `scpmd` (compile worker) | `scpm.worker.Main` | long-lived: many requests per process |
 | test runner | `scpm.testrunner.Main` | one process per test run (forked JVM, isolated classpath) |
 
-Later the same messages travel over a unix socket for the shared daemon. Framing does not
-change.
+The shared daemon (`scpm daemon serve`) speaks the same protocol to its clients over a Unix
+socket, renumbering request ids per client. A client that disconnects has its compiles
+cancelled; a client that stops reading its messages is disconnected. The daemon adds
+`daemon/status` (`{}` → status object) and `daemon/stop` (`{"force": false}` →
+`{"activeRequests": n}`; it then waits up to 30 s for active compiles, or cancels them with
+`force`). A `compile` sent to a stopping daemon fails with the error code `unavailable`;
+clients retry it once on a new connection. Clients always read their connection promptly
+(events are handled on another thread), so a slow terminal never stalls the daemon.
 
 ## Envelope
 

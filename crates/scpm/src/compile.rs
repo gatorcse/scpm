@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -215,7 +215,7 @@ fn plan(tc: &Toolchain, node: &Node, upstream: &[String], tools: &str) -> Result
         classpath.insert(0, (None, classes_dir(&ws.root, &v.id)));
     }
 
-    let mut scalac_options = v.scalac_options.clone();
+    let mut scalac_options = absolute_plugins(&ws.root, &v.scalac_options);
     let vlock = &tc.lock.variants[&v.id];
     for key in &vlock.compiler_plugins {
         scalac_options.push(format!("-Xplugin:{}", tc.file(key).display()));
@@ -299,6 +299,34 @@ fn plan(tc: &Toolchain, node: &Node, upstream: &[String], tools: &str) -> Result
     })
 }
 
+/// `-Xplugin:` paths relative to the workspace root, made absolute: the compiler would
+/// resolve them against its own working directory, which is the daemon's (or wherever scpm
+/// was started), not the workspace.
+fn absolute_plugins(root: &Path, options: &[String]) -> Vec<String> {
+    options
+        .iter()
+        .map(|o| match o.strip_prefix("-Xplugin:") {
+            // Comma-separated plugins, each a classpath (entries joined by the platform's
+            // path separator).
+            Some(plugins) => {
+                let plugins: Vec<String> = plugins
+                    .split(',')
+                    .map(|cp| {
+                        if cp.is_empty() {
+                            return String::new();
+                        }
+                        let entries = std::env::split_paths(cp).map(|e| root.join(e));
+                        std::env::join_paths(entries)
+                            .map_or_else(|_| cp.to_string(), |j| j.to_string_lossy().into_owned())
+                    })
+                    .collect();
+                format!("-Xplugin:{}", plugins.join(","))
+            }
+            None => o.clone(),
+        })
+        .collect()
+}
+
 /// Makes the edit paths of a quick-fix action workspace-relative.
 fn relative_edits(root: &Path, mut action: Value) -> Value {
     if let Some(edits) = action.get_mut("edits").and_then(Value::as_array_mut) {
@@ -348,44 +376,144 @@ fn diagnostic(root: &Path, task: &str, e: &Value) -> Diagnostic {
 struct Route {
     reporter: Option<Arc<Reporter>>,
     root: PathBuf,
+    /// Events of workers (connections) with this generation or older are dropped: they
+    /// belong to a cancelled command. A worker that was merely replaced (e.g. a retry on a
+    /// new daemon connection) keeps routing, so requests still in flight on it lose nothing.
+    cancelled_upto: u64,
 }
 
-/// A compile worker that can outlive one command (the MCP server and, later, the daemon keep
-/// it warm). Commands using one slot must not overlap.
-#[derive(Default)]
+/// How long to wait before trying the daemon again after it failed.
+const DAEMON_RETRY: Duration = Duration::from_secs(60);
+
+struct SlotWorker {
+    classpath: Vec<PathBuf>,
+    worker: Arc<Worker>,
+    daemon: bool,
+}
+
+/// A compile worker that can outlive one command: a connection to the shared daemon, or a
+/// worker JVM this process owns (in CI, with `--no-daemon`, or if the daemon can't start).
+/// The MCP server keeps one slot for its lifetime. Commands using one slot must not overlap.
 pub struct WorkerSlot {
-    worker: Mutex<Option<(Vec<PathBuf>, Arc<Worker>)>>,
+    worker: Mutex<Option<SlotWorker>>,
+    /// The installed worker, for [`WorkerSlot::cancel`] (which must not wait for `worker`,
+    /// held while a worker starts).
+    live: Mutex<Option<Arc<Worker>>>,
     route: Arc<Mutex<Route>>,
+    generations: AtomicU64,
+    use_daemon: bool,
+    /// After the daemon failed: when to try it again.
+    daemon_retry_at: Mutex<Option<Instant>>,
+    /// Set at the start of a command when a fallback worker should give way to the daemon.
+    retry_daemon: AtomicBool,
     cancelled: AtomicBool,
 }
 
+impl Default for WorkerSlot {
+    fn default() -> Self {
+        WorkerSlot {
+            worker: Mutex::new(None),
+            live: Mutex::new(None),
+            route: Arc::new(Mutex::new(Route::default())),
+            generations: AtomicU64::new(0),
+            use_daemon: crate::daemon::enabled(),
+            daemon_retry_at: Mutex::new(None),
+            retry_daemon: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+        }
+    }
+}
+
 impl WorkerSlot {
+    fn daemon_due(&self) -> bool {
+        self.use_daemon && self.daemon_retry_at.lock().expect("retry").is_none_or(|t| Instant::now() >= t)
+    }
+
+    /// At the start of a command: if we fell back to our own worker a while ago, try the
+    /// daemon again (nothing is in flight between commands, so switching is safe).
+    fn begin_command(&self) {
+        let fallback = self.worker.lock().expect("worker slot").as_ref().is_some_and(|w| !w.daemon);
+        self.retry_daemon.store(fallback && self.daemon_due(), Ordering::SeqCst);
+    }
+
     /// The running worker for `classpath`, starting (or restarting) it if needed.
     ///
-    /// The slot's lock is never held while waiting on a worker, so [`WorkerSlot::cancel`] (run
-    /// on the MCP reader thread) can't block behind a worker that hangs starting up.
+    /// The slot's lock is held while a worker starts, but [`WorkerSlot::cancel`] (run on the MCP
+    /// reader thread) never waits for it: it reaches the worker through `live`. A new worker is
+    /// published there before its handshake, so a cancel can kill one that hangs starting up.
     fn get(&self, classpath: Vec<PathBuf>, log: &Path) -> Result<Arc<Worker>, CompileError> {
         let cancelled = || Err(CompileError::Setup("cancelled".into()));
-        let old = {
-            let mut slot = self.worker.lock().expect("worker slot");
-            // Checked under the lock: `cancel` sets the flag before it takes the lock.
-            if self.cancelled.load(Ordering::SeqCst) {
-                return cancelled();
-            }
-            if let Some((cp, w)) = slot.as_ref()
-                && *cp == classpath
-                && w.is_alive()
-            {
-                return Ok(w.clone());
-            }
-            slot.take()
-        };
-        if let Some((_, old)) = old
-            && let Ok(old) = Arc::try_unwrap(old)
-        {
-            old.shutdown();
+        if self.cancelled.load(Ordering::SeqCst) {
+            return cancelled();
         }
+        let mut slot = self.worker.lock().expect("worker slot");
+        let retry = self.retry_daemon.swap(false, Ordering::SeqCst);
+        if let Some(s) = slot.as_ref()
+            && s.classpath == classpath
+            && s.worker.is_alive()
+            && !retry
+        {
+            return Ok(s.worker.clone());
+        }
+        let generation = self.generations.fetch_add(1, Ordering::SeqCst) + 1;
         let route = self.route.clone();
+        let on_event = move |event: Value| {
+            if event["t"] != "diagnostic" {
+                return;
+            }
+            let route = route.lock().expect("route");
+            if generation <= route.cancelled_upto {
+                return;
+            }
+            if let Some(reporter) = route.reporter.as_ref() {
+                let task = event["target"].as_str().unwrap_or_default();
+                reporter.emit(Event::Diagnostic(diagnostic(&route.root, task, &event)));
+            }
+        };
+        let install = |slot: &mut Option<SlotWorker>, w: Worker, daemon: bool| {
+            self.live.lock().expect("live").take();
+            if let Some(old) = slot.take()
+                && let Ok(old) = Arc::try_unwrap(old.worker)
+            {
+                old.shutdown();
+            }
+            let w = Arc::new(w);
+            *self.live.lock().expect("live") = Some(w.clone());
+            {
+                // A cancel that came in while the worker started applies to it too.
+                let route = self.route.lock().expect("route");
+                if self.cancelled.load(Ordering::SeqCst) {
+                    drop(route);
+                    w.kill("was stopped (request cancelled)");
+                    return Err(CompileError::Setup("cancelled".into()));
+                }
+            }
+            *slot = Some(SlotWorker { classpath: classpath.clone(), worker: w.clone(), daemon });
+            Ok(w)
+        };
+        if self.daemon_due() {
+            match crate::daemon::connect_or_start(&classpath, on_event.clone()) {
+                Ok(w) => {
+                    *self.daemon_retry_at.lock().expect("retry") = None;
+                    return install(&mut slot, w, true);
+                }
+                Err(e) => {
+                    eprintln!("warning: compiling without the shared daemon: {e}");
+                    *self.daemon_retry_at.lock().expect("retry") = Some(Instant::now() + DAEMON_RETRY);
+                    // Keep using our own worker if it is fine.
+                    if let Some(s) = slot.as_ref()
+                        && s.classpath == classpath
+                        && s.worker.is_alive()
+                    {
+                        return Ok(s.worker.clone());
+                    }
+                }
+            }
+        }
+        // A cancel during a slow daemon start: don't start a worker of our own either.
+        if self.cancelled.load(Ordering::SeqCst) {
+            return cancelled();
+        }
         let spec = worker::Spawn {
             name: "the compile worker",
             classpath: &classpath,
@@ -398,31 +526,11 @@ impl WorkerSlot {
             initialize: false,
             own_process_group: false,
         };
-        let w = Arc::new(Worker::spawn(spec, move |event| {
-            if event["t"] != "diagnostic" {
-                return;
-            }
-            let route = route.lock().expect("route");
-            if let Some(reporter) = route.reporter.as_ref() {
-                let task = event["target"].as_str().unwrap_or_default();
-                reporter.emit(Event::Diagnostic(diagnostic(&route.root, task, &event)));
-            }
-        })?);
-        {
-            let mut slot = self.worker.lock().expect("worker slot");
-            *slot = Some((classpath, w.clone()));
-            // A cancel that ran before the worker was published couldn't kill it.
-            if self.cancelled.load(Ordering::SeqCst) {
-                w.kill("was stopped (request cancelled)");
-                return cancelled();
-            }
-        }
-        if let Err(e) = w.handshake() {
+        let w = install(&mut slot, Worker::spawn(spec, on_event)?, false)?;
+        if let Err(e) = w.initialize(None) {
             // Don't keep a worker that failed its handshake (it may still be running).
-            let mut slot = self.worker.lock().expect("worker slot");
-            if slot.as_ref().is_some_and(|(_, s)| Arc::ptr_eq(s, &w)) {
-                slot.take();
-            }
+            slot.take();
+            self.live.lock().expect("live").take();
             w.kill("failed to start");
             return Err(e.into());
         }
@@ -430,11 +538,22 @@ impl WorkerSlot {
     }
 
     /// Cancels the current command (e.g. a cancelled MCP call): in-flight compiles fail with
-    /// `reason`, and no worker is (re)started until [`WorkerSlot::reset_cancel`].
+    /// `reason` (and are cancelled in the daemon), their late events are dropped, and no
+    /// worker is (re)started until [`WorkerSlot::reset_cancel`].
     pub fn cancel(&self, reason: &str) {
         self.cancelled.store(true, Ordering::SeqCst);
-        if let Some((_, w)) = self.worker.lock().expect("worker slot").as_ref() {
+        self.route.lock().expect("route").cancelled_upto = self.generations.load(Ordering::SeqCst);
+        if let Some(w) = self.live.lock().expect("live").as_ref() {
             w.kill(reason);
+        }
+    }
+
+    /// Forgets `w` (if it is still the slot's worker), so the next request gets a new one.
+    fn discard(&self, w: &Arc<Worker>) {
+        let mut slot = self.worker.lock().expect("worker slot");
+        if slot.as_ref().is_some_and(|s| Arc::ptr_eq(&s.worker, w)) {
+            slot.take();
+            self.live.lock().expect("live").take();
         }
     }
 
@@ -445,8 +564,9 @@ impl WorkerSlot {
 
     /// Stops the worker, if one is running.
     pub fn shutdown(&self) {
-        if let Some((_, w)) = self.worker.lock().expect("worker slot").take()
-            && let Ok(w) = Arc::try_unwrap(w)
+        self.live.lock().expect("live").take();
+        if let Some(s) = self.worker.lock().expect("worker slot").take()
+            && let Ok(w) = Arc::try_unwrap(s.worker)
         {
             w.shutdown();
         }
@@ -477,6 +597,7 @@ impl<'a> WorkerHandle<'a> {
             route.reporter = Some(reporter.clone());
             route.root = tc.ws.root.clone();
         }
+        slot.begin_command();
         WorkerHandle { tc, reporter, slot, owned, failed: Mutex::new(None) }
     }
 
@@ -494,6 +615,19 @@ impl<'a> WorkerHandle<'a> {
             *failed = Some(e.clone());
         }
         started
+    }
+
+    /// Sends a compile request. One that reaches a daemon while it stops (after its idle
+    /// timeout, or `scpm daemon stop`) is retried once on a new connection.
+    fn compile(&self, params: &Value) -> Result<Value, WorkerError> {
+        let w = self.get().map_err(WorkerError::Setup)?;
+        match w.request("compile", params.clone()) {
+            Err(WorkerError::Remote { code, .. }) if code == "unavailable" => {
+                self.slot.discard(&w);
+                self.get().map_err(WorkerError::Setup)?.request("compile", params.clone())
+            }
+            reply => reply,
+        }
     }
 
     pub fn shutdown(self) {
@@ -674,7 +808,7 @@ fn compile_plan(plan: &Plan, worker: &WorkerHandle) -> Result<Option<String>, Co
     }
     worker.reporter.emit(Event::TaskStart { task: task.clone() });
     let started = Instant::now();
-    let response = worker.get().map_err(WorkerError::Setup).and_then(|w| w.request("compile", plan.params.clone()));
+    let response = worker.compile(&plan.params);
     let elapsed = started.elapsed().as_millis() as u64;
     let result = match response {
         Ok(r) => r,
@@ -766,5 +900,19 @@ mod tests {
         // A directory where a file is expected is a real failure, not "already gone".
         fs::create_dir_all(&file).unwrap();
         assert!(remove_stale(&file, false).is_err());
+    }
+
+    #[test]
+    fn relative_plugin_paths_resolve_against_the_workspace() {
+        let root = Path::new("/ws");
+        let opts = ["-Xplugin:tools/a.jar,/abs/b.jar".to_string(), "-deprecation".to_string()];
+        assert_eq!(absolute_plugins(root, &opts), ["-Xplugin:/ws/tools/a.jar,/abs/b.jar", "-deprecation"]);
+        // One plugin whose classpath has two entries.
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let opts = [format!("-Xplugin:tools/p.jar{sep}tools/support.jar,c.jar")];
+        assert_eq!(
+            absolute_plugins(root, &opts),
+            [format!("-Xplugin:/ws/tools/p.jar{sep}/ws/tools/support.jar,/ws/c.jar")]
+        );
     }
 }

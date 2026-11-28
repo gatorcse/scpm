@@ -11,6 +11,7 @@ pub mod config;
 pub mod coord;
 pub mod coursier;
 pub mod credentials;
+pub mod daemon;
 pub mod diag;
 pub mod explain;
 pub mod fetch;
