@@ -210,7 +210,11 @@ fn pem_bundle() -> Option<PathBuf> {
     if !cfg!(target_os = "linux") {
         return None;
     }
-    let from_env = std::env::var_os("SSL_CERT_FILE").map(PathBuf::from).filter(|p| p.is_file());
+    // Absolute: the sidecar runs in its private home, not scpm's working directory.
+    let from_env = std::env::var_os("SSL_CERT_FILE")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .map(|p| std::path::absolute(&p).unwrap_or(p));
     from_env.or_else(|| {
         [
             "/etc/ssl/certs/ca-certificates.crt",
@@ -351,12 +355,29 @@ impl Sidecar {
     }
 
     /// A request that must be answered within `limit`; otherwise the sidecar is killed.
+    /// The deadline starts before the request is written, and a watchdog kills the process when
+    /// it passes: a JVM that stops reading its input would otherwise block the write itself.
     fn call(&self, method: &str, params: Value, limit: Duration) -> Result<Value, ResolverError> {
-        match self.worker.request_timeout(method, params, Some(limit)) {
-            Err(e @ WorkerError::Timeout(_)) => {
-                self.worker.kill("was stopped: it did not answer in time");
-                Err(e.into())
-            }
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let expired = std::sync::atomic::AtomicBool::new(false);
+        let result = std::thread::scope(|s| {
+            let expired = &expired;
+            s.spawn(move || {
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = finished.recv_timeout(limit) {
+                    expired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    self.worker.kill("was stopped: it did not answer in time");
+                }
+            });
+            let result = self.worker.request(method, params);
+            let _ = done.send(());
+            result
+        });
+        match result {
+            Err(_) if expired.load(std::sync::atomic::Ordering::SeqCst) => Err(WorkerError::Timeout(format!(
+                "the resolver sidecar did not answer `{method}` within {}s, and was stopped",
+                limit.as_secs_f64().ceil()
+            ))
+            .into()),
             other => Ok(other?),
         }
     }
@@ -446,24 +467,33 @@ impl Timeouts {
 /// for `cs`). A bearer token goes as basic auth for the user `token`; an entry from coursier's
 /// own sources scoped to a realm keeps it.
 fn repository_params(repos: &[Repo]) -> Result<Vec<Value>, ResolverError> {
+    repository_params_with(repos, &CoursierCredentials::load())
+}
+
+fn repository_params_with(repos: &[Repo], creds: &CoursierCredentials) -> Result<Vec<Value>, ResolverError> {
     let shared = coursier::shared_credentials(repos, &|var| std::env::var(var).ok(), &mut Vec::new())
         .map_err(|e| ResolverError::Setup(e.to_string()))?;
-    let coursier_creds = CoursierCredentials::load().restricted(&coursier::insecure_credential_origins(repos));
+    let coursier_creds = creds.restricted(&coursier::insecure_credential_origins(repos));
     Ok(repos
         .iter()
         .zip(shared)
         .map(|(r, shared)| {
             let url = r.fetch_url();
-            let auth = match shared {
+            let (auth, challenges) = match shared {
                 Some(a @ (Auth::Basic { .. } | Auth::Bearer(_))) => {
-                    Some(json!({"user": a.user(), "password": a.password()}))
+                    (Some(json!({"user": a.user(), "password": a.password()})), Vec::new())
                 }
                 None => match coursier_creds.find(url) {
-                    Some(c) => Some(json!({"user": c.user, "password": c.password})),
-                    None => coursier_creds
-                        .challenge_candidates(url)
-                        .first()
-                        .map(|c| json!({"user": c.user, "password": c.password, "realm": c.realm})),
+                    Some(c) => (Some(json!({"user": c.user, "password": c.password})), Vec::new()),
+                    // Every realm-scoped entry: the challenge decides which one applies.
+                    None => (
+                        None,
+                        coursier_creds
+                            .challenge_candidates(url)
+                            .iter()
+                            .map(|c| json!({"user": c.user, "password": c.password, "realm": c.realm}))
+                            .collect(),
+                    ),
                 },
             };
             let mut v = json!({"id": r.id, "url": url});
@@ -472,6 +502,9 @@ fn repository_params(repos: &[Repo]) -> Result<Vec<Value>, ResolverError> {
             }
             if let Some(a) = auth {
                 v["auth"] = a;
+            }
+            if !challenges.is_empty() {
+                v["challenges"] = json!(challenges);
             }
             v
         })
@@ -657,6 +690,23 @@ mod tests {
                 json!({"module": "g:a", "version": "1", "transitive": true, "exclusions": ["x:y"], "classifier": "sources"}),
                 json!({"module": "g:b", "version": "2", "transitive": false, "exclusions": [], "type": "aar"}),
             ]
+        );
+    }
+
+    /// Every realm-scoped coursier entry for a repository's origin is sent: which one applies is
+    /// decided by the realm a challenge names.
+    #[test]
+    fn every_realm_scoped_candidate_is_sent() {
+        let creds = CoursierCredentials::from_env_value("repo.example(R1) alice:pw1\nrepo.example(R2) bob:pw2\n");
+        let repos = vec![Repo { id: "r".into(), url: "https://repo.example/m/".into(), ..Default::default() }];
+        let params = repository_params_with(&repos, &creds).unwrap();
+        assert_eq!(params[0].get("auth"), None);
+        assert_eq!(
+            params[0]["challenges"],
+            json!([
+                {"user": "alice", "password": "pw1", "realm": "R1"},
+                {"user": "bob", "password": "pw2", "realm": "R2"},
+            ])
         );
     }
 

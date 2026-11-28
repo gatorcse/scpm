@@ -88,7 +88,15 @@ object InitializeResult:
 final case class AuthSpec(user: String, password: String, realm: Option[String] = None)
 
 /** A configured repository, mirrors already applied to `url`. */
-final case class RepoSpec(id: String, url: String, groups: Option[List[String]] = None, auth: Option[AuthSpec] = None)
+/** `challenges`: realm-scoped credentials from coursier's own sources, each sent only after a
+  * challenge naming its realm. */
+final case class RepoSpec(
+    id: String,
+    url: String,
+    groups: Option[List[String]] = None,
+    auth: Option[AuthSpec] = None,
+    challenges: List[AuthSpec] = Nil
+)
 
 /** `ttl` in seconds (absent: 24 h); `refresh` re-checks changing metadata whatever the TTL. */
 final case class CacheSpec(

@@ -463,8 +463,9 @@ pub struct DepDetails {
     /// Default `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transitive: Option<bool>,
-    /// System → classifier of this module's native jar (e.g. `linux-x86_64: linux-aarch_64`),
-    /// replacing scpm's built-in mapping for it; systems not listed get no native jar, and `{}`
+    /// System → classifier of this module's native jar (e.g. `linux-x86_64: linux-x86_64`),
+    /// replacing scpm's built-in mapping for it (and, in a preset or variant overlay, the whole
+    /// inherited map); systems not listed get no native jar, and `{}`
     /// turns the mapping off. Needs the resolver sidecar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub natives: Option<std::collections::BTreeMap<String, String>>,

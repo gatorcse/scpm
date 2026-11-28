@@ -145,8 +145,13 @@ final class Service(proxy: Option[ProxySpec], trust: Option[TrustSpec], userAgen
   ProxySelector.setDefault(Proxies(proxy.getOrElse(ProxySpec(noProxy = List("localhost", "127.0.0.1", "::1")))))
   private val sslFactory: SSLSocketFactory = Trust.socketFactory(trust)
   private val pool: ExecutorService = Service.daemonPool(Service.PoolSize, "scpm-resolver-download")
+  // Bounded orchestration: a request's thread waits for its systems' resolutions, and those wait
+  // for downloads, so each level has its own fixed pool (sharing one would deadlock once full),
+  // sized to the CPUs; downloads run on `pool`.
   private val requests: ExecutionContext =
-    ExecutionContext.fromExecutorService(Executors.newCachedThreadPool(Service.daemonFactory("scpm-resolver-system")))
+    ExecutionContext.fromExecutorService(Service.daemonPool(Service.Orchestration, "scpm-resolver-request"))
+  private val systemsEc: ExecutionContext =
+    ExecutionContext.fromExecutorService(Service.daemonPool(Service.Orchestration, "scpm-resolver-system"))
   // One throttle for the whole sidecar: a rate limit applies to the client as a whole.
   private val throttle: HostThrottle = HostThrottle(
     initialDelay = 1.second,
@@ -196,6 +201,18 @@ final class Service(proxy: Option[ProxySpec], trust: Option[TrustSpec], userAgen
                 throw ResolverError("transport", s"repository `$id`: $err", TransportData(id, url, err))
               case _ => ()
           }
+        // The metadata was served but gave no versions (unparseable, say): an error too, not an
+        // empty list. Only a metadata 404 with no listing is "no versions".
+        val metadataServed = cache.entries.exists((url, e) =>
+          Service.under(url, Some(r.url)) && url.endsWith("/maven-metadata.xml") && e.isRight
+        )
+        outcome.left.foreach { err =>
+          if metadataServed then
+            val url = cache.entries.collectFirst {
+              case (u, Right(_)) if Service.under(u, Some(r.url)) && u.endsWith("/maven-metadata.xml") => u
+            }.getOrElse(r.url)
+            throw ResolverError("transport", s"repository `$id` served $url, which gave no versions: $err", TransportData(id, url, err))
+        }
         val list = outcome.toOption.toList.flatMap(_.available0.map(_.repr)).distinct
         RepoVersions(id, list)
     }
@@ -222,10 +239,12 @@ final class Service(proxy: Option[ProxySpec], trust: Option[TrustSpec], userAgen
       )
     }
 
+  /** One credential per origin and realm: a repository's own (`auth`), and each realm-scoped
+    * candidate (`challenges`), sent only after a challenge naming its realm. */
   private def credentials(specs: List[RepoSpec]): Seq[DirectCredentials] =
     specs.flatMap { s =>
-      s.auth.flatMap(a => Service.origin(s.url).map(o => (o, a)))
-    }.distinctBy(_._1).map { (origin, a) =>
+      Service.origin(s.url).toList.flatMap(o => (s.auth.toList ++ s.challenges).map(a => (o, a)))
+    }.distinctBy((o, a) => (o, a.realm)).map { (origin, a) =>
       DirectCredentials(
         host = origin,
         usernameOpt = Some(a.user),
@@ -250,7 +269,8 @@ final class Service(proxy: Option[ProxySpec], trust: Option[TrustSpec], userAgen
       credentials = credentials(spec.repositories),
       logger = CacheLogger.nop,
       pool = pool,
-      ttl = Some(spec.ttl.fold(24.hours)(_.seconds)),
+      // `refresh`: changing metadata is always re-checked, whatever the TTL.
+      ttl = Some(if spec.refresh then Duration.Zero else spec.ttl.fold(24.hours)(_.seconds)),
       localArtifactsShouldBeCached = false,
       followHttpToHttpsRedirections = true,
       followHttpsToHttpRedirections = false,
@@ -287,7 +307,7 @@ final class Service(proxy: Option[ProxySpec], trust: Option[TrustSpec], userAgen
       val cache = fileCache(spec)
       val systems = req.systems.distinct.sorted
       if systems.isEmpty then throw ResolverError.plain("bad_request", s"${req.label}: no systems")
-      val perSystem = systems.map(s => Future(s -> resolveSystem(spec, repos, cache, req, s))(using requests))
+      val perSystem = systems.map(s => Future(s -> resolveSystem(spec, repos, cache, req, s))(using systemsEc))
       Merge.merge(perSystem.map(Await.result(_, Duration.Inf)).toMap) match
         case Right(list) => RequestResult(classpath = Some(list))
         case Left(by)    => RequestResult(bySystem = Some(by))
@@ -418,6 +438,9 @@ object Service:
   /** Downloads and resolution work share one pool, sized for the total concurrency a re-lock had
     * with `cs` (8 processes × 6), not coursier's per-process 6. */
   val PoolSize = 48
+
+  /** Requests, and systems of requests, resolved at once; more wait their turn. */
+  val Orchestration: Int = math.max(4, Runtime.getRuntime.availableProcessors)
 
   def daemonFactory(name: String): java.util.concurrent.ThreadFactory = r =>
     val t = Thread(r, name)

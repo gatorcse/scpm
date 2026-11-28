@@ -489,7 +489,13 @@ fn the_resolvers_jars_come_from_the_pinned_list() {
     assert_eq!(reqs.iter().filter(|r| r.method == "GET").count(), names.len(), "{reqs:?}");
     assert!(reqs.iter().all(|r| r.authorization.is_none()), "no credentials on the resolver's jars: {reqs:?}");
     let resolver_cache = walk(home.path());
-    assert!(resolver_cache.iter().filter(|p| p.to_string_lossy().contains("scpm/resolver/")).count() >= names.len());
+    assert!(
+        resolver_cache
+            .iter()
+            .filter(|p| p.parent().is_some_and(|d| d.ends_with(Path::new("scpm").join("resolver"))))
+            .count()
+            >= names.len()
+    );
 
     // A served jar that doesn't match its pin is refused.
     let mut tampered = files;
@@ -562,6 +568,21 @@ fn a_sidecar_that_does_not_answer_is_stopped() {
         assert!(err.contains(&format!("did not answer `{method}`")), "{name}: {err}");
         assert!(started.elapsed() < std::time::Duration::from_secs(60), "{name}: stopped in time");
     }
+    // A request bigger than the pipe's buffer, to a process that stopped reading: the write
+    // itself blocks, and the deadline (which starts before it) still stops the process.
+    let deps: String = (0..600).map(|i| format!("  org.many:artifact-number-{i:04}: '1.0.{i}'\n")).collect();
+    fs::write(ws.path().join("modules/b/scpm.yaml"), format!("scala: none\ndependencies:\n{deps}")).unwrap();
+    let Some(classes) = fake_resolver(&ws.path().join("deaf"), init_only) else { return };
+    let started = std::time::Instant::now();
+    let out = scpm(ws.path(), cache.path())
+        .env("SCPM_RESOLVER_CLASSPATH", &classes)
+        .env("SCPM_TEST_RESOLVER_TIMEOUT_MS", "1500")
+        .arg("install")
+        .assert()
+        .failure();
+    let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(err.contains("did not answer `resolve`"), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "stopped in time");
 }
 
 fn sha2_digest(bytes: &[u8]) -> Vec<u8> {

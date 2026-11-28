@@ -196,7 +196,7 @@ answered `bad_environment` (`data.what`) and the process exits with status 2.
 
 ### `resolve`
 
-Params: `repositories` (`[{id, url, groups?, auth?: {user, password, realm?}}]`, in declared
+Params: `repositories` (`[{id, url, groups?, auth?: {user, password, realm?}, challenges?: [{user, password, realm}]}]`; `challenges` are realm-scoped entries, each sent only after a challenge naming its realm, in declared
 order, mirrors applied), `cache`, `ttl` (seconds; absent: 24 h), `refresh`, `offline`, and
 `requests`: `[{label, systems[], jdk, natives[], roots[], boms[], forced[], artifactTypes[]}]`.
 A root is `{module: "org:name", version, classifier?, type?, exclusions: ["org:name"],

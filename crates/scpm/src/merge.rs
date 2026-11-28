@@ -3,7 +3,7 @@
 //!
 //! Rules: maps merge key by key, scalars override, lists append (no deduplication: option
 //! lists such as `[-release, '17']` must keep repeated tokens). A value tagged `!replace`
-//! replaces the inherited value. At the top level of a module, the matrix-defining keys
+//! replaces the inherited value; a dependency's `natives:` map always does. At the top level of a module, the matrix-defining keys
 //! `scala` and `platforms` always replace.
 
 use serde_yaml_ng::Value;
@@ -13,6 +13,9 @@ const REPLACE_TAG: &str = "replace";
 
 /// Top-level module keys whose values replace rather than merge.
 const MATRIX_KEYS: [&str; 2] = ["scala", "platforms"];
+
+/// A dependency's native mapping (`natives:`), which an overlay replaces whole.
+const NATIVES_KEY: &str = "natives";
 
 /// Merges a module-shaped `overlay` on top of `base` in place.
 pub fn merge_module(base: &mut Value, overlay: Value) {
@@ -54,6 +57,11 @@ pub fn merge(base: &mut Value, overlay: Value) {
                     continue;
                 }
                 match base_map.get_mut(&key) {
+                    // A dependency's `natives:` map is one mapping, not a set of keys to add to: an
+                    // overlay replaces it whole, so `natives: {}` turns an inherited one off.
+                    Some(existing) if key.as_str() == Some(NATIVES_KEY) && value.is_mapping() => {
+                        *existing = strip_replace_tags(value);
+                    }
                     Some(existing) => merge(existing, value),
                     None if value.is_null() => {}
                     None => {
@@ -211,6 +219,30 @@ mod tests {
         let mut base = yaml("{opts: [-release, '17']}");
         merge(&mut base, yaml("{opts: [-java-output-version, '17']}"));
         assert_eq!(base, yaml("{opts: [-release, '17', -java-output-version, '17']}"));
+    }
+
+    #[test]
+    fn a_dependencys_natives_map_is_replaced_whole() {
+        let preset = "{dependencies: {g:n: {version: '1', natives: {linux-x86_64: a, macos-aarch64: b}}}}";
+        // A partial overlay keeps none of the inherited systems.
+        let mut base = yaml(preset);
+        merge(&mut base, yaml("{dependencies: {g:n: {natives: {linux-x86_64: c}}}}"));
+        assert_eq!(base, yaml("{dependencies: {g:n: {version: '1', natives: {linux-x86_64: c}}}}"));
+        // `{}` turns the inherited mapping off.
+        let mut base = yaml(preset);
+        merge(&mut base, yaml("{dependencies: {g:n: {natives: {}}}}"));
+        assert_eq!(base, yaml("{dependencies: {g:n: {version: '1', natives: {}}}}"));
+        // An empty `natives:` inherits; `!replace` still works.
+        let mut base = yaml(preset);
+        merge(&mut base, yaml("{dependencies: {g:n: {natives: }}}"));
+        assert_eq!(base, yaml(preset));
+        let mut base = yaml(preset);
+        merge(&mut base, yaml("{dependencies: {g:n: {natives: !replace {windows-x86_64: d}}}}"));
+        assert_eq!(base, yaml("{dependencies: {g:n: {version: '1', natives: {windows-x86_64: d}}}}"));
+        // Only a mapping is a native map: a module named `natives` is an ordinary entry.
+        let mut base = yaml("{dependencies: {natives: 'workspace:*'}}");
+        merge(&mut base, yaml("{dependencies: {g:x: '1'}}"));
+        assert_eq!(base, yaml("{dependencies: {natives: 'workspace:*', g:x: '1'}}"));
     }
 
     #[test]

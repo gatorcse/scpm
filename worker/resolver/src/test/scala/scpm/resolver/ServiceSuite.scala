@@ -262,6 +262,26 @@ class ServiceSuite extends munit.FunSuite:
     server.statuses.remove("/public/org/fix/base/maven-metadata.xml")
   }
 
+  test("metadata that is served but unreadable is an error, even when the listing is refused") {
+    val cache = Files.createTempDirectory("resolver-cache").toFile
+    server.put("/public/org/fix/garbled/maven-metadata.xml", "<metadata><versioning".getBytes)
+    server.statuses.put("/public/org/fix/garbled/", 403)
+    try
+      val err = intercept[ResolverError](service.listVersions(ListVersionsParams(repos, cache.getPath, module = "org.fix:garbled")))
+      assertEquals(err.body.code, "transport", err.body.message)
+    finally server.statuses.remove("/public/org/fix/garbled/")
+  }
+
+  test("refresh re-checks changing metadata whatever the TTL") {
+    val cache = Files.createTempDirectory("resolver-cache").toFile
+    server.metadata("public", "org.fix", "fresh", Seq("1.0"))
+    val params = ListVersionsParams(repos, cache.getPath, module = "org.fix:fresh")
+    assertEquals(service.listVersions(params).versions, List("1.0"))
+    server.metadata("public", "org.fix", "fresh", Seq("1.0", "2.0"))
+    assertEquals(service.listVersions(params).versions, List("1.0"), "within the 24 h TTL")
+    assertEquals(service.listVersions(params.copy(refresh = true)).versions, List("1.0", "2.0"))
+  }
+
   test("a refused metadata refresh is an error, not the stale cached versions") {
     val cache = Files.createTempDirectory("resolver-cache").toFile
     // TTL 0: every listing re-checks maven-metadata.xml (a `LocalUpdateChanging` pass).
@@ -380,6 +400,17 @@ class CredentialsSuite extends munit.FunSuite:
     val other = run("com.sec:lib", AuthSpec("alice", "pw", Some("Other")))
     assertEquals(other.error.map(_.code), Some("unauthorized"), other.toString)
     assert(secure.headers.asScala.forall(_._2.isEmpty), "never sent for another realm")
+  }
+
+  test("every realm-scoped candidate is kept: a challenge for the second realm gets its credentials") {
+    clear()
+    val cache = Files.createTempDirectory("resolver-cache").toFile
+    val challenges = List(AuthSpec("bob", "other", Some("Other")), AuthSpec("alice", "pw", Some("R")))
+    val repos = List(RepoSpec("secure", secure.url("secure"), challenges = challenges), RepoSpec("public", open.url("public")))
+    val req = ResolveRequestSpec("t", List("linux-x86_64"), "25", roots = List(RootSpec("com.sec:lib", "1.0")), artifactTypes = List("jar"))
+    val r = service.resolve(ResolveParams(repos, cache.getPath, requests = List(req))).results.head
+    assert(r.error.isEmpty, r.toString)
+    assert(secure.headers.asScala.exists(_._2.contains(basic)))
   }
 
   test("credentials are not forwarded on a redirect to another origin") {
