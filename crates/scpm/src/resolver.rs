@@ -161,7 +161,7 @@ pub fn classpath(machine: &Machine) -> Result<(Vec<PathBuf>, Option<String>), Re
 /// worker finds its own: `worker/target/out/jvm/resolver-stage` above the running binary.
 fn local_build() -> Option<(PathBuf, Vec<PathBuf>)> {
     let exe = std::env::current_exe().ok()?;
-    exe.ancestors().find_map(|dir| {
+    crate::worker::checkout_ancestors(&exe).find_map(|dir| {
         let stage = dir.join("worker/target/out/jvm/resolver-stage");
         let names = std::fs::read_to_string(stage.join("classpath.txt")).ok()?;
         let jars: Vec<PathBuf> =

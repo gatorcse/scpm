@@ -50,15 +50,20 @@ pub fn helper_jar(env_var: &str, project: &str) -> Result<PathBuf, WorkerError> 
         return Ok(path);
     }
     let exe = env::current_exe().map_err(|e| WorkerError::Setup(e.to_string()))?;
-    for dir in exe.ancestors() {
-        let out = dir.join("worker/target/out/jvm");
-        if let Some(jar) = find_jar(&out, project) {
-            return Ok(jar);
-        }
-    }
-    Err(WorkerError::Setup(format!(
-        "cannot find the {project} jar; build it with `sbt package` in worker/ or set {env_var}"
-    )))
+    checkout_ancestors(&exe).find_map(|dir| find_jar(&dir.join("worker/target/out/jvm"), project)).ok_or_else(|| {
+        WorkerError::Setup(format!(
+            "cannot find the {project} jar; build it with `sbt package` in worker/ or set {env_var}"
+        ))
+    })
+}
+
+/// The directories above the scpm binary where a source checkout's `worker/` build output is
+/// looked for. The binary's path is resolved first, so a symlink to it (`~/.local/bin/scpm` →
+/// `<checkout>/target/release/scpm`) finds the checkout: macOS and Windows report the path the
+/// binary was started through, not its target.
+pub fn checkout_ancestors(exe: &Path) -> impl Iterator<Item = PathBuf> {
+    let exe = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    exe.ancestors().skip(1).map(Path::to_path_buf).collect::<Vec<_>>().into_iter()
 }
 
 fn find_jar(out: &Path, project: &str) -> Option<PathBuf> {
@@ -1133,5 +1138,36 @@ mod java_home_tests {
         let path = std::env::join_paths([x64.join("bin"), arm.join("bin")]).unwrap();
         assert_eq!(find_in_path(&path, Path::new("java")), Some(arm.join("bin/java")), "what detect_java runs");
         assert_eq!(detected_java_home_from(None, &[None, None], Some(path)), Some(arm));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod checkout_tests {
+    use super::{checkout_ancestors, find_jar};
+    use std::fs;
+
+    #[test]
+    fn a_symlinked_binary_finds_its_checkouts_helper_jars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("checkout");
+        let jar_dir = checkout.join("worker/target/out/jvm/scala-3.9.0/scpm-compile-worker");
+        fs::create_dir_all(&jar_dir).unwrap();
+        fs::write(jar_dir.join("scpm-compile-worker_3-0.1.0.jar"), b"").unwrap();
+        fs::create_dir_all(checkout.join("target/release")).unwrap();
+        let exe = checkout.join("target/release/scpm");
+        fs::write(&exe, b"").unwrap();
+        let bin = tmp.path().join("home/.local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let link = bin.join("scpm");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+
+        let find = |exe| {
+            checkout_ancestors(exe).find_map(|d| find_jar(&d.join("worker/target/out/jvm"), "scpm-compile-worker"))
+        };
+        let found = find(&link).expect("found through the symlink");
+        assert_eq!(found.file_name().unwrap(), "scpm-compile-worker_3-0.1.0.jar");
+        assert!(found.starts_with(checkout.canonicalize().unwrap()), "{}", found.display());
+        assert_eq!(find(&exe), Some(found), "and from the binary itself");
+        assert_eq!(find(&bin.join("missing")), None, "a path that does not resolve is searched as given");
     }
 }
