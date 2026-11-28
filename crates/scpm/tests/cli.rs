@@ -1325,7 +1325,24 @@ fn init_writes_a_workspace_that_loads_then_adds_a_module() {
     assert!(!root.join("hello").exists());
     assert_eq!(stdout(&root, &["ls"]).split_whitespace().collect::<Vec<_>>(), ["app@jvm-3", "modules/app"]);
 
-    let text = stdout(&root, &["init", "modules/core"]);
+    // The hint names the root unless scpm runs there: `-C` alone doesn't move the user.
+    let hint = String::from_utf8(
+        scpm(&root)
+            .args(["init", "modules/core"])
+            .current_dir(tmp.path())
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(hint.contains(&format!("then `scpm -C {} compile`", root.canonicalize().unwrap().display())), "{hint}");
+    fs::remove_dir_all(root.join("modules/core")).unwrap();
+    let text = String::from_utf8(
+        scpm(&root).args(["init", "modules/core"]).current_dir(&root).assert().success().get_output().stdout.clone(),
+    )
+    .unwrap();
     assert!(text.starts_with("Added module `core` (core@jvm-3)"), "{text}");
     assert!(text.contains("depend on it with `core: workspace:*`, then `scpm compile`"), "{text}");
     scpm(&root)

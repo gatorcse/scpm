@@ -405,10 +405,10 @@ impl Writer {
     }
 
     fn append(&mut self, path: &Path, original: &[u8], extra: &[u8]) -> Result<(), InitError> {
-        fs::write(path, [original, extra].concat()).map_err(|e| io_error(path, e))?;
+        // Recorded first: a write that fails part way still gets the original back on undo.
         self.appended.push(path.to_path_buf());
         self.originals.push(original.to_vec());
-        Ok(())
+        fs::write(path, [original, extra].concat()).map_err(|e| io_error(path, e))
     }
 
     /// Removes what was created (newest first) and restores appended files. Best effort: a

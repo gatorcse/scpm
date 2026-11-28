@@ -405,7 +405,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             if cli.json {
                 print_json(&report)?;
             } else {
-                print_init(&report, &start)?;
+                print_init(&report)?;
             }
             Ok(())
         }
@@ -1047,7 +1047,7 @@ fn print_install_summary(s: &InstallSummary) -> io::Result<()> {
 
 /// What `scpm init` wrote, and what to run next (with `-C` when the root isn't the current
 /// directory).
-fn print_init(report: &crate::init::InitReport, start: &std::path::Path) -> io::Result<()> {
+fn print_init(report: &crate::init::InitReport) -> io::Result<()> {
     let mut out = io::stdout().lock();
     let what = match report.kind {
         "workspace" => format!("Created a workspace with module `{}`", report.module),
@@ -1060,13 +1060,11 @@ fn print_init(report: &crate::init::InitReport, start: &std::path::Path) -> io::
     for f in &report.updated {
         writeln!(out, "  ~ {f}")?;
     }
-    let here = start.canonicalize().is_ok_and(|s| s == report.root);
+    // The process's own directory, not `-C`'s: the suggested commands run from where the user is.
+    let here = std::env::current_dir().and_then(|d| d.canonicalize()).is_ok_and(|d| d == report.root);
     let root = report.root.display().to_string();
-    let root = if root.contains(|c: char| c.is_whitespace() || c == '\'') {
-        format!("'{}'", root.replace('\'', r"'\''"))
-    } else {
-        root
-    };
+    let plain = |c: char| c.is_ascii_alphanumeric() || "/._-".contains(c);
+    let root = if !root.chars().all(plain) { format!("'{}'", root.replace('\'', r"'\''")) } else { root };
     let c = if here { String::new() } else { format!("-C {root} ") };
     if report.kind == "workspace" {
         writeln!(out, "\nNext:\n  scpm {c}run {}      compile and run it\n  scpm {c}test", report.module)?;
