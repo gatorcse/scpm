@@ -131,7 +131,7 @@ same way, without a response.
 ## Methods: test runner
 
 The test runner is started as `java -cp <runner jar + deps + test classpath> scpm.testrunner.Main`
-and receives exactly one `run` request, then exits. The CLI keeps the runner's stdin open until
+and receives exactly one `run` (or `discover`) request, then exits. The CLI keeps the runner's stdin open until
 it has the response, and may close it right after. End of input before the response means the
 CLI went away: the runner kills the processes its tests started, answers `crashed` (message
 `parent went away (stdin closed)`) and exits with status 4. If shutdown hooks (the tests' own
@@ -159,6 +159,15 @@ auto-detected, whose class is on the classpath but cannot be created (a missing 
 failing initializer or constructor): "cannot create framework X: <error>". `filters` that match no
 suite give an `ok` result with zero counts and a `warn` log event, as do a run that finds no
 framework on the classpath and one that finds no suites in `testClassesDirs`.
+
+### `discover`
+
+The same params as `run` (`testClassesDirs` required, `frameworks` and `filters` optional). The
+runner finds the suites a `run` would run, matching classes against the frameworks'
+fingerprints in the same priority order, but runs nothing: classes are loaded without being
+initialized. `result`: `{"status": "ok", "suites": [{"framework": "munit", "classes":
+["app.MainSuite"]}]}` (only frameworks with suites, class names as frameworks expect them, i.e.
+Scala objects without their trailing `$`). `scpm bsp` uses it for `buildTarget/scalaTestClasses`.
 
 If a test ends the JVM (`System.exit`), the runner still emits `test.suite.end` for the running
 suite, an `error` log naming it, and a `crashed` result with the counts so far and the message

@@ -1344,3 +1344,284 @@ fn foreign_mirror_settings_do_not_redirect_cs() {
     let err = stderr_of(hostile_scpm().arg("install"));
     assert!(err.contains("note: ") && err.contains("scpm config explain"), "{err}");
 }
+
+#[test]
+fn bom_versions_come_from_catalogs_and_are_locked() {
+    if !cs_available() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    let bom_key = "bom:com.fasterxml.jackson:jackson-bom";
+    // jackson-databind 2.17.0 depends on jackson-core 2.17.0; the BOM manages it.
+    let lib = "dependencies:\n  com.fasterxml.jackson.core:jackson-databind: 2.17.0\n";
+    let workspace = |bom: &str| {
+        format!(
+            "catalogs:\n  json:\n    com.fasterxml.jackson:jackson-bom: {bom}\nboms:\n  com.fasterxml.jackson:jackson-bom: catalog:json\n"
+        )
+    };
+    let core_of = |l: &Value| {
+        strings(&l["variants"]["lib@jvm"]["compileClasspath"])
+            .into_iter()
+            .find(|k| k.starts_with("com.fasterxml.jackson.core:jackson-core:"))
+            .unwrap()
+    };
+
+    java_workspace(ws.path(), &workspace("2.18.2"), lib);
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    let l = lock(ws.path());
+    assert_eq!(core_of(&l), "com.fasterxml.jackson.core:jackson-core:2.18.2");
+    assert_eq!(
+        l["variants"]["lib@jvm"]["specifiers"][bom_key],
+        serde_json::json!({"spec": "catalog:json", "version": "2.18.2"})
+    );
+
+    // A catalog range is selected once, recorded with the catalog selections, and applied.
+    java_workspace(ws.path(), &workspace("~2.17.0"), lib);
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    let l = lock(ws.path());
+    let selected =
+        l["catalogs"]["json/com.fasterxml.jackson:jackson-bom@jvm-java"]["version"].as_str().unwrap().to_string();
+    assert!(selected.starts_with("2.17."), "{l:#}");
+    assert_eq!(l["variants"]["lib@jvm"]["specifiers"][bom_key]["version"], selected.as_str());
+    assert_eq!(core_of(&l), format!("com.fasterxml.jackson.core:jackson-core:{selected}"));
+    scpm(ws.path(), &shared_cache()).args(["install", "--frozen"]).assert().success();
+
+    // A module BOM on the same coordinate replaces the workspace one.
+    java_workspace(
+        ws.path(),
+        &workspace("~2.17.0"),
+        &format!("{lib}boms:\n  com.fasterxml.jackson:jackson-bom: 2.18.1\n"),
+    );
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    let l = lock(ws.path());
+    assert_eq!(core_of(&l), "com.fasterxml.jackson.core:jackson-core:2.18.1");
+    assert!(l["catalogs"].get("json/com.fasterxml.jackson:jackson-bom@jvm-java").is_none(), "{l:#}");
+}
+
+/// Writes Java-only modules `a` and `b` (b depends on a), each with the given extra config.
+fn two_java_modules(dir: &Path, workspace_extra: &str, a: &str, b: &str) {
+    fs::write(dir.join("scpm-workspace.yaml"), format!("modules: ['modules/*']\n{workspace_extra}")).unwrap();
+    for (name, extra) in [("a", a), ("b", b)] {
+        fs::create_dir_all(dir.join("modules").join(name)).unwrap();
+        fs::write(dir.join("modules").join(name).join("scpm.yaml"), format!("scala: none\n{extra}")).unwrap();
+    }
+}
+
+fn jackson_core(l: &Value, variant: &str) -> String {
+    strings(&l["variants"][variant]["compileClasspath"])
+        .into_iter()
+        .find(|k| k.starts_with("com.fasterxml.jackson.core:jackson-core:"))
+        .unwrap()
+}
+
+#[test]
+fn joint_resolution_applies_one_version_per_bom() {
+    if !cs_available() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    let a = "dependencies:\n  com.fasterxml.jackson.core:jackson-databind: 2.17.0\nboms:\n  com.fasterxml.jackson:jackson-bom: 2.17.3\n";
+    // b's own BOM wins over its upstream's, whatever the versions' string order.
+    two_java_modules(
+        ws.path(),
+        "",
+        a,
+        "dependencies:\n  a: workspace:*\nboms:\n  com.fasterxml.jackson:jackson-bom: 2.18.2\n",
+    );
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    let l = lock(ws.path());
+    assert_eq!(jackson_core(&l, "a@jvm"), "com.fasterxml.jackson.core:jackson-core:2.17.3");
+    assert_eq!(jackson_core(&l, "b@jvm"), "com.fasterxml.jackson.core:jackson-core:2.18.2");
+
+    // Without a BOM of its own, b gets its upstream's.
+    two_java_modules(ws.path(), "", a, "dependencies:\n  a: workspace:*\n");
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    assert_eq!(jackson_core(&lock(ws.path()), "b@jvm"), "com.fasterxml.jackson.core:jackson-core:2.17.3");
+}
+
+#[test]
+fn locked_bom_ranges_are_not_reselected_when_a_variant_relocks() {
+    if !cs_available() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    let bom_key = "bom:com.fasterxml.jackson:jackson-bom";
+    let lib = "dependencies:\n  com.fasterxml.jackson.core:jackson-databind: 2.17.0\nboms:\n  com.fasterxml.jackson:jackson-bom: ~2.17.0\n";
+    java_workspace(ws.path(), "", lib);
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    // Pretend the range was locked when 2.17.1 was the latest.
+    let path = ws.path().join("scpm-lock.yaml");
+    let mut l: serde_yaml_ng::Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    l["variants"]["lib@jvm"]["specifiers"][bom_key]["version"] = "2.17.1".into();
+    fs::write(&path, serde_yaml_ng::to_string(&l).unwrap()).unwrap();
+
+    // An unrelated edit re-locks lib@jvm; the unchanged BOM range keeps its version.
+    let edited = lib.replace("2.17.0\nboms", "2.17.0\n  org.slf4j:slf4j-api: 2.0.17\nboms");
+    assert_ne!(edited, lib);
+    java_workspace(ws.path(), "", &edited);
+    let summary = json_install(ws.path(), &shared_cache(), &[]);
+    assert_eq!(summary["relocked"], serde_json::json!(["lib@jvm"]));
+    let l = lock(ws.path());
+    assert_eq!(l["variants"]["lib@jvm"]["specifiers"][bom_key]["version"], "2.17.1");
+    assert_eq!(jackson_core(&l, "lib@jvm"), "com.fasterxml.jackson.core:jackson-core:2.17.1");
+}
+
+#[test]
+fn catalog_selections_under_the_pre_sharing_key_are_honoured() {
+    if !cs_available() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    let write = |extra: &str| {
+        fs::write(
+            ws.path().join("scpm-workspace.yaml"),
+            "modules: ['modules/*']\ntoolchain: {scala: '3.9.0'}\ncatalog:\n  org.slf4j:slf4j-api: ~2.0.0\n",
+        )
+        .unwrap();
+        fs::create_dir_all(ws.path().join("modules/m")).unwrap();
+        fs::write(
+            ws.path().join("modules/m/scpm.yaml"),
+            format!("dependencies:\n  org.slf4j:slf4j-api: catalog\n{extra}"),
+        )
+        .unwrap();
+    };
+    write("");
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    // Rewrite the selection as a lock from before Java coordinates shared one: keyed by the
+    // variant's Scala version, at an older version within the range.
+    let path = ws.path().join("scpm-lock.yaml");
+    let mut l: serde_yaml_ng::Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let catalogs = l["catalogs"].as_mapping_mut().unwrap();
+    assert!(catalogs.remove("default/org.slf4j:slf4j-api@jvm-java").is_some());
+    catalogs.insert(
+        "default/org.slf4j:slf4j-api@jvm-3".into(),
+        serde_yaml_ng::from_str("{range: ~2.0.0, version: 2.0.16}").unwrap(),
+    );
+    fs::write(&path, serde_yaml_ng::to_string(&l).unwrap()).unwrap();
+
+    // A no-op install rewrites the selection under the shared key instead of pruning it.
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    assert_eq!(lock(ws.path())["catalogs"]["default/org.slf4j:slf4j-api@jvm-java"]["version"], "2.0.16");
+    scpm(ws.path(), &shared_cache()).args(["install", "--frozen"]).assert().success();
+
+    // An unrelated edit re-locks m@jvm-3; the range keeps its version.
+    write("  org.slf4j:slf4j-simple: 2.0.16\n");
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    let l = lock(ws.path());
+    assert_eq!(l["catalogs"]["default/org.slf4j:slf4j-api@jvm-java"]["version"], "2.0.16", "{l:#}");
+    assert!(l["catalogs"].get("default/org.slf4j:slf4j-api@jvm-3").is_none());
+    assert!(strings(&l["variants"]["m@jvm-3"]["compileClasspath"]).contains(&"org.slf4j:slf4j-api:2.0.16".to_string()));
+}
+
+#[test]
+fn conflicting_pre_sharing_selections_are_reported() {
+    if !cs_available() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    fs::write(
+        ws.path().join("scpm-workspace.yaml"),
+        "modules: ['modules/*']\ntoolchain: {scala: '3.9.0'}\ncatalog:\n  org.slf4j:slf4j-api: ~2.0.0\n",
+    )
+    .unwrap();
+    fs::create_dir_all(ws.path().join("modules/m")).unwrap();
+    fs::write(
+        ws.path().join("modules/m/scpm.yaml"),
+        "scala: ['3.9.0', '2.13.18']\ndependencies:\n  org.slf4j:slf4j-api: catalog\n",
+    )
+    .unwrap();
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    // A lock from before sharing: one selection per Scala version, and they disagree.
+    let path = ws.path().join("scpm-lock.yaml");
+    let mut l: serde_yaml_ng::Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let catalogs = l["catalogs"].as_mapping_mut().unwrap();
+    assert!(catalogs.remove("default/org.slf4j:slf4j-api@jvm-java").is_some());
+    for (binary, version) in [("3", "2.0.16"), ("2.13", "2.0.15")] {
+        catalogs.insert(
+            format!("default/org.slf4j:slf4j-api@jvm-{binary}").into(),
+            serde_yaml_ng::from_str(&format!("{{range: ~2.0.0, version: {version}}}")).unwrap(),
+        );
+    }
+    fs::write(&path, serde_yaml_ng::to_string(&l).unwrap()).unwrap();
+
+    let out = scpm(ws.path(), &shared_cache()).arg("install").assert().success().get_output().clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Java coordinates now share one selection"), "{err}");
+    assert!(err.contains("2.0.15") && err.contains("2.0.16"), "{err}");
+    let shared = lock(ws.path())["catalogs"]["default/org.slf4j:slf4j-api@jvm-java"]["version"].clone();
+    assert!(shared == "2.0.16" || shared == "2.0.15", "{shared}");
+}
+
+#[test]
+fn a_topology_change_that_reorders_bom_owners_relocks() {
+    if !cs_available() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    fs::write(ws.path().join("scpm-workspace.yaml"), "modules: ['modules/*']\n").unwrap();
+    let module = |name: &str, body: &str| {
+        fs::create_dir_all(ws.path().join("modules").join(name)).unwrap();
+        fs::write(ws.path().join("modules").join(name).join("scpm.yaml"), format!("scala: none\n{body}")).unwrap();
+    };
+    let bom = |v: &str| format!("boms:\n  com.fasterxml.jackson:jackson-bom: {v}\n");
+    // r -> b, d; b -> e; e -> a; d -> c. a's BOM is 3 hops away, c's 2: c wins.
+    module(
+        "r",
+        "dependencies:\n  com.fasterxml.jackson.core:jackson-databind: 2.17.0\n  b: workspace:*\n  d: workspace:*\n",
+    );
+    module("b", "dependencies:\n  e: workspace:*\n");
+    module("e", "dependencies:\n  a: workspace:*\n");
+    module("d", "dependencies:\n  c: workspace:*\n");
+    module("a", &bom("2.17.3"));
+    module("c", &bom("2.18.2"));
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    assert_eq!(jackson_core(&lock(ws.path()), "r@jvm"), "com.fasterxml.jackson.core:jackson-core:2.18.2");
+
+    // b now depends on a directly: a and c are both 2 hops away and a wins the tie by id.
+    // r's own config and its upstream set are unchanged.
+    module("b", "dependencies:\n  e: workspace:*\n  a: workspace:*\n");
+    let summary = json_install(ws.path(), &shared_cache(), &[]);
+    assert!(summary["relocked"].as_array().unwrap().contains(&"r@jvm".into()), "{summary:#}");
+    assert_eq!(jackson_core(&lock(ws.path()), "r@jvm"), "com.fasterxml.jackson.core:jackson-core:2.17.3");
+}
+
+#[test]
+fn a_legacy_selection_conflicting_with_an_existing_shared_one_is_reported() {
+    if !cs_available() {
+        return;
+    }
+    let ws = tempfile::tempdir().unwrap();
+    fs::write(
+        ws.path().join("scpm-workspace.yaml"),
+        "modules: ['modules/*']\ntoolchain: {scala: '3.9.0'}\ncatalog:\n  org.slf4j:slf4j-api: ~2.0.0\n",
+    )
+    .unwrap();
+    // A Java-only module owns the shared `@jvm-java` selection; a Scala module has a legacy one.
+    for (name, extra) in [("j", "scala: none\n"), ("s", "")] {
+        fs::create_dir_all(ws.path().join("modules").join(name)).unwrap();
+        fs::write(
+            ws.path().join("modules").join(name).join("scpm.yaml"),
+            format!("{extra}dependencies:\n  org.slf4j:slf4j-api: catalog\n"),
+        )
+        .unwrap();
+    }
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    let path = ws.path().join("scpm-lock.yaml");
+    let mut l: serde_yaml_ng::Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let catalogs = l["catalogs"].as_mapping_mut().unwrap();
+    catalogs.insert(
+        "default/org.slf4j:slf4j-api@jvm-java".into(),
+        serde_yaml_ng::from_str("{range: ~2.0.0, version: 2.0.16}").unwrap(),
+    );
+    catalogs.insert(
+        "default/org.slf4j:slf4j-api@jvm-3".into(),
+        serde_yaml_ng::from_str("{range: ~2.0.0, version: 2.0.15}").unwrap(),
+    );
+    fs::write(&path, serde_yaml_ng::to_string(&l).unwrap()).unwrap();
+
+    let out = scpm(ws.path(), &shared_cache()).arg("install").assert().success().get_output().clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Java coordinates now share one selection"), "{err}");
+    assert!(err.contains("2.0.15") && err.contains("s@jvm-3"), "{err}");
+    assert_eq!(lock(ws.path())["catalogs"]["default/org.slf4j:slf4j-api@jvm-java"]["version"], "2.0.16");
+}

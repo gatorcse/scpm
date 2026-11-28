@@ -14,7 +14,7 @@ use serde_yaml_ng::Value;
 use crate::config::{
     DepSpec, MODULE_FILE, ModuleFile, OneOrMany, Repository, TaskDef, VersionScheme, WORKSPACE_FILE, WorkspaceFile,
 };
-use crate::coord::{Coord, CrossKind, VersionedCoord};
+use crate::coord::{Coord, CrossKind};
 use crate::diag::{Diagnostic, Diagnostics, closest, ser_opt_path, ser_path, ser_paths, slash_path};
 use crate::merge::{
     has_replace_tags, merge_module, parse_with_visible_tags, strip_replace_tags, unknown_tags, untag_replace,
@@ -45,6 +45,15 @@ pub struct Module {
     /// Directory relative to the workspace root (`.` for the root module), `/`-separated.
     pub dir: String,
     pub variants: Vec<Variant>,
+    /// The variant `scpm idea` turns into an IntelliJ module (`ide.primary`, else the first).
+    pub ide_primary: String,
+}
+
+impl Module {
+    /// The variant IDEs that allow one variant per module show (`ide.primary`).
+    pub fn primary_variant(&self) -> &Variant {
+        self.variants.iter().find(|v| v.id == self.ide_primary).unwrap_or(&self.variants[0])
+    }
 }
 
 /// One buildable unit: a module on one platform with one Scala version.
@@ -65,8 +74,11 @@ pub struct Variant {
     pub workspace_dependencies: Vec<WorkspaceDependency>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub compiler_plugins: Vec<Dependency>,
+    /// BOMs, workspace ones first; a module BOM replaces a workspace BOM with the same key.
+    /// Their versions resolve like dependencies' (catalogs, ranges); they are never added to a
+    /// classpath themselves.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub boms: Vec<VersionedCoord>,
+    pub boms: Vec<Dependency>,
     pub scalac_options: Vec<String>,
     pub javac_options: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -243,10 +255,10 @@ fn load_at(root: &Path, workspace_file: Option<PathBuf>) -> Result<Workspace, Di
         }
     }
     // Workspace BOMs apply to every module: parse them once.
-    for (i, bom) in config.boms.iter().enumerate() {
-        match VersionedCoord::parse(bom) {
+    for (key, spec) in &config.boms {
+        match bom_dependency(&ctx, key, spec) {
             Ok(b) => ctx.boms.push(b),
-            Err(e) => diags.push(ctx.in_ws(Diagnostic::new(e.to_string()).at_key(format!("boms[{i}]")))),
+            Err(e) => diags.push(ctx.in_ws(e.at_key(format!("boms.{key}")))),
         }
     }
     validate_workspace(&ctx, &mut diags);
@@ -288,7 +300,7 @@ struct Ctx<'a> {
     presets: IndexMap<String, Value>,
     ws_file: Option<PathBuf>,
     /// Parsed workspace `boms`.
-    boms: Vec<VersionedCoord>,
+    boms: Vec<Dependency>,
 }
 
 impl Ctx<'_> {
@@ -576,6 +588,7 @@ fn module_checks(m: &ModuleFile, prefix: &str, kind: Kind, depth: Option<usize>)
             ("platforms", !m.platforms.is_empty()),
             ("scala", m.scala.is_some()),
             ("variants", !m.variants.is_empty()),
+            ("ide", m.ide.is_some()),
         ];
         for (key, set) in forbidden {
             if set {
@@ -595,9 +608,9 @@ fn module_checks(m: &ModuleFile, prefix: &str, kind: Kind, depth: Option<usize>)
     if !m.generated_sources.is_empty() {
         out.push(not_supported(at("generatedSources"), "`generatedSources`", 3));
     }
-    for (i, bom) in m.boms.iter().enumerate() {
-        if let Err(e) = VersionedCoord::parse(bom) {
-            out.push(Diagnostic::new(e.to_string()).at_key(at(&format!("boms[{i}]"))));
+    for key in m.boms.keys() {
+        if let Err(e) = Coord::parse(key) {
+            out.push(Diagnostic::new(e.to_string()).at_key(at(&format!("boms.{key}"))));
         }
     }
     let dirs = [
@@ -695,6 +708,17 @@ fn normalize(path: &Path) -> PathBuf {
 /// Directories between the workspace root and `rel_dir`.
 fn depth_of(rel_dir: &Path) -> usize {
     rel_dir.components().filter(|c| matches!(c, Component::Normal(_))).count()
+}
+
+/// The module files the workspace's `modules` globs match right now (absolute paths, sorted),
+/// whether or not they were loaded: a long-running process (`scpm bsp`) compares this list to
+/// notice modules that were added or removed.
+pub fn module_files(ws: &Workspace) -> Vec<PathBuf> {
+    let ws_file = ws.workspace_file.as_ref().map(|p| rel(&ws.root, p));
+    discover_modules(&ws.root, &ws.config, ws_file.as_deref(), &mut Diagnostics::default())
+        .into_iter()
+        .map(|dir| ws.root.join(dir).join(MODULE_FILE))
+        .collect()
 }
 
 /// Module directories, relative to the root, in a stable order.
@@ -1090,9 +1114,32 @@ fn expand_module(ctx: &Ctx, rel_dir: &Path) -> Result<Module, Diagnostics> {
                 .with_help(format!("this module's variants: {}", all_ids.join(", "))),
         );
     }
+    let mut ide_primary = variants.first().map(|v| v.id.clone()).unwrap_or_default();
+    if let Some(selector) = base.ide.as_ref().and_then(|ide| ide.primary.as_deref()) {
+        match VariantSelector::parse(selector) {
+            Err(e) => {
+                let d = Diagnostic::new(format!("invalid variant selector `{selector}`: {e}"))
+                    .in_file(&file)
+                    .at_key("ide.primary");
+                diags.push(match e.help() {
+                    Some(help) => d.with_help(help),
+                    None => d,
+                });
+            }
+            Ok(sel) => match variants.iter().find(|v| sel.matches(v.platform, v.scala.as_ref())) {
+                Some(v) => ide_primary = v.id.clone(),
+                None => diags.push(
+                    Diagnostic::new(format!("`ide.primary` selector `{selector}` matches no variant"))
+                        .in_file(&file)
+                        .at_key("ide.primary")
+                        .with_help(format!("this module's variants: {}", all_ids.join(", "))),
+                ),
+            },
+        }
+    }
     let dir = if rel_dir.as_os_str().is_empty() { ".".to_string() } else { slash_path(rel_dir) };
     diags.dedup();
-    diags.into_result(Module { name, dir, variants })
+    diags.into_result(Module { name, dir, variants, ide_primary })
 }
 
 fn from_value<T: DeserializeOwned>(value: &Value, file: &Path) -> Result<T, Diagnostics> {
@@ -1276,11 +1323,30 @@ fn build_variant(
             Err(d) => diags.push(d.in_file(file).at_key(at)),
         }
     }
-    // Invalid module and preset BOMs are reported by `module_checks`.
-    let mut boms = ctx.boms.clone();
-    for b in cfg.boms.iter().filter_map(|raw| VersionedCoord::parse(raw).ok()) {
-        if !boms.contains(&b) {
-            boms.push(b);
+    // Invalid BOM coordinates are reported by `module_checks`; catalog lookups here.
+    // A Java-only module skips workspace BOMs that need a Scala version (`org::name`): they
+    // can't name an artifact for it. Its own such BOMs are errors, like dependencies.
+    let mut boms: Vec<Dependency> =
+        ctx.boms.iter().filter(|b| scala.is_some() || b.coord.cross == CrossKind::Java).cloned().collect();
+    for (key, spec) in &cfg.boms {
+        let Ok(coord) = Coord::parse(key) else { continue };
+        if scala.is_none() && coord.cross != CrossKind::Java {
+            diags.push(
+                Diagnostic::new(format!(
+                    "`{coord}` needs a Scala version, but this module is Java-only (`scala: none`)"
+                ))
+                .in_file(file)
+                .at_key(format!("boms.{key}"))
+                .with_help("use the full artifact name with a single `:`, e.g. `org:name_3`"),
+            );
+            continue;
+        }
+        match bom_dependency(ctx, key, spec) {
+            Ok(b) => match boms.iter_mut().find(|w| w.coord == b.coord) {
+                Some(w) => *w = b,
+                None => boms.push(b),
+            },
+            Err(d) => diags.push(d.in_file(file).at_key(format!("boms.{key}"))),
         }
     }
     // The module's own directories were checked as written; any that leave the workspace here
@@ -1358,7 +1424,7 @@ fn build_variant(
 }
 
 /// `scala-3`, `scala-2.13`, `scala-jvm`, … in the order sbt uses.
-fn source_suffixes(platform: Platform, scala: Option<&ScalaVersion>) -> Vec<String> {
+pub(crate) fn source_suffixes(platform: Platform, scala: Option<&ScalaVersion>) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(s) = scala {
         let major = s.full.split('.').next().unwrap_or_default().to_string();
@@ -1399,6 +1465,25 @@ fn external_dependency(
         }
     }
     Ok(Dependency { scope, coord, spec: spec.version().0.clone(), version, exclude, classifier, kind, transitive })
+}
+
+/// A BOM entry (`org:name: <spec>`): its version resolves through catalogs like a dependency's.
+fn bom_dependency(ctx: &Ctx, key: &str, spec: &Ver) -> Result<Dependency, Diagnostic> {
+    let coord = Coord::parse(key).map_err(|e| Diagnostic::new(e.to_string()))?;
+    let version = resolve_catalog(ctx, key, spec)?;
+    if let VersionSpec::Workspace { .. } = version {
+        return Err(Diagnostic::new("a BOM's version cannot be `workspace:`"));
+    }
+    Ok(Dependency {
+        scope: Scope::Compile,
+        coord,
+        spec: spec.0.clone(),
+        version,
+        exclude: Vec::new(),
+        classifier: None,
+        kind: None,
+        transitive: false,
+    })
 }
 
 /// Reports dependencies on modules that don't exist. `failed` holds the names of modules that

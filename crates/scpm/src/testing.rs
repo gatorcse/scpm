@@ -46,6 +46,9 @@ pub fn kill_running(reason: &str) {
 /// How long a test JVM may take to exit after it reported its results.
 const EXIT_GRACE: Duration = Duration::from_secs(30);
 
+/// How long test discovery ([`discover_tests`]) may take.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Default)]
 pub struct TestOptions {
     /// Globs on fully qualified suite names.
@@ -54,6 +57,9 @@ pub struct TestOptions {
     pub test_names: Vec<String>,
     /// Per-variant timeout for the forked test JVM (`None`: no limit).
     pub timeout: Option<Duration>,
+    /// The JUnit report's file name in `test-reports/` (`None`: `junit.xml`). Several runs of
+    /// one variant in one request (per-suite selections) each need their own.
+    pub report_name: Option<String>,
 }
 
 /// `.scpm/out/<id>/test-classes`.
@@ -65,6 +71,24 @@ pub fn test_classes_dir(root: &Path, id: &str) -> PathBuf {
 /// modules' outputs and resources, then locked jars. Missing outputs or jars are errors
 /// (missing resource directories are just skipped).
 pub fn runtime_classpath(tc: &Toolchain, v: &Variant, test: bool) -> Result<Vec<PathBuf>, CompileError> {
+    let (cp, required) = runtime_entries(tc, v, test)?;
+    if let Some(missing) = required.iter().map(|&i| &cp[i]).find(|p| !p.exists()) {
+        return Err(CompileError::Setup(format!(
+            "{} is missing; run `scpm install` / `scpm compile`",
+            missing.display()
+        )));
+    }
+    Ok(cp)
+}
+
+/// [`runtime_classpath`] without checking that outputs exist yet (for IDEs, which ask before
+/// building).
+pub fn runtime_classpath_unchecked(tc: &Toolchain, v: &Variant, test: bool) -> Result<Vec<PathBuf>, CompileError> {
+    Ok(runtime_entries(tc, v, test)?.0)
+}
+
+/// The runtime classpath, and the indices of the entries that must exist.
+fn runtime_entries(tc: &Toolchain, v: &Variant, test: bool) -> Result<(Vec<PathBuf>, Vec<usize>), CompileError> {
     let ws = tc.ws;
     let kind = if test { ClasspathKind::TestRuntime } else { ClasspathKind::Runtime };
     let resources =
@@ -92,13 +116,7 @@ pub fn runtime_classpath(tc: &Toolchain, v: &Variant, test: bool) -> Result<Vec<
             ClasspathEntry::Artifact(key) => cp.push(tc.file(key)),
         }
     }
-    if let Some(missing) = required.iter().map(|&i| &cp[i]).find(|p| !p.exists()) {
-        return Err(CompileError::Setup(format!(
-            "{} is missing; run `scpm install` / `scpm compile`",
-            missing.display()
-        )));
-    }
-    Ok(cp)
+    Ok((cp, required))
 }
 
 /// The test runner's classpath, checked before anything is compiled.
@@ -194,7 +212,8 @@ fn run_variant_tests(
         Err(e) => (TaskStatus::Crashed, Some(e.to_string())),
     };
     let cases = cases.lock().expect("cases").clone();
-    if let Err(e) = write_junit(&tc.ws.root, v, &cases, status, message.as_deref()) {
+    let report = opts.report_name.as_deref().unwrap_or("junit.xml");
+    if let Err(e) = write_junit(&tc.ws.root, v, report, &cases, status, message.as_deref()) {
         reporter.emit(Event::Log { task: task.clone(), level: "warn".into(), message: format!("JUnit report: {e}") });
     }
     reporter.emit(Event::TaskEnd { task, status, duration_ms: started.elapsed().as_millis() as u64, message });
@@ -322,6 +341,7 @@ fn fork_runner(
 fn write_junit(
     root: &Path,
     v: &Variant,
+    file: &str,
     cases: &[TestCase],
     status: TaskStatus,
     message: Option<&str>,
@@ -383,7 +403,7 @@ fn write_junit(
         xml.push_str("  </testsuite>\n");
     }
     xml.push_str("</testsuites>\n");
-    fs::write(dir.join("junit.xml"), xml)
+    fs::write(dir.join(file), xml)
 }
 
 /// XML text content: escapes markup and drops characters XML 1.0 forbids.
@@ -403,11 +423,8 @@ pub fn exec_main(tc: &Toolchain, v: &Variant, main_class: Option<&str>, args: &[
     let main = main_class.or(v.main_class.as_deref()).ok_or_else(|| {
         CompileError::Setup(format!("{} has no `mainClass`; set it in scpm.yaml or pass --main", v.module))
     })?;
-    let classpath = runtime_classpath(tc, v, false)?;
     let java = worker::java()?;
-    let joined = std::env::join_paths(&classpath).map_err(|e| CompileError::Setup(e.to_string()))?;
-    let mut cmd = Command::new(&java.path);
-    cmd.args(&v.jvm_options).arg("-cp").arg(joined).arg(main).args(args).envs(v.env.iter());
+    let mut cmd = main_command(tc, v, main, &[], args)?;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -420,6 +437,68 @@ pub fn exec_main(tc: &Toolchain, v: &Variant, main_class: Option<&str>, args: &[
             cmd.status().map_err(|e| CompileError::Setup(format!("cannot start {}: {e}", java.path.display())))?;
         Ok(status.code().unwrap_or(1))
     }
+}
+
+/// `java <jvmOptions> <extra_jvm_options> -cp <runtime classpath> <main> <args>` with the
+/// variant's environment, as `scpm run` starts it (the BSP server runs it the same way).
+pub fn main_command(
+    tc: &Toolchain,
+    v: &Variant,
+    main: &str,
+    extra_jvm_options: &[String],
+    args: &[String],
+) -> Result<Command, CompileError> {
+    let classpath = runtime_classpath(tc, v, false)?;
+    let java = worker::java()?;
+    let joined = std::env::join_paths(&classpath).map_err(|e| CompileError::Setup(e.to_string()))?;
+    let mut cmd = Command::new(&java.path);
+    cmd.args(&v.jvm_options).args(extra_jvm_options).arg("-cp").arg(joined).arg(main).args(args).envs(v.env.iter());
+    Ok(cmd)
+}
+
+/// Test classes per framework, as `scpm test` would run them, found by the test runner's
+/// `discover` method (it loads the compiled test classes without running anything). Needs
+/// the variant's tests compiled.
+pub fn discover_tests(tc: &Toolchain, v: &Variant) -> Result<Vec<(String, Vec<String>)>, CompileError> {
+    let mut classpath = runner_classpath(tc)?;
+    // Unchecked: an output that doesn't exist yet only hides the classes it would hold.
+    classpath.extend(runtime_classpath_unchecked(tc, v, true)?);
+    let module_dir = tc.ws.module(&v.module).map(|m| tc.ws.root.join(&m.dir)).unwrap_or_else(|| tc.ws.root.clone());
+    let spec = worker::Spawn {
+        name: "the test runner",
+        classpath: &classpath,
+        main: "scpm.testrunner.Main",
+        jvm_options: &v.jvm_options,
+        env: v.env.iter().map(|(k, val)| (k.clone(), val.clone())).collect(),
+        cwd: Some(&module_dir),
+        log_file: None,
+        initialize: false,
+        own_process_group: true,
+    };
+    let runner = Worker::spawn(spec, |_| {})?;
+    let params = json!({"target": v.id, "testClassesDirs": [test_classes_dir(&tc.ws.root, &v.id)]});
+    let result = runner.request_timeout("discover", params, Some(DISCOVERY_TIMEOUT));
+    if result.is_err() {
+        runner.kill("did not finish test discovery in time");
+    }
+    let _ = runner.wait_timeout(Some(EXIT_GRACE));
+    let result = result?;
+    if result["status"] != "ok" {
+        return Err(CompileError::Setup(format!(
+            "test discovery failed in {}: {}",
+            v.id,
+            result["message"].as_str().unwrap_or("the test runner crashed")
+        )));
+    }
+    Ok(result["suites"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|s| {
+            let classes = s["classes"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string);
+            (s["framework"].as_str().unwrap_or_default().to_string(), classes.collect())
+        })
+        .collect())
 }
 
 #[cfg(test)]

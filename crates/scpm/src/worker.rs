@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::env;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -239,6 +240,56 @@ fn parse_java_version(output: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The executable `SCPM_JAVA` names, as `detect_java` runs it: a bare name is looked up on
+/// `path`, and symlinks are resolved. `None` when `SCPM_JAVA` is unset or empty.
+fn explicit_java(explicit: Option<OsString>, path: Option<&OsString>) -> Option<PathBuf> {
+    let exe = PathBuf::from(explicit.filter(|j| !j.is_empty())?);
+    let exe = if exe.components().count() == 1 {
+        // Executable-aware, like process spawning: a non-executable `java` earlier on PATH is skipped.
+        path.and_then(|p| find_in_path(p, &exe)).unwrap_or(exe)
+    } else {
+        exe
+    };
+    Some(exe.canonicalize().unwrap_or(exe))
+}
+
+/// The home directory of the JDK scpm runs, found without starting a JVM, in `detect_java`'s
+/// order: the `SCPM_JAVA` executable's home, `SCPM_JAVA_HOME`, `JAVA_HOME`, then the `java` on
+/// `PATH` with symlinks resolved. `None` if there is none.
+pub fn java_home() -> Option<PathBuf> {
+    java_home_from(
+        env::var_os("SCPM_JAVA"),
+        &[env::var_os("SCPM_JAVA_HOME"), env::var_os("JAVA_HOME")],
+        env::var_os("PATH"),
+    )
+}
+
+fn java_home_from(explicit: Option<OsString>, homes: &[Option<OsString>], path: Option<OsString>) -> Option<PathBuf> {
+    let exe = if cfg!(windows) { "java.exe" } else { "java" };
+    // `<home>/bin/java`; a version manager's shim resolves to the manager, not a JDK.
+    let home_of = |java: &Path| {
+        java.parent()?.parent().map(Path::to_path_buf).filter(|home| home.join("bin").join(exe).is_file())
+    };
+    let from_explicit = explicit_java(explicit, path.as_ref()).and_then(|java| home_of(&java));
+    let from_env = || {
+        homes
+            .iter()
+            .flatten()
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from)
+            .find(|home| home.join("bin").join(exe).is_file())
+    };
+    let from_path = || {
+        env::split_paths(path.as_ref()?)
+            .map(|d| d.join(exe))
+            .find(|p| p.is_file())
+            .and_then(|p| p.canonicalize().ok())
+            .and_then(|p| home_of(&p))
+            .filter(|home| home.join("release").is_file())
+    };
+    from_explicit.or_else(from_env).or_else(from_path).map(|home| home.canonicalize().unwrap_or(home))
+}
+
 /// An identity of the JDK for build fingerprints, found without starting a JVM when possible:
 /// the `release` file of the JDK that `detect_java` uses (`SCPM_JAVA`, `SCPM_JAVA_HOME`,
 /// `JAVA_HOME`, or the resolved `java` on `PATH`). Falls back to running `java -version`, never
@@ -246,10 +297,8 @@ fn parse_java_version(output: &str) -> Option<String> {
 pub fn java_identity() -> Result<String, WorkerError> {
     // Same precedence as `detect_java`: an explicit `SCPM_JAVA` executable comes first, so
     // switching it changes the fingerprint even while `JAVA_HOME` is set.
-    if let Some(explicit) = env::var_os("SCPM_JAVA").filter(|j| !j.is_empty()) {
-        // A bare name runs whatever PATH finds, so identify that, not the literal name.
-        let exe = on_path(PathBuf::from(explicit));
-        let real = exe.canonicalize().unwrap_or(exe);
+    // A bare name runs whatever PATH finds, so identify that, not the literal name.
+    if let Some(real) = explicit_java(env::var_os("SCPM_JAVA"), env::var_os("PATH").as_ref()) {
         let release = real.parent().and_then(Path::parent).and_then(|home| {
             let text = std::fs::read_to_string(home.join("release")).ok()?;
             text.lines().find(|l| l.starts_with("JAVA_VERSION=")).map(str::to_string)
@@ -933,5 +982,46 @@ mod version_tests {
         assert_eq!(absolute(std::path::Path::new("tools/runner.jar")), cwd.join("tools/runner.jar"));
         let abs = cwd.join("x.jar");
         assert_eq!(absolute(&abs), abs);
+    }
+}
+
+#[cfg(test)]
+mod java_home_tests {
+    use super::java_home_from;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// A fake JDK at `dir/name`: `bin/java` and a `release` file.
+    fn jdk(dir: &Path, name: &str) -> PathBuf {
+        let home = dir.join(name);
+        fs::create_dir_all(home.join("bin")).unwrap();
+        let java = home.join("bin").join(if cfg!(windows) { "java.exe" } else { "java" });
+        fs::write(&java, "").unwrap();
+        // PATH lookup skips non-executable files, as process spawning does.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&java, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(home.join("release"), "JAVA_VERSION=\"21\"\n").unwrap();
+        home.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn scpm_java_comes_before_the_home_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let (j21, j17) = (jdk(dir.path(), "jdk21"), jdk(dir.path(), "jdk17"));
+        let exe = if cfg!(windows) { "java.exe" } else { "java" };
+        let homes = [None, Some(OsString::from(&j17))];
+        let explicit = Some(j21.join("bin").join(exe).into_os_string());
+        assert_eq!(java_home_from(explicit, &homes, None), Some(j21.clone()));
+        // A bare name resolves through PATH, as `detect_java` runs it.
+        let path = Some(j21.join("bin").into_os_string());
+        assert_eq!(java_home_from(Some(OsString::from(exe)), &homes, path.clone()), Some(j21.clone()));
+        // Unset or unresolvable: the home variables, then PATH.
+        assert_eq!(java_home_from(None, &homes, path.clone()), Some(j17));
+        assert_eq!(java_home_from(Some("".into()), &[None, None], path.clone()), Some(j21));
+        assert_eq!(java_home_from(Some("/nowhere/bin/java".into()), &[None, None], None), None);
     }
 }

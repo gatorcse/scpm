@@ -12,6 +12,31 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::platform::Platform;
 use crate::version::Ver;
 
+/// `boms` is a map like `dependencies`; the earlier `[org:name:version]` list form gets a
+/// pointer to the new form rather than serde's generic type error.
+fn boms<'de, D: Deserializer<'de>>(d: D) -> Result<IndexMap<String, Ver>, D::Error> {
+    struct Boms;
+    impl<'de> serde::de::Visitor<'de> for Boms {
+        type Value = IndexMap<String, Ver>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map of BOM coordinates to versions")
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(IndexMap::new())
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            IndexMap::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, _: A) -> Result<Self::Value, A::Error> {
+            Err(A::Error::custom(
+                "`boms` is a map of coordinate to version, like `dependencies` \
+                 (e.g. `io.netty:netty-bom: 4.1.115.Final` or `com.fasterxml.jackson:jackson-bom: catalog`)",
+            ))
+        }
+    }
+    d.deserialize_any(Boms)
+}
+
 pub const WORKSPACE_FILE: &str = "scpm-workspace.yaml";
 pub const MODULE_FILE: &str = "scpm.yaml";
 
@@ -42,9 +67,10 @@ pub struct WorkspaceFile {
     /// Named catalogs, referenced as `catalog:<name>`.
     #[serde(default)]
     pub catalogs: IndexMap<String, IndexMap<String, Ver>>,
-    /// BOMs (`org:name:version`) applied to every module.
-    #[serde(default)]
-    pub boms: Vec<String>,
+    /// BOMs applied to every module: `org:name: <version>`, where the version may be exact, a
+    /// range, `catalog` or `catalog:<name>` (looked up by the BOM's coordinate).
+    #[serde(default, deserialize_with = "boms")]
+    pub boms: IndexMap<String, Ver>,
     /// Forced versions applied workspace-wide.
     #[serde(default)]
     pub overrides: IndexMap<String, Ver>,
@@ -64,6 +90,42 @@ pub struct WorkspaceFile {
     pub versioning: Option<Versioning>,
     #[serde(default)]
     pub lock: LockSettings,
+    /// IDE project files that a non-frozen `scpm install` keeps up to date (design §10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ide: Option<WorkspaceIde>,
+}
+
+/// `ide` in the workspace file: which IDE files a non-frozen `scpm install` regenerates.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceIde {
+    /// Regenerate `.metals/mbt.json` (Metals v2) after every non-frozen install. Without it,
+    /// the file is regenerated only when it already exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metals: Option<bool>,
+    /// Regenerate the IntelliJ project files (`scpm idea`) after every non-frozen install.
+    /// Without it, they are regenerated only when scpm generated them before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idea: Option<bool>,
+    /// Compile Scala sources with SemanticDB output (in each classes directory, under
+    /// `META-INF/semanticdb`), which Metals v1 needs over BSP for references, rename,
+    /// implementations and code lenses. `scpm compile` and `scpm bsp` both apply it, so they
+    /// share build outputs. Scala 3 uses the compiler's own `-Xsemanticdb`; Scala 2 the locked
+    /// `semanticdb-scalac` compiler plugin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semanticdb: Option<bool>,
+}
+
+/// `ide` in a module file or a preset.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModuleIde {
+    /// The variant `scpm idea` turns into this module's IntelliJ module, as a variant selector
+    /// (`2.13`, `jvm-3`, …). IntelliJ modules can't share a content root, so a cross-built
+    /// module gets one IntelliJ module. Default: the first variant (the first Scala version
+    /// listed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -288,8 +350,9 @@ pub struct ModuleFile {
     /// Compiler plugins (`org:::name` for full-cross Scala 2 plugins); added as `-Xplugin`.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub compiler_plugins: IndexMap<String, DepSpec>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub boms: Vec<String>,
+    /// BOMs: `org:name: <version>` (exact, a range, `catalog` or `catalog:<name>`).
+    #[serde(default, deserialize_with = "boms", skip_serializing_if = "IndexMap::is_empty")]
+    pub boms: IndexMap<String, Ver>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scalac_options: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -328,6 +391,9 @@ pub struct ModuleFile {
     pub variants: IndexMap<String, ModuleFile>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub tasks: IndexMap<String, TaskDef>,
+    /// IDE settings (not allowed in `variants` overrides).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ide: Option<ModuleIde>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

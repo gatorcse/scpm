@@ -410,6 +410,7 @@ impl Server {
             test_names: strings("tests"),
             timeout: Some(std::time::Duration::from_secs(args["timeoutSeconds"].as_u64().unwrap_or(1800)))
                 .filter(|d| !d.is_zero()),
+            report_name: None,
         };
         self.build(args, "test", progress, |tc, graph, selected, handle, reporter| {
             // As in the CLI: clear every selected variant's report first, so a run that fails
@@ -422,6 +423,8 @@ impl Server {
             } else {
                 testing::runner_classpath(tc).map_err(|e| e.to_string())?
             };
+            // As `scpm test`: a run that fails before tests start leaves no stale JUnit reports.
+            testing::clear_reports(tc, &variants);
             let scope = compile::Scope { tests: true, runtime: true };
             if !compile::compile(tc, graph, selected, scope, handle).map_err(|e| e.to_string())? {
                 return Ok(false);

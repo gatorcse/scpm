@@ -107,10 +107,12 @@ final class TestRun {
     return (Framework) Class.forName(name, true, loader).getDeclaredConstructor().newInstance();
   }
 
-  Map<String, Object> run() {
+  /** The suites of each framework, in framework priority order; a class goes to the first. */
+  private List<Map.Entry<Framework, List<TaskDef>>> suites() {
     Discovery discovery = new Discovery(loader);
     List<String> classNames = Discovery.classNames(params.testClassesDirs());
     Set<String> claimed = new HashSet<>();
+    List<Map.Entry<Framework, List<TaskDef>>> suites = new ArrayList<>();
     for (Framework framework : frameworks) {
       List<TaskDef> taskDefs = new ArrayList<>();
       for (String className : classNames) {
@@ -124,13 +126,37 @@ final class TestRun {
                   taskDefs.add(new TaskDef(testName, fp, params.names(testName), selectors()));
                 });
       }
-      if (!taskDefs.isEmpty()) runFramework(framework, taskDefs);
+      if (!taskDefs.isEmpty()) suites.add(Map.entry(framework, taskDefs));
     }
+    return suites;
+  }
+
+  /**
+   * The {@code discover} result: {@code {"status": "ok", "suites": [{"framework": "munit",
+   * "classes": ["a.FooSuite"]}]}}, without running anything.
+   */
+  Map<String, Object> discover() {
+    List<Object> suites = new ArrayList<>();
+    for (Map.Entry<Framework, List<TaskDef>> e : suites()) {
+      Map<String, Object> item = new LinkedHashMap<>();
+      item.put("framework", e.getKey().name());
+      item.put("classes", e.getValue().stream().map(TaskDef::fullyQualifiedName).toList());
+      suites.add(item);
+    }
+    Map<String, Object> result = new LinkedHashMap<>();
+    result.put("status", "ok");
+    result.put("suites", suites);
+    return result;
+  }
+
+  Map<String, Object> run() {
+    List<Map.Entry<Framework, List<TaskDef>>> suites = suites();
+    for (Map.Entry<Framework, List<TaskDef>> e : suites) runFramework(e.getKey(), e.getValue());
     if (frameworks.isEmpty()) {
       out.log("warn", "no test framework found on the classpath");
-    } else if (claimed.isEmpty() && !params.filters().isEmpty()) {
+    } else if (suites.isEmpty() && !params.filters().isEmpty()) {
       out.log("warn", "no test suites match the filters " + String.join(", ", params.filters()));
-    } else if (claimed.isEmpty()) {
+    } else if (suites.isEmpty()) {
       out.log(
           "warn",
           "no test suites found in " + String.join(", ", params.testClassesDirs())

@@ -12,6 +12,7 @@ use crate::config::{ModuleFile, WorkspaceFile};
 use crate::diag::Diagnostics;
 use crate::filter;
 use crate::graph::Graph;
+use crate::ide;
 use crate::install::{self, ClasspathKind, InstallOptions, InstallSummary};
 use crate::lockfile::Lockfile;
 use crate::report::{Event, Mode, Reporter};
@@ -113,6 +114,17 @@ pub enum Command {
     },
     /// Serve the Model Context Protocol on stdio for agents (keeps a compile worker warm).
     Mcp,
+    /// Serve the Build Server Protocol on stdio, for IntelliJ, Metals v1 and other BSP clients
+    /// (they start it through `.bsp/scpm.json`; `--setup` writes that file).
+    Bsp {
+        /// Write `.bsp/scpm.json` (pointing at this scpm binary) instead of serving, so BSP
+        /// clients find scpm. A non-frozen `scpm install` keeps it up to date afterwards.
+        #[arg(long)]
+        setup: bool,
+        /// With --setup: replace a `.bsp/scpm.json` that scpm didn't write.
+        #[arg(long, requires = "setup")]
+        force: bool,
+    },
     /// Explain why an artifact is on the classpath (`org::name`, `org:name_3` or `name`).
     Why { artifact: String },
     /// Print a variant's classpath (installs first if the lockfile is stale).
@@ -129,6 +141,59 @@ pub enum Command {
         #[arg(value_enum)]
         file: SchemaFile,
     },
+    /// Generate IDE project files from the workspace and the lockfile (installs first if the
+    /// lock is stale). A non-frozen `scpm install` keeps generated files up to date.
+    Ide {
+        #[command(subcommand)]
+        target: IdeTarget,
+    },
+    /// Generate native IntelliJ project files in `.idea/` (same as `scpm ide idea`).
+    Idea(IdeaArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IdeTarget {
+    /// Write `.metals/mbt.json`, the build description Metals v2 reads.
+    Metals {
+        /// Write the file here instead (e.g. `"$MBT_OUTPUT_FILE"` in a Metals `*.mbt.sh`
+        /// importer script).
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        #[command(flatten)]
+        sources: SourcesArgs,
+        #[arg(long)]
+        frozen: bool,
+    },
+    /// Write native IntelliJ project files in `.idea/`: one module per scpm module (its
+    /// `ide.primary` variant), libraries, Scala SDKs and the project JDK.
+    Idea(IdeaArgs),
+}
+
+#[derive(Debug, Clone, Copy, clap::Args)]
+pub struct SourcesArgs {
+    /// Don't download missing sources jars; use only those already in the coursier cache.
+    #[arg(long)]
+    no_sources: bool,
+    /// Ask again for sources jars of modules recorded as publishing none.
+    #[arg(long, conflicts_with = "no_sources")]
+    refresh_sources: bool,
+}
+
+impl SourcesArgs {
+    fn options(self) -> ide::SourcesOptions {
+        ide::SourcesOptions { fetch: !self.no_sources, refresh: self.refresh_sources }
+    }
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct IdeaArgs {
+    #[command(flatten)]
+    sources: SourcesArgs,
+    /// Also replace IntelliJ files that scpm didn't generate (by default they are left alone).
+    #[arg(long)]
+    force: bool,
+    #[arg(long)]
+    frozen: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -347,11 +412,72 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Command::Install { frozen, verify } => {
             let (ws, graph) = load(&start)?;
-            let summary = install::install(&ws, &graph, InstallOptions { frozen: frozen || in_ci(), verify })?;
+            let frozen = frozen || in_ci();
+            let summary = install::install(&ws, &graph, InstallOptions { frozen, verify })?;
             if cli.json {
                 print_json(&summary)?;
             } else {
                 print_install_summary(&summary)?;
+            }
+            if !frozen && let Some(lock) = Lockfile::read(&ws.root).map_err(|e| Failure::Command(e.to_string()))? {
+                report_refresh(&ide::refresh(&ws, &lock));
+            }
+            Ok(())
+        }
+        Command::Ide { target: IdeTarget::Metals { output, sources, frozen } } => {
+            let (ws, graph) = load(&start)?;
+            let lock = install_quietly(&ws, &graph, frozen)?;
+            let tc = compile::Toolchain::new(&ws, &lock).map_err(|e| Failure::Command(e.to_string()))?;
+            let opts = ide::metals::Options { output: output.map(|o| start.join(o)), sources: sources.options() };
+            let s = ide::metals::generate(&tc, &opts).map_err(|e| Failure::Command(e.to_string()))?;
+            if cli.json {
+                print_json(&s)?;
+            } else {
+                for w in &s.warnings {
+                    eprintln!("warning: {w}");
+                }
+                println!(
+                    "{} {} ({} namespaces, {} dependency modules; sources jars: {} cached, {} fetched, {} unavailable)",
+                    if s.written { "Wrote" } else { "Up to date:" },
+                    s.path,
+                    s.namespaces,
+                    s.dependency_modules,
+                    s.sources.cached,
+                    s.sources.fetched,
+                    s.sources.missing
+                );
+            }
+            Ok(())
+        }
+        Command::Ide { target: IdeTarget::Idea(args) } | Command::Idea(args) => {
+            let (ws, graph) = load(&start)?;
+            let lock = install_quietly(&ws, &graph, args.frozen)?;
+            let tc = compile::Toolchain::new(&ws, &lock).map_err(|e| Failure::Command(e.to_string()))?;
+            let mut s =
+                ide::idea::generate(&tc, &ide::idea::Options { sources: args.sources.options(), force: args.force })
+                    .map_err(|e| Failure::Command(e.to_string()))?;
+            if let Some(w) = s.skipped_warning() {
+                s.warnings.insert(0, w);
+            }
+            if cli.json {
+                print_json(&s)?;
+            } else {
+                for w in &s.warnings {
+                    eprintln!("warning: {w}");
+                }
+                for (module, variant) in &s.modules {
+                    println!("{module}: {variant}");
+                }
+                println!(
+                    "{} IntelliJ module{}, {} libraries; {} file{} written, {} removed, {} skipped (open the workspace directory in IntelliJ)",
+                    s.modules.len(),
+                    if s.modules.len() == 1 { "" } else { "s" },
+                    s.libraries,
+                    s.written.len(),
+                    if s.written.len() == 1 { "" } else { "s" },
+                    s.removed.len(),
+                    s.skipped.len()
+                );
             }
             Ok(())
         }
@@ -400,6 +526,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 filters: suites,
                 test_names: tests,
                 timeout: (timeout > 0).then(|| std::time::Duration::from_secs(timeout)),
+                report_name: None,
             };
             let result = compile::Toolchain::new(&ws, &lock).and_then(|tc| {
                 // Clear every selected variant's report, including ones that no longer have tests.
@@ -545,6 +672,27 @@ fn run(cli: Cli) -> Result<(), Failure> {
                     .map_err(|e| Failure::Command(e.to_string()))
             }
         },
+        Command::Bsp { setup: true, force } => {
+            let (root, _) = workspace::find_root(&start)?;
+            let exe = ide::bsp::invoked_exe().map_err(|e| Failure::Command(e.to_string()))?;
+            let s = ide::bsp::setup(&root, &exe, force).map_err(|e| Failure::Command(e.to_string()))?;
+            if ide::idea::generated_before(&root) {
+                eprintln!(
+                    "warning: this workspace also has IntelliJ project files from `scpm idea`; importing it over BSP replaces that setup (open one or the other, and delete `.idea/` before a BSP import)"
+                );
+            }
+            if cli.json {
+                print_json(&s)?;
+            } else {
+                println!("{} {} (runs {} bsp)", if s.written { "Wrote" } else { "Up to date:" }, s.path, exe.display());
+            }
+            Ok(())
+        }
+        Command::Bsp { setup: false, .. } => match crate::bsp::serve(start) {
+            Ok(0) => Ok(()),
+            Ok(code) => Err(Failure::Exit(code.clamp(1, 255) as u8)),
+            Err(e) => Err(Failure::Command(e.to_string())),
+        },
         Command::Mcp => {
             crate::mcp::Server::new(start).serve().map_err(|e| Failure::Command(e.to_string()))?;
             Ok(())
@@ -683,10 +831,28 @@ fn load(start: &std::path::Path) -> Result<(Workspace, Graph), Failure> {
     Ok((ws, graph))
 }
 
-/// Install-before-run (design §5.4): re-lock and fetch as needed (frozen in CI), then read the lock.
+/// Install-before-run (design §5.4): re-lock and fetch as needed (frozen in CI), then read the
+/// lock. Outside frozen mode, IDE files scpm maintains are refreshed too: config edits that
+/// don't re-lock (scalacOptions, sources, `ide.primary`, …) reach them as well. The refresh
+/// uses cached sources jars only (no `cs`), and returns at once when there are no IDE files.
 /// Warnings and notices are printed on stderr; the notices are returned too, for `--json` reports.
 fn ensure_installed(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<(Lockfile, Vec<String>), Failure> {
     let (lock, summary) = install::ensure(ws, graph, frozen)?;
+    report_ensure(&summary);
+    if !frozen && !in_ci() {
+        report_refresh(&ide::refresh(ws, &lock));
+    }
+    Ok((lock, summary.notices))
+}
+
+/// Install-before-run without the IDE refresh (for the commands that generate IDE files).
+fn install_quietly(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<Lockfile, Failure> {
+    let (lock, summary) = install::ensure(ws, graph, frozen)?;
+    report_ensure(&summary);
+    Ok(lock)
+}
+
+fn report_ensure(summary: &InstallSummary) {
     for w in &summary.warnings {
         eprintln!("warning: {w}");
     }
@@ -696,7 +862,16 @@ fn ensure_installed(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<(Lock
     if !summary.relocked.is_empty() || summary.fetch.downloaded > 0 {
         eprintln!("installed: {} re-locked, {} downloaded", summary.relocked.len(), summary.fetch.downloaded);
     }
-    Ok((lock, summary.notices))
+}
+
+/// IDE files regenerated after an install go to stderr, so stdout keeps its own format.
+fn report_refresh(r: &ide::Refreshed) {
+    for w in &r.warnings {
+        eprintln!("warning: {w}");
+    }
+    if !r.written.is_empty() {
+        eprintln!("updated {}", r.written.join(", "));
+    }
 }
 
 /// A sortable, unique id for a run: `<unix millis>-<pid>`.

@@ -39,6 +39,12 @@ pub fn classes_dir(root: &Path, id: &str) -> PathBuf {
 /// Holds `.scpm/out/.lock` for the duration of a build so two scpm commands in one workspace
 /// don't compile into the same directories at once.
 pub fn workspace_lock(root: &Path) -> Result<File, CompileError> {
+    let never = AtomicBool::new(false);
+    Ok(workspace_lock_unless(root, &never)?.expect("never cancelled"))
+}
+
+/// [`workspace_lock`] that gives up (returning `None`) once `cancelled` is set.
+pub fn workspace_lock_unless(root: &Path, cancelled: &AtomicBool) -> Result<Option<File>, CompileError> {
     let dir = root.join(".scpm/out");
     fs::create_dir_all(&dir).map_err(|e| CompileError::Setup(format!("{}: {e}", dir.display())))?;
     let path = dir.join(".lock");
@@ -52,7 +58,8 @@ pub fn workspace_lock(root: &Path) -> Result<File, CompileError> {
     let mut warned = false;
     loop {
         match fetch::try_lock(&file) {
-            Ok(true) => return Ok(file),
+            Ok(true) => return Ok(Some(file)),
+            Ok(false) if cancelled.load(Ordering::SeqCst) => return Ok(None),
             Ok(false) => {
                 if !warned {
                     eprintln!("waiting for another scpm command in this workspace to finish…");
@@ -115,6 +122,82 @@ impl<'a> Toolchain<'a> {
         cp.extend(self.boot(&install::worker_boot())?);
         Ok(cp)
     }
+}
+
+/// The compiler options scpm passes for a variant (shared with the IDE generators).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompilerOptions {
+    /// The variant's `scalacOptions`, its release target and `-Xplugin:<jar>` per plugin.
+    pub scalac: Vec<String>,
+    pub javac: Vec<String>,
+    /// The Java release target: `release`, else the project JDK's major version (design §6.3).
+    pub release: Option<String>,
+    /// Compiler plugin jars (also in `scalac` as `-Xplugin:`), not counting SemanticDB's.
+    pub plugins: Vec<PathBuf>,
+    /// The SemanticDB options at the end of `scalac` (`ide.semanticdb`), so IDE generators
+    /// whose own compiler shouldn't write SemanticDB can leave them out.
+    pub semanticdb: Vec<String>,
+}
+
+/// The scalac and javac options a variant's main (or, with `test`, test) sources compile with:
+/// its own, the release target, its locked compiler plugins, and SemanticDB output into the
+/// classes directory when the workspace sets `ide.semanticdb`.
+pub fn compiler_options(
+    tc: &Toolchain,
+    v: &crate::workspace::Variant,
+    test: bool,
+) -> Result<CompilerOptions, CompileError> {
+    let ws = tc.ws;
+    let vlock = tc.lock.variants.get(&v.id).ok_or_else(|| InstallError::Stale(vec![v.id.clone()]))?;
+    // Relative `-Xplugin:` paths resolve against the workspace root (daemon and foreground alike).
+    let mut scalac = absolute_plugins(&ws.root, &v.scalac_options);
+    let plugins: Vec<PathBuf> = vlock.compiler_plugins.iter().map(|k| tc.file(k)).collect();
+    for jar in &plugins {
+        scalac.push(format!("-Xplugin:{}", jar.display()));
+    }
+    let mut javac = v.javac_options.clone();
+    let release = v.release.clone().or_else(|| ws.config.toolchain.jdk.as_deref().and_then(install::jdk_major));
+    if let Some(release) = &release {
+        javac.extend(["--release".to_string(), release.clone()]);
+        if let Some(s) = &v.scala {
+            if s.binary == "3" {
+                scalac.extend(["-java-output-version".to_string(), release.clone()]);
+            } else {
+                scalac.push(format!("-release:{release}"));
+            }
+        }
+    }
+    let semanticdb = match &v.scala {
+        Some(s) if install::semanticdb_enabled(ws) => {
+            let out =
+                if test { crate::testing::test_classes_dir(&ws.root, &v.id) } else { classes_dir(&ws.root, &v.id) };
+            semanticdb_options(tc, &s.full, &ws.root, &out)?
+        }
+        _ => Vec::new(),
+    };
+    scalac.extend(semanticdb.iter().cloned());
+    Ok(CompilerOptions { scalac, javac, release, plugins, semanticdb })
+}
+
+/// SemanticDB output for one Scala version: files go to `<out>/META-INF/semanticdb/`, named by
+/// their path relative to the workspace root (the layout Metals reads; the target root is set
+/// explicitly because the compiler runs in the daemon's directory).
+fn semanticdb_options(tc: &Toolchain, scala: &str, root: &Path, out: &Path) -> Result<Vec<String>, CompileError> {
+    let (root, out) = (root.display().to_string(), out.display().to_string());
+    if crate::coord::scala_binary_version(scala) == "3" {
+        return Ok(vec!["-Xsemanticdb".into(), "-sourceroot".into(), root, "-semanticdb-target".into(), out]);
+    }
+    let boot = install::semanticdb_boot(scala)
+        .ok_or_else(|| CompileError::Setup(format!("no SemanticDB plugin is published for Scala {scala}")))?;
+    let plugin = tc.boot(&boot)?;
+    let jar = plugin.first().ok_or_else(|| CompileError::Setup(format!("no SemanticDB plugin for Scala {scala}")))?;
+    Ok(vec![
+        format!("-Xplugin:{}", jar.display()),
+        "-Yrangepos".into(),
+        format!("-P:semanticdb:sourceroot:{root}"),
+        format!("-P:semanticdb:targetroot:{out}"),
+        "-P:semanticdb:failures:warning".into(),
+    ])
 }
 
 fn is_scala_library(key: &str) -> bool {
@@ -215,24 +298,7 @@ fn plan(tc: &Toolchain, node: &Node, upstream: &[String], tools: &str) -> Result
         classpath.insert(0, (None, classes_dir(&ws.root, &v.id)));
     }
 
-    let mut scalac_options = absolute_plugins(&ws.root, &v.scalac_options);
-    let vlock = &tc.lock.variants[&v.id];
-    for key in &vlock.compiler_plugins {
-        scalac_options.push(format!("-Xplugin:{}", tc.file(key).display()));
-    }
-    let mut javac_options = v.javac_options.clone();
-    // The release target defaults to the project JDK (design §6.3).
-    let release = v.release.clone().or_else(|| ws.config.toolchain.jdk.as_deref().and_then(install::jdk_major));
-    if let Some(release) = &release {
-        javac_options.extend(["--release".to_string(), release.clone()]);
-        if let Some(s) = &v.scala {
-            if s.binary == "3" {
-                scalac_options.extend(["-java-output-version".to_string(), release.clone()]);
-            } else {
-                scalac_options.push(format!("-release:{release}"));
-            }
-        }
-    }
+    let CompilerOptions { scalac: scalac_options, javac: javac_options, .. } = compiler_options(tc, v, node.test)?;
 
     // The fingerprint covers everything that can change the output; equal fingerprints let us
     // skip the worker entirely.
