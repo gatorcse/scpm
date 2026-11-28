@@ -106,6 +106,21 @@ fn init_in(dir: &Path, opts: &InitOptions, w: &mut Writer) -> Result<InitReport,
             root.join(WORKSPACE_FILE).display()
         )));
     };
+    // The Scala version the module ended up with, catalog references and defaults resolved: an
+    // inherited `none` (Java-only) or a Scala 3 too old for munit is refused like a bad --scala.
+    for v in &m.variants {
+        match &v.scala {
+            None => {
+                return Err(InitError::Usage(format!(
+                    "the workspace's default is `scala: none` (Java-only), but scpm init writes Scala sources\n  \
+                     help: pass --scala <version>, e.g. --scala {DEFAULT_SCALA}"
+                )));
+            }
+            Some(scala) => check_scala(&scala.full).map_err(|e| {
+                InitError::Usage(format!("{e}\n  help: the workspace's default Scala is {}; pass --scala", scala.full))
+            })?,
+        }
+    }
     Ok(InitReport {
         kind,
         root: root.clone(),
@@ -260,12 +275,12 @@ fn gitignore(root: &Path, w: &mut Writer) -> Result<(), InitError> {
 fn check_scala(v: &str) -> Result<(), InitError> {
     let parsed = ScalaVersion::parse(v).map_err(|e| InitError::Usage(format!("--scala: {e}")))?;
     if parsed.binary == "2.12" {
-        return Err(InitError::Usage(format!("--scala {v}: scpm compiles Scala 2.13 and 3, not 2.12")));
+        return Err(InitError::Usage(format!("Scala {v}: scpm compiles Scala 2.13 and 3, not 2.12")));
     }
     let minor: u32 = v.split('.').nth(1).and_then(|m| m.parse().ok()).unwrap_or(0);
     if parsed.binary == "3" && minor < 3 {
         return Err(InitError::Usage(format!(
-            "--scala {v}: the tests scpm init writes use munit {DEFAULT_MUNIT}, which needs Scala 3.3 or later"
+            "Scala {v}: the tests scpm init writes use munit {DEFAULT_MUNIT}, which needs Scala 3.3 or later"
         )));
     }
     Ok(())
@@ -610,5 +625,22 @@ mod tests {
         let err = init(tmp.path(), &InitOptions { name: None, scala: Some("3.2.2".into()) }).unwrap_err().to_string();
         assert!(err.contains("needs Scala 3.3 or later"), "{err}");
         assert!(init(tmp.path(), &InitOptions { name: None, scala: Some("3.3.6".into()) }).is_ok());
+    }
+
+    #[test]
+    fn an_inherited_scala_is_checked_like_an_explicit_one() {
+        for (default, expect) in [("none", "`scala: none`"), ("3.2.2", "needs Scala 3.3 or later")] {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::write(
+                tmp.path().join(WORKSPACE_FILE),
+                format!("modules: ['modules/*']\ntoolchain:\n  scala: {default}\n"),
+            )
+            .unwrap();
+            let err = init(&tmp.path().join("modules/a"), &InitOptions::default()).unwrap_err().to_string();
+            assert!(err.contains(expect), "{default}: {err}");
+            assert!(!tmp.path().join("modules").exists(), "{default}: rolled back");
+            let ok = init(&tmp.path().join("modules/a"), &InitOptions { name: None, scala: Some("3.9.0".into()) });
+            assert_eq!(ok.unwrap().variants, ["a@jvm-3"], "{default}: an explicit --scala wins");
+        }
     }
 }
