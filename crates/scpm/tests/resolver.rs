@@ -134,14 +134,55 @@ const EPOLL: &str = "io.netty:netty-transport-native-epoll:4.1.115.Final";
 /// app (Windows adds winonly) → base, nat; nat publishes per-system classifier jars; netty's
 /// epoll transport, whose natives the built-in table maps.
 fn fixture() -> Server {
+    fixture_with(&["linux-x86_64", "linux-aarch_64"])
+}
+
+/// [`fixture`] with only these classifier jars of the epoll transport.
+fn fixture_with(epoll_classifiers: &[&str]) -> Server {
     let mut r = Repo::default();
     r.module("org.fix:base:1.0", &[], &[], &[])
         .module("org.fix:winonly:1.0", &[], &[], &[])
         .module("org.fix:nat:1.0", &[], &[], &["linux-x86_64", "osx-aarch_64"])
         .module("org.fix:app:1.0", &["org.fix:base:1.0", "org.fix:nat:1.0"], &["org.fix:winonly:1.0"], &[])
-        .module(EPOLL, &[], &[], &["linux-x86_64", "linux-aarch_64"])
+        .module(EPOLL, &[], &[], epoll_classifiers)
         .module("com.example:hello:1.0", &[], &[], &[]);
     Server::maven(r.files, None)
+}
+
+/// A mapped native jar the repository doesn't serve: a warning under scpm's own mapping (its
+/// table follows Maven Central, so a proxy or mirror is missing it), an error under one the
+/// user wrote (most likely a typo in the classifier).
+#[test]
+fn a_mapped_native_jar_the_repository_lacks() {
+    if stage().is_none() {
+        return;
+    }
+    // Built-in row: epoll 4.1.115 maps linux-aarch64 to `linux-aarch_64`, which isn't served.
+    let server = fixture_with(&["linux-x86_64"]);
+    let ws = tempfile::tempdir().unwrap();
+    // The host's own system too, so the restore after the re-lock has its projection.
+    workspace(ws.path(), &server, &format!("  systems: [linux-aarch64, linux-x86_64, {}]\n", scpm::system::own()));
+    let cache = tempfile::tempdir().unwrap();
+    let summary = json_install(ws.path(), cache.path());
+    let warnings = summary["warnings"].to_string();
+    assert!(
+        warnings.contains("no native jar on linux-aarch64 (`linux-aarch_64`)") && warnings.contains("404 or 403"),
+        "{summary}"
+    );
+    // A mapping the user wrote, with a typo: an error, and no lock is written.
+    let ws = tempfile::tempdir().unwrap();
+    workspace(
+        ws.path(),
+        &server,
+        "  systems: [linux-x86_64]\n  nativeClassifiers:\n    - {module: 'org.fix:nat', natives: {linux-x86_64: linux-x86-64}}\n",
+    );
+    let out = scpm(ws.path(), cache.path()).arg("install").assert().code(1);
+    let err = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        err.contains("org.fix:nat:1.0: the repository has no native jar for linux-x86_64 (`linux-x86-64`)"),
+        "{err}"
+    );
+    assert!(!ws.path().join("scpm-lock.yaml").exists());
 }
 
 /// Java modules `a` (app, and the epoll transport) and `b` (hello only).

@@ -1181,14 +1181,25 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     .map_err(|e| with_notice(e, &repos, true))?;
 
     record_artifacts(&mut lock, all.iter().flat_map(|req| results[*req].artifacts()), &repos)?;
-    // Systems a mapped module gets no native jar on (design §5.4): a note, never an error.
+    // Systems a mapped module got no native jar on (design §5.4): unmapped ones are a note, a
+    // built-in mapping's missing jar a warning, a user-written mapping's an error (before the
+    // lock is written).
     if resolver.full_context() {
+        let mut errors: Vec<String> = Vec::new();
         for req in requests.values() {
-            for note in native_notes(req, &results[req], &ctx.systems) {
-                if !notes.contains(&note) {
-                    notes.push(note);
+            let found = native_notes(req, &results[req], &ctx.systems);
+            for (into, items) in
+                [(&mut notes, found.notes), (&mut warnings, found.warnings), (&mut errors, found.errors)]
+            {
+                for item in items {
+                    if !into.contains(&item) {
+                        into.push(item);
+                    }
                 }
             }
+        }
+        if !errors.is_empty() {
+            return Err(InstallError::Resolve(errors.join("\n")));
         }
     }
     for (name, req) in &boot_requests {
@@ -1375,13 +1386,28 @@ impl Resolver {
     }
 }
 
-/// The systems a mapped module on a classpath got no native jar for (design §5.4): no mapping
-/// row covers the system at the resolved version (a library that doesn't support it, or a
-/// version older than its native jars), or the repository lacks the mapped jar, which the
-/// sidecar leaves out rather than failing the resolution. One note per module and version.
-fn native_notes(req: &ResolveRequest, res: &Resolution, systems: &[String]) -> Vec<String> {
+/// What a re-lock found about mapped modules' native jars (design §5.4).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NativeFindings {
+    /// No mapping row covers a system at the resolved version (a library that doesn't support
+    /// it, or a version older than its native jars): expected, so a note.
+    notes: Vec<String>,
+    /// A built-in row maps the system, but the repository answered 404 or 403 for the jar (the
+    /// sidecar leaves it out, as coursier skips an optional artifact on either). The table
+    /// follows Maven Central, so this is a proxy's negative cache, a mirror without the
+    /// classifiers, or the like: a warning.
+    warnings: Vec<String>,
+    /// The same for a mapping the user wrote (`natives:`, `lock.nativeClassifiers`), most
+    /// likely a typo in a classifier: an error.
+    errors: Vec<String>,
+}
+
+/// [`NativeFindings`] for one request's resolution. A module whose matching rows map nothing
+/// (`natives: {}`, which turns mapping off) is never mentioned.
+fn native_notes(req: &ResolveRequest, res: &Resolution, systems: &[String]) -> NativeFindings {
+    let mut found = NativeFindings::default();
     if req.natives.is_empty() {
-        return Vec::new();
+        return found;
     }
     // Keys on each system.
     let on: BTreeMap<&str, BTreeSet<&str>> = systems
@@ -1400,43 +1426,52 @@ fn native_notes(req: &ResolveRequest, res: &Resolution, systems: &[String]) -> V
         .collect();
     let mains: BTreeSet<&str> =
         on.values().flatten().copied().filter(|k| k.split(':').count() == 3 && !k.contains('@')).collect();
-    let mut notes = Vec::new();
     for key in mains {
         let mut parts = key.split(':');
         let (Some(g), Some(a), Some(v)) = (parts.next(), parts.next(), parts.next()) else { continue };
         let module = format!("{g}:{a}");
         let rows: Vec<&crate::natives::NativeSpec> = req.natives.iter().filter(|n| n.module == module).collect();
-        if rows.is_empty() {
+        if rows.iter().all(|r| r.natives.is_empty()) {
             continue;
         }
         let mut unmapped = Vec::new();
-        let mut absent = Vec::new();
+        let (mut absent_built_in, mut absent_written) = (Vec::new(), Vec::new());
         for s in systems.iter().filter(|s| on[s.as_str()].contains(key)) {
-            let classifier = rows
+            let mapped = rows
                 .iter()
                 .filter(|r| r.versions.as_deref().is_none_or(|i| interval_contains(i, v)))
-                .find_map(|r| r.natives.get(s));
-            match classifier {
+                .find_map(|r| r.natives.get(s).map(|c| (c, r.written)));
+            match mapped {
                 None => unmapped.push(s.as_str()),
-                Some(c) if !on[s.as_str()].contains(format!("{key}:{c}").as_str()) => absent.push(format!("{s} ({c})")),
+                Some((c, written)) if !on[s.as_str()].contains(format!("{key}:{c}").as_str()) => {
+                    if written { &mut absent_written } else { &mut absent_built_in }.push(format!("{s} (`{c}`)"))
+                }
                 Some(_) => {}
             }
         }
         if !unmapped.is_empty() {
-            notes.push(format!(
+            found.notes.push(format!(
                 "{key} gets no native jar on {}: no native mapping covers {} at this version",
                 unmapped.join(", "),
                 if unmapped.len() == 1 { "that system" } else { "those systems" }
             ));
         }
-        if !absent.is_empty() {
-            notes.push(format!(
-                "{key} gets no native jar on {}: its repository doesn't have the mapped classifier",
-                absent.join(", ")
+        if !absent_built_in.is_empty() {
+            found.warnings.push(format!(
+                "{key} gets no native jar on {}: scpm's mapping names that classifier, but the repository answered \
+                 404 or 403 for it (a proxy's negative cache, or a mirror without the classifier jars?)",
+                absent_built_in.join(", ")
+            ));
+        }
+        if !absent_written.is_empty() {
+            found.errors.push(format!(
+                "{key}: the repository has no native jar for {} (it answered 404 or 403)\n  help: check the \
+                 classifier in `natives:` or `lock.nativeClassifiers`; leave a system out for no native jar",
+                absent_written.join(", ")
             ));
         }
     }
-    notes
+    found
 }
 
 /// Whether a Maven interval (`[a,b)`, `[a,)`, …) contains `version`.
@@ -2076,24 +2111,43 @@ mod tests {
             (art(&format!("{epoll}:4.1.30.Final")), None),
             (art(&format!("{epoll}:4.1.30.Final:linux-x86_64")), Some(vec!["linux-x86_64".into()])),
         ]);
+        let found = native_notes(&req, &old, &systems);
         assert_eq!(
-            native_notes(&req, &old, &systems),
+            found.notes,
             [format!(
                 "{epoll}:4.1.30.Final gets no native jar on linux-aarch64, macos-aarch64: no native mapping covers those systems at this version"
             )]
         );
-        // 4.1.115 maps linux-aarch_64, which this repository lacked.
+        assert!(found.warnings.is_empty() && found.errors.is_empty());
+        // 4.1.115 maps linux-aarch_64, which this repository didn't serve: a built-in row's warning.
         let new = Resolution::Merged(vec![
             (art(&format!("{epoll}:4.1.115.Final")), Some(vec!["linux-aarch64".into(), "linux-x86_64".into()])),
             (art(&format!("{epoll}:4.1.115.Final:linux-x86_64")), Some(vec!["linux-x86_64".into()])),
         ]);
-        assert_eq!(
-            native_notes(&req, &new, &systems),
-            [format!(
-                "{epoll}:4.1.115.Final gets no native jar on linux-aarch64 (linux-aarch_64): its repository doesn't have the mapped classifier"
-            )]
+        let found = native_notes(&req, &new, &systems[..2]);
+        assert!(found.notes.is_empty() && found.errors.is_empty(), "{found:?}");
+        assert_eq!(found.warnings.len(), 1);
+        assert!(
+            found.warnings[0]
+                .starts_with(&format!("{epoll}:4.1.115.Final gets no native jar on linux-aarch64 (`linux-aarch_64`)"))
         );
-        assert!(native_notes(&ResolveRequest::default(), &new, &systems).is_empty());
+        assert!(found.warnings[0].contains("404 or 403"), "{found:?}");
+        // The same for a mapping the user wrote: an error.
+        let mine = BTreeMap::from([("linux-aarch64".to_string(), "linux-aarch_64".to_string())]);
+        let written = ResolveRequest {
+            natives: crate::natives::specs(&crate::natives::BUILT_IN, &[(epoll.into(), mine)]),
+            ..Default::default()
+        };
+        let found = native_notes(&written, &new, &systems[..2]);
+        assert_eq!(found.errors.len(), 1, "{found:?}");
+        assert!(found.errors[0].contains("natives:"), "{found:?}");
+        // `natives: {}` turns mapping off: nothing to say.
+        let off = ResolveRequest {
+            natives: crate::natives::specs(&crate::natives::BUILT_IN, &[(epoll.into(), BTreeMap::new())]),
+            ..Default::default()
+        };
+        assert_eq!(native_notes(&off, &old, &systems), NativeFindings::default());
+        assert_eq!(native_notes(&ResolveRequest::default(), &new, &systems), NativeFindings::default());
     }
 
     #[test]

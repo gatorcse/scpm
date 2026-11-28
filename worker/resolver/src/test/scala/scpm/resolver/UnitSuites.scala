@@ -140,6 +140,19 @@ class DefaultedFieldsSuite extends munit.FunSuite:
     )
   }
 
+class RecordingSuite extends munit.FunSuite:
+  test("checksum errors give expected and actual; the cache's own misses aren't a repository's") {
+    assertEquals(
+      Recording.checksums("wrong checksum: /c/x.jar (expected SHA-1 abc123 in /c/x.jar.sha1, got def456)"),
+      ("abc123", "def456")
+    )
+    assertEquals(Recording.checksums("checksum not found: /c/x.jar"), ("", ""))
+    assert(Recording.localMiss("/cache/https/h/x.pom not found", "/cache"))
+    assert(Recording.localMiss("file in cache not found or too old: /cache/x", "/cache"))
+    assert(!Recording.localMiss("not found: https://h/x.pom", "/cache"))
+    assert(!Recording.localMiss("unauthorized: https://h/x.pom (R)", "/cache"))
+  }
+
 class TrustSuite extends munit.FunSuite:
   // Certificates stand in as names: only which stores are combined matters here.
   private val (root, user, jdk) = (Seq("root"), Seq("user"), Seq("jdk"))

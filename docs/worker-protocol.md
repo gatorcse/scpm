@@ -203,7 +203,7 @@ A root is `{module: "org:name", version, classifier?, type?, exclusions: ["org:n
 transitive}`; a native mapping `{module, versions? (a Maven interval), natives: {<system>:
 <classifier>}}`, several per module allowed (the first that maps the system at the resolved
 version applies); `boms` and `forced` are `org:name:version`. A mapped native jar the
-repository lacks is left out, not an error.
+repository answers 404 or 403 for is left out, not an error.
 
 Result: `{results: [...]}`, one per request in order: `{classpath: [entry]}`, merged over the
 request's systems (an entry not on every system lists its `systems`, sorted), or `{bySystem:

@@ -138,10 +138,11 @@ pub fn classpath(machine: &Machine) -> Result<(Vec<PathBuf>, Option<String>), Re
     };
     let list = BootstrapList::parse(&text)
         .map_err(|e| ResolverError::Setup(format!("the resolver's built-in jar list is invalid: {e}")))?;
-    // A source checkout's own jars stand in for a development list, which names no release; a
-    // binary with a released list keeps its pins, unless the checkout's jars are used anyway, which
-    // is then said as for SCPM_RESOLVER_CLASSPATH.
+    // A source checkout's own jars stand in for a development list, which names no release. A
+    // released list keeps its pins: only a debug build (a developer's) uses the checkout's jars
+    // over it, and says so as for SCPM_RESOLVER_CLASSPATH.
     if test_list.is_none()
+        && (list.release.is_none() || cfg!(debug_assertions))
         && let Some((dir, jars)) = local_build()
     {
         if list.release.is_none() {

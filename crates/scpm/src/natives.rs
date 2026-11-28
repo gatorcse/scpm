@@ -122,6 +122,10 @@ pub struct NativeSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub versions: Option<String>,
     pub natives: BTreeMap<String, String>,
+    /// Written by the user (`natives:`, `lock.nativeClassifiers`) rather than scpm's table: a
+    /// mapped jar missing from the repository is then an error, not a warning. Not sent.
+    #[serde(skip)]
+    pub written: bool,
 }
 
 /// The mappings for one JVM request: `overrides` (a direct dependency's `natives:`, then
@@ -131,7 +135,7 @@ pub fn specs(table: &Table, overrides: &[(String, BTreeMap<String, String>)]) ->
     let mut out: Vec<NativeSpec> = Vec::new();
     for (module, natives) in overrides {
         if !out.iter().any(|s| &s.module == module) {
-            out.push(NativeSpec { module: module.clone(), versions: None, natives: natives.clone() });
+            out.push(NativeSpec { module: module.clone(), versions: None, natives: natives.clone(), written: true });
         }
     }
     for m in table.mappings {
@@ -142,6 +146,7 @@ pub fn specs(table: &Table, overrides: &[(String, BTreeMap<String, String>)]) ->
             module: m.module.to_string(),
             versions: m.range.interval(),
             natives: m.natives.iter().map(|(s, c)| (s.to_string(), c.to_string())).collect(),
+            written: false,
         });
     }
     out
@@ -219,7 +224,11 @@ mod tests {
         let mine = BTreeMap::from([("linux-x86_64".to_string(), "linux-x86_64".to_string())]);
         let specs = specs(&BUILT_IN, &[(epoll.clone(), mine.clone()), (epoll.clone(), BTreeMap::new())]);
         let found: Vec<&NativeSpec> = specs.iter().filter(|s| s.module == epoll).collect();
-        assert_eq!(found, [&NativeSpec { module: epoll, versions: None, natives: mine }], "first wins, all versions");
+        assert_eq!(
+            found,
+            [&NativeSpec { module: epoll, versions: None, natives: mine, written: true }],
+            "first wins, all versions"
+        );
         // epoll's three rows became the one override.
         assert_eq!(specs.len(), BUILT_IN.mappings.len() - 2);
     }

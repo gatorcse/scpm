@@ -201,11 +201,26 @@ class ServiceSuite extends munit.FunSuite:
     assert(data.contains("\"repository\":\"public\"") && data.contains("\"status\":\"404\""), data)
   }
 
-  test("a mapped native jar the repository lacks is left out, not an error") {
+  test("a mapped native jar the repository answers 404 for is left out, not an error") {
     val cache = Files.createTempDirectory("resolver-cache").toFile
     val wrong = List(NativeSpec("org.fix:nat", None, Map("linux-x86_64" -> "linux-riscv64")))
     val Seq(r) = resolve(cache, request(List("linux-x86_64"), natives = wrong)): @unchecked
     assertEquals(keys(r), List("org.fix:app:1.0", "org.fix:base:1.0", "org.fix:nat:1.0"))
+  }
+
+  // Which answers coursier 2.1.27 skips an optional artifact on, measured here: 404 and 403 (S3
+  // answers 403 for a missing object without ListBucket); a 401 still fails the resolution.
+  test("a mapped native jar answered 403 is left out too; 401 fails") {
+    val path = "/public/org/fix/nat/1.0/nat-1.0-linux-x86_64.jar"
+    try
+      server.statuses.put(path, 403)
+      val Seq(forbidden) = resolve(Files.createTempDirectory("c").toFile, request(List("linux-x86_64"))): @unchecked
+      assertEquals(forbidden.error, None, forbidden.toString)
+      assert(!keys(forbidden).exists(_.contains("nat:1.0:linux")), forbidden.toString)
+      server.statuses.put(path, 401)
+      val Seq(unauthorized) = resolve(Files.createTempDirectory("c").toFile, request(List("linux-x86_64"))): @unchecked
+      assertEquals(unauthorized.error.map(_.code), Some("unauthorized"), unauthorized.toString)
+    finally server.statuses.remove(path)
   }
 
   test("several rows for one module: the first that maps the system at the version") {
@@ -242,6 +257,30 @@ class ServiceSuite extends munit.FunSuite:
     val err = intercept[ResolverError](service.listVersions(ListVersionsParams(repos, Files.createTempDirectory("c").toFile.getPath, module = "org.fix:base")))
     assertEquals(err.body.code, "unauthorized")
     server.statuses.remove("/public/org/fix/base/maven-metadata.xml")
+  }
+
+  test("a refused metadata refresh is an error, not the stale cached versions") {
+    val cache = Files.createTempDirectory("resolver-cache").toFile
+    // TTL 0: every listing re-checks maven-metadata.xml (a `LocalUpdateChanging` pass).
+    val params = ListVersionsParams(repos, cache.getPath, ttl = Some(0), module = "org.fix:base")
+    assertEquals(service.listVersions(params).versions, List("0.1", "1.0"))
+    server.metadata("public", "org.fix", "base", Seq("0.1", "1.0", "2.0"))
+    server.statuses.put("/public/org/fix/base/maven-metadata.xml", 401)
+    try
+      val err = intercept[ResolverError](service.listVersions(params))
+      assertEquals(err.body.code, "unauthorized")
+    finally
+      server.statuses.remove("/public/org/fix/base/maven-metadata.xml")
+      server.metadata("public", "org.fix", "base", Seq("0.1", "1.0"))
+  }
+
+  test("an offline miss names the POM it would have needed") {
+    val cache = Files.createTempDirectory("resolver-cache").toFile
+    val params = ResolveParams(repos, cache.getPath, offline = true, requests = List(request(List("linux-x86_64"))))
+    val err = service.resolve(params).results.head.error.getOrElse(fail("expected an error"))
+    assertEquals(err.code, "offline_miss")
+    val data = new String(com.github.plokhotnyuk.jsoniter_scala.core.writeToArray(err.data.get), "UTF-8")
+    assert(data.contains(server.url("public") + "org/fix/app/1.0/app-1.0.pom"), data)
   }
 
   test("the file cache is built with the sealed settings") {

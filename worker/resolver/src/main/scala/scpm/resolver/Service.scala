@@ -76,21 +76,22 @@ object Interval:
 final class Recording(underlying: FileCache[Task]) extends Cache[Task]:
   val log = ConcurrentLinkedQueue[(String, Either[String, Unit])]()
 
+  private val cacheRoot = underlying.location.getCanonicalPath
+
   private def recorded(f: Cache.Fetch[Task]): Cache.Fetch[Task] = artifact =>
     EitherT(f(artifact).run.map { result =>
-      log.add(artifact.url -> result.map(_ => ()))
+      if !result.left.exists(Recording.localMiss(_, cacheRoot)) then log.add(artifact.url -> result.map(_ => ()))
       result
     })
 
-  // Only the passes that go to the network are recorded: a cache-only pass that misses (the
-  // first of `LocalUpdateChanging, FetchMissing`) isn't something a repository answered.
+  // Every pass is recorded, since `LocalUpdateChanging` and `LocalUpdate` do ask the repository
+  // about changing files (`maven-metadata.xml`) once their TTL has expired; only answers that
+  // are the cache's own misses, not a repository's, are left out.
   // Every policy in turn, as `FileCache.fetch` does (`Versions` uses this one).
   override def fetch: Cache.Fetch[Task] = artifact =>
     fetchs.tail.foldLeft(fetchs.head(artifact))((acc, f) => acc.orElse(f(artifact)))
   override def fetchs: Seq[Cache.Fetch[Task]] =
-    underlying.cachePolicies.zip(underlying.fetchs).map { (policy, f) =>
-      if Recording.remote(policy) then recorded(f) else f
-    }
+    underlying.fetchs.map(recorded)
   override def ec: ExecutionContext = underlying.ec
   override def file(artifact: Artifact): EitherT[Task, ArtifactError, File] = underlying.file(artifact)
   override def loggerOpt: Option[CacheLogger] = underlying.loggerOpt
@@ -98,10 +99,17 @@ final class Recording(underlying: FileCache[Task]) extends Cache[Task]:
   def entries: List[(String, Either[String, Unit])] = log.asScala.toList
 
 object Recording:
-  /** Whether a pass with this policy asks repositories (rather than only the cache). */
-  def remote(policy: CachePolicy): Boolean = policy match
-    case CachePolicy.FetchMissing | CachePolicy.Update | CachePolicy.UpdateChanging | CachePolicy.ForceDownload => true
-    case _                                                                                                      => false
+  /** Whether an error is the cache's own miss (a file not in the cache, or too old there), which
+    * no repository answered: those name a path under the cache, or are `FileTooOldOrNotFound`. */
+  def localMiss(error: String, cacheRoot: String): Boolean =
+    error.contains(cacheRoot) || status(error) == "offline"
+
+  /** `(expected, actual)` from a checksum error's text, when it has them (both empty otherwise). */
+  def checksums(error: String): (String, String) =
+    val pattern = """.*expected \S+ (\S+).*got (\S+?)\)?$""".r
+    error.trim match
+      case pattern(expected, actual) => (expected, actual)
+      case _                         => ("", "")
 
   /** An HTTP status, or what went wrong, from coursier's error text (`ArtifactError.describe`). */
   def status(error: String): String =
@@ -168,7 +176,7 @@ final class Service(proxy: Option[ProxySpec], trust: Option[TrustSpec], userAgen
               case s @ ("401" | "403") =>
                 throw ResolverError("unauthorized", s"repository `$id` refused $url: $err", UnauthorizedData(id, url, s.toInt))
               case "checksum" =>
-                throw ResolverError("checksum", s"repository `$id`: $err", ChecksumData(url, "", err))
+                throw ResolverError("checksum", s"repository `$id`: $err", { val (expected, actual) = Recording.checksums(err); ChecksumData(url, expected, actual) })
               case "transport" =>
                 throw ResolverError("transport", s"repository `$id`: $err", TransportData(id, url, err))
               case _ => ()
@@ -303,7 +311,8 @@ final class Service(proxy: Option[ProxySpec], trust: Option[TrustSpec], userAgen
                 url = url,
                 checksumUrls = art.checksumUrls.map((k, v) => k -> (url + v.stripPrefix(art.url))),
                 extra = Map.empty,
-                // Optional: a mapped jar the repository lacks leaves that system without one
+                // Optional: a mapped jar the repository answers 404 or 403 for (S3 answers 403 for a
+                // missing object without ListBucket) leaves that system without one
                 // (scpm notes it) instead of failing the whole resolution.
                 optional = true
               )
@@ -494,6 +503,13 @@ object Service:
     * `offline` for whether the request was offline (then a miss is `offline_miss`). */
   def error(e: CoursierError, specs: List[RepoSpec], recording: Recording, offline: Boolean): ResolverError =
     def repoOf(url: String) = specs.find(s => under(url, Some(s.url))).fold("")(_.id)
+    // The POM a module comes from in the first repository allowed for it (offline, nothing is
+    // recorded, since nothing is asked).
+    def pomUrl(c: ResolutionError.CantDownloadModule): Option[String] =
+      val (org, name, version) = (c.module.organization.value, c.module.name.value, c.versionConstraint.asString)
+      Groups.allowed(specs, org).headOption.flatMap(id => specs.find(_.id == id)).map { s =>
+        s"${normalized(s.url)}/${org.replace('.', '/')}/$name/$version/$name-$version.pom"
+      }
     // Requests about the module, anchored at a path segment (`/org/acme/name/`, not `xorg/…`).
     def tried(c: ResolutionError.CantDownloadModule) =
       val path = "/" + c.module.organization.value.replace('.', '/') + "/" + c.module.name.value + "/"
@@ -511,11 +527,13 @@ object Service:
           case (Some(t), _, _, _) =>
             ResolverError("unauthorized", s"repository `${t.repository}` refused ${t.url} (HTTP ${t.status})", UnauthorizedData(t.repository, t.url, t.status.toInt))
           case (_, Some(t), _, _) =>
-            ResolverError("checksum", s"${t.url}: a served checksum didn't match", ChecksumData(t.url, "", "mismatch"))
+            val text = recording.entries.collectFirst { case (u, Left(e)) if u == t.url => e }.getOrElse("")
+            val (expected, actual) = Recording.checksums(text)
+            ResolverError("checksum", s"${t.url}: a served checksum didn't match ($text)", ChecksumData(t.url, expected, actual))
           case (_, _, Some(t), Some((c, _))) =>
             ResolverError("transport", s"cannot reach ${t.url}: ${c.perRepositoryErrors.mkString("; ")}", TransportData(t.repository, t.url, c.perRepositoryErrors.mkString("; ")))
           case (_, _, _, Some((c, attempts))) if offline =>
-            ResolverError("offline_miss", s"${c.module.repr}:${c.versionConstraint.asString} is not cached", OfflineMissData(attempts.headOption.fold(c.module.repr)(_.url)))
+            ResolverError("offline_miss", s"${c.module.repr}:${c.versionConstraint.asString} is not cached", OfflineMissData(attempts.headOption.map(_.url).orElse(pomUrl(c)).getOrElse(c.module.repr)))
           case (_, _, _, Some((c, attempts))) =>
             ResolverError("not_found", r.getMessage, NotFoundData(c.module.repr, c.versionConstraint.asString, attempts))
           case _ => ResolverError.plain("internal", r.getMessage)
