@@ -11,7 +11,7 @@ use scpm::coursier::{Auth, Repo};
 use scpm::credentials::CoursierCredentials;
 use scpm::fetch::{FetchItem, FetchOptions, fetch_all, sha256_file};
 use scpm::install::fetch_items;
-use scpm::lockfile::{ArtifactLock, Lockfile};
+use scpm::lockfile::{ArtifactLock, Classpath, ClasspathEntry, Lockfile};
 use support::{HELLO_JAR_PATH, Reply, Server, hello_repo_files};
 
 const JAR: &[u8] = b"PK\x03\x04 not really a jar, but bytes with a known sha256";
@@ -244,8 +244,8 @@ fn credential_errors_only_matter_when_downloading() {
 }
 
 fn hello_lock() -> Lockfile {
-    let mut lock = Lockfile { lockfile_version: 1, ..Default::default() };
-    lock.boot.insert("test".into(), vec!["com.example:hello:1.0".into()]);
+    let mut lock = Lockfile { lockfile_version: 2, ..Default::default() };
+    lock.boot.insert("test".into(), Classpath::plain([ClasspathEntry::Artifact("com.example:hello:1.0".into())]));
     lock.artifacts.insert(
         "com.example:hello:1.0".into(),
         ArtifactLock { repo: "local".into(), sha256: sha256(JAR), size: JAR.len() as u64 },

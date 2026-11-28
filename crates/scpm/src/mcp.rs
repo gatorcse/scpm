@@ -334,7 +334,7 @@ impl Server {
         let summary = install::install(
             &ws,
             &graph,
-            install::InstallOptions { frozen: frozen || install::in_ci(), verify: false },
+            install::InstallOptions { frozen: frozen || install::in_ci(), ..Default::default() },
         )?;
         Ok(serde_json::to_value(summary)?)
     }

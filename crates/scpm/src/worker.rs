@@ -264,6 +264,41 @@ pub fn java_home() -> Option<PathBuf> {
     )
 }
 
+/// The home of exactly the JDK `detect_java` runs: like [`java_home`], except that when
+/// `SCPM_JAVA` is set and no home can be derived from it, `None` rather than another JDK's.
+pub fn detected_java_home() -> Option<PathBuf> {
+    detected_java_home_from(
+        env::var_os("SCPM_JAVA"),
+        &[env::var_os("SCPM_JAVA_HOME"), env::var_os("JAVA_HOME")],
+        env::var_os("PATH"),
+    )
+}
+
+fn detected_java_home_from(
+    explicit: Option<OsString>,
+    homes: &[Option<OsString>],
+    path: Option<OsString>,
+) -> Option<PathBuf> {
+    match explicit.filter(|j| !j.is_empty()) {
+        Some(java) => {
+            let exe = if cfg!(windows) { "java.exe" } else { "java" };
+            explicit_java(Some(java), path.as_ref())
+                .and_then(|java| java.parent()?.parent().map(Path::to_path_buf))
+                .filter(|home| home.join("bin").join(exe).is_file())
+                .map(|home| home.canonicalize().unwrap_or(home))
+        }
+        // Exactly what `detect_java` picks: the first non-empty home variable, else the
+        // executable `java` that `find_in_path` finds on PATH (skipping non-executable files).
+        None => selected_java_home(|var| match var {
+            "SCPM_JAVA_HOME" => homes.first().cloned().flatten(),
+            "JAVA_HOME" => homes.get(1).cloned().flatten(),
+            "PATH" => path.clone(),
+            _ => None,
+        })
+        .map(|home| home.canonicalize().unwrap_or(home)),
+    }
+}
+
 fn java_home_from(explicit: Option<OsString>, homes: &[Option<OsString>], path: Option<OsString>) -> Option<PathBuf> {
     let exe = if cfg!(windows) { "java.exe" } else { "java" };
     // `<home>/bin/java`; a version manager's shim resolves to the manager, not a JDK.
@@ -987,7 +1022,7 @@ mod version_tests {
 
 #[cfg(test)]
 mod java_home_tests {
-    use super::java_home_from;
+    use super::{detected_java_home_from, find_in_path, java_home_from};
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1023,5 +1058,41 @@ mod java_home_tests {
         assert_eq!(java_home_from(None, &homes, path.clone()), Some(j17));
         assert_eq!(java_home_from(Some("".into()), &[None, None], path.clone()), Some(j21));
         assert_eq!(java_home_from(Some("/nowhere/bin/java".into()), &[None, None], None), None);
+    }
+
+    /// The host system is read from the JDK `detect_java` runs, never from another one.
+    #[test]
+    fn the_detected_home_follows_scpm_java_strictly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (j21, j17) = (jdk(dir.path(), "jdk21"), jdk(dir.path(), "jdk17"));
+        let exe = if cfg!(windows) { "java.exe" } else { "java" };
+        let homes = [None, Some(OsString::from(&j17))];
+        let path = Some(j21.join("bin").into_os_string());
+        let explicit = Some(j21.join("bin").join(exe).into_os_string());
+        assert_eq!(detected_java_home_from(explicit, &homes, None), Some(j21.clone()));
+        assert_eq!(detected_java_home_from(Some(OsString::from(exe)), &homes, path.clone()), Some(j21.clone()));
+        // `SCPM_JAVA` names a java without a JDK home: no home, not JAVA_HOME's.
+        let wrapper = dir.path().join("java-wrapper");
+        fs::write(&wrapper, "").unwrap();
+        assert_eq!(detected_java_home_from(Some(wrapper.into_os_string()), &homes, path.clone()), None);
+        assert_eq!(
+            java_home_from(Some(dir.path().join("java-wrapper").into_os_string()), &homes, None),
+            Some(j17.clone())
+        );
+        assert_eq!(detected_java_home_from(None, &homes, path), Some(j17));
+    }
+
+    /// On PATH, the home is that of the `java` `detect_java` runs: a non-executable `java`
+    /// earlier on PATH is skipped, as spawning skips it.
+    #[cfg(unix)]
+    #[test]
+    fn the_detected_home_on_path_skips_non_executable_javas() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (x64, arm) = (jdk(dir.path(), "jdk-x64"), jdk(dir.path(), "jdk-arm"));
+        fs::set_permissions(x64.join("bin/java"), fs::Permissions::from_mode(0o644)).unwrap();
+        let path = std::env::join_paths([x64.join("bin"), arm.join("bin")]).unwrap();
+        assert_eq!(find_in_path(&path, Path::new("java")), Some(arm.join("bin/java")), "what detect_java runs");
+        assert_eq!(detected_java_home_from(None, &[None, None], Some(path)), Some(arm));
     }
 }

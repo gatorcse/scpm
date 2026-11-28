@@ -131,19 +131,14 @@ pub struct ModuleIde {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LockSettings {
-    /// The fixed OS/arch/JDK used for POM profile activation when locking, so a lock made on
-    /// macOS equals one made on Linux. Default `{os: linux, arch: x86_64, jdk: <project jdk>}`.
+    /// The systems (OS and CPU architecture pairs, e.g. `linux-x86_64`, `macos-aarch64`) every
+    /// classpath is locked for; each machine uses its own. Unset: scpm's default set, which the
+    /// lock's header then records. More than one system needs the resolver sidecar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolution_context: Option<ResolutionContext>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ResolutionContext {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub os: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arch: Option<String>,
+    #[schemars(length(min = 1))]
+    pub systems: Option<Vec<String>>,
+    /// The JDK major version POM profiles are activated for when locking. Default: the project
+    /// JDK's major version (`toolchain.jdk`), else 25.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jdk: Option<Ver>,
 }

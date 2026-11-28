@@ -659,7 +659,7 @@ fn empty_keys_do_not_wipe_inherited_values() {
 
 #[test]
 fn integers_are_valid_versions() {
-    let ws = format!("{WS}lock: {{resolutionContext: {{jdk: 25}}}}\n");
+    let ws = format!("{WS}lock: {{jdk: 25}}\n");
     let dir = workspace(&[("scpm-workspace.yaml", &ws), ("modules/a/scpm.yaml", "release: 17\n")]);
     let v = json(dir.path(), &["config", "a"]);
     assert_eq!(v[0]["release"], "17");

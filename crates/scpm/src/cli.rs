@@ -65,6 +65,16 @@ pub enum Command {
         /// Re-hash cached artifacts against the lock and re-download any that don't match.
         #[arg(long)]
         verify: bool,
+        /// Also restore these systems' files (e.g. `linux-x86_64`), besides the host system's.
+        #[arg(long = "system", value_name = "SYSTEM", value_delimiter = ',', conflicts_with = "all_systems")]
+        systems: Vec<String>,
+        /// Restore every system's files, not just the host system's.
+        #[arg(long)]
+        all_systems: bool,
+        /// Lock for scpm's current default system set, replacing the one the lock's header
+        /// recorded (only when `lock.systems` is unset).
+        #[arg(long)]
+        reset_systems: bool,
     },
     /// Compile modules (and what they depend on). Unchanged variants are skipped without a JVM.
     Compile {
@@ -126,7 +136,12 @@ pub enum Command {
         force: bool,
     },
     /// Explain why an artifact is on the classpath (`org::name`, `org:name_3` or `name`).
-    Why { artifact: String },
+    Why {
+        artifact: String,
+        /// Explain this system's classpath instead of the host system's.
+        #[arg(long, value_name = "SYSTEM")]
+        system: Option<String>,
+    },
     /// Print a variant's classpath (installs first if the lockfile is stale).
     Classpath {
         /// Variant id, e.g. `core@jvm-3`, or a module with a single variant.
@@ -135,6 +150,10 @@ pub enum Command {
         kind: ClasspathKind,
         #[arg(long)]
         frozen: bool,
+        /// Print this system's classpath (e.g. `linux-x86_64`) instead of the host system's;
+        /// its files are restored too.
+        #[arg(long, value_name = "SYSTEM")]
+        system: Option<String>,
     },
     /// Print the JSON Schema of a configuration file.
     Schema {
@@ -410,16 +429,27 @@ fn run(cli: Cli) -> Result<(), Failure> {
             }
             Ok(())
         }
-        Command::Install { frozen, verify } => {
+        Command::Install { frozen, verify, systems, all_systems, reset_systems } => {
             let (ws, graph) = load(&start)?;
             let frozen = frozen || in_ci();
-            let summary = install::install(&ws, &graph, InstallOptions { frozen, verify })?;
+            for s in &systems {
+                check_system_name(s)?;
+            }
+            let restore = if all_systems {
+                install::RestoreSystems::All
+            } else if systems.is_empty() {
+                install::RestoreSystems::Host
+            } else {
+                install::RestoreSystems::Also(systems)
+            };
+            let summary = install::install(&ws, &graph, InstallOptions { frozen, verify, restore, reset_systems })?;
             if cli.json {
                 print_json(&summary)?;
             } else {
                 print_install_summary(&summary)?;
             }
             if !frozen && let Some(lock) = Lockfile::read(&ws.root).map_err(|e| Failure::Command(e.to_string()))? {
+                let (lock, _) = install::host_projection(&lock)?;
                 report_refresh(&ide::refresh(&ws, &lock));
             }
             Ok(())
@@ -697,8 +727,20 @@ fn run(cli: Cli) -> Result<(), Failure> {
             crate::mcp::Server::new(start).serve().map_err(|e| Failure::Command(e.to_string()))?;
             Ok(())
         }
-        Command::Why { artifact } => {
+        Command::Why { artifact, system } => {
             let (ws, graph) = load(&start)?;
+            // `why` runs `cs`, which resolves for the machine it runs on: it can explain only the
+            // host system's classpath (design §5.2.1, "M1 scope").
+            if let Some(s) = &system {
+                check_system_name(s)?;
+                let host = &crate::system::host().system;
+                if s != host {
+                    return Err(Failure::Command(format!(
+                        "`scpm why --system {s}` needs the resolver sidecar's `graph` method, which comes with M2 of \
+                         the sidecar (design §5.2.1); this scpm explains only the host system's classpath ({host})"
+                    )));
+                }
+            }
             let (lock, install_notices) = ensure_installed(&ws, &graph, false)?;
             let selected: Vec<String> =
                 filter::select(&ws, &graph, &cli.filter, &invocation_dir(&start)?)?.into_iter().collect();
@@ -733,7 +775,10 @@ fn run(cli: Cli) -> Result<(), Failure> {
             }
             Ok(())
         }
-        Command::Classpath { target, kind, frozen } => {
+        Command::Classpath { target, kind, frozen, system } => {
+            if let Some(s) = &system {
+                check_system_name(s)?;
+            }
             let (ws, graph) = load(&start)?;
             let cwd = invocation_dir(&start)?;
             let mut selected = filter::select(&ws, &graph, std::slice::from_ref(&target), &cwd)?;
@@ -752,7 +797,14 @@ fn run(cli: Cli) -> Result<(), Failure> {
                     selected.iter().cloned().collect::<Vec<_>>().join(", ")
                 )));
             };
-            let (lock, _) = ensure_installed(&ws, &graph, frozen)?;
+            let lock = match &system {
+                Some(s) => {
+                    let (lock, summary) = install::ensure_for(&ws, &graph, frozen, Some(s))?;
+                    report_ensure(&summary);
+                    lock
+                }
+                None => ensure_installed(&ws, &graph, frozen)?.0,
+            };
             let files = install::classpath_files(&ws, &lock, id, kind)?;
             if cli.json {
                 print_json(&files)?;
@@ -852,6 +904,16 @@ fn install_quietly(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<Lockfi
     Ok(lock)
 }
 
+/// A `--system` value must name a system scpm knows.
+fn check_system_name(system: &str) -> Result<(), Failure> {
+    match crate::system::known(system) {
+        Some(_) => Ok(()),
+        None => {
+            Err(Failure::Usage(format!("unknown system `{system}`; known systems: {}", crate::system::known_names())))
+        }
+    }
+}
+
 fn report_ensure(summary: &InstallSummary) {
     for w in &summary.warnings {
         eprintln!("warning: {w}");
@@ -893,7 +955,7 @@ fn print_install_summary(s: &InstallSummary) -> io::Result<()> {
     for w in &s.warnings {
         eprintln!("warning: {w}");
     }
-    for n in &s.notices {
+    for n in s.notes.iter().chain(&s.notices) {
         eprintln!("note: {n}");
     }
     let mut out = io::stdout().lock();

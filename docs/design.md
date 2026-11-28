@@ -764,7 +764,7 @@ In CI, the `setup-scpm` action caches it, keyed by the lockfile hash and the run
 Design goals, taking lessons from pnpm 12's experimental v13 lockfile format: few merge conflicts, one entry per artifact, sorted, stable.
 
 ```yaml
-lockfileVersion: 2               # Phase 1 writes version 1, with a single `resolutionContext` instead of `systems` + `jdk`
+lockfileVersion: 2               # Phase 1 wrote version 1, with a single `resolutionContext` instead of `systems` + `jdk`; scpm converts it
 systems: [linux-aarch64, linux-x86_64, macos-aarch64, macos-x86_64, windows-x86_64]   # see "Systems" (also defaultSystems and nativeMappings)
 jdk: 25
 bootInputs: sha256:…             # repositories + systems + jdk; a change re-resolves every boot entry
@@ -963,6 +963,16 @@ artifacts:                           # every system's files, one entry each, all
   - That same install suggests removing hand-declared native classifiers that a built-in mapping now covers.
   - Under `SCPM_RESOLVER=cs`, the M2 default-set upgrade, and any change to more than one system, is skipped with a note. `cs` then works only for a workspace whose set has a single system.
   - **Version skew:** an M1 binary on `cs` running a non-frozen install over a lock that already has several systems (written by an M2 binary, or by the sidecar in M1) stops with the "needs the sidecar" error. A frozen run with it works, because restores need no resolver.
+
+**As implemented (M1, lockfile version 2).** Details the text above leaves open, settled in the implementation:
+
+- The boot section's flag is a top-level `bootFullContext: true` next to `bootInputs` (the `boot` map holds only entries). A re-lock that resolves any boot entry without the full context clears it.
+- **`cs` and several systems:** the "needs the sidecar" error comes only when `cs` would resolve something (a stale variant or a missing boot entry). An install over a several-system lock with nothing to re-lock only restores, as a frozen one does.
+- **The frozen note about unmarked variants** is given only for a lock that already mixes them with sidecar-written ones (a variant or the boot section marked, or a `nativeMappings` header), or when the sidecar resolves. Under `cs` every variant is unmarked, and a note on every frozen CI run would say nothing new.
+- **Notes** (a host outside the set, unmarked variants, the project-JDK fallback) are part of `scpm install`'s summary (`notes` in `--json`). Commands that install first (`compile`, `test`, …) don't print them; errors are always printed.
+- **The project JDK** is, until scpm provisions `toolchain.jdk` (§6.3), the JDK that runs `run` and `test` today: the one `detect_java` finds. The worker-JDK check is in place (before restoring and compiling) but can't fail until the two are separate JDKs.
+- `scpm install --system <s>[,…]`, `--all-systems` and `--reset-systems`, and `scpm classpath --system <s>` exist; `scpm why --system <s>` accepts only the host system (M1 scope, §5.2.1). `classpath --system <s>` restores only that system's files and works from a host outside the set (packaging for Linux on a Mac). `run --system` is deferred (it would run another system's natives on the host's JVM; packaging, Phase 4, is the real consumer).
+- **Converting a v1 lock** maps Phase 1's free-form `os`/`arch` to the canonical system (`Linux`/`amd64` → `linux-x86_64`, which counts as default set 1). Only the canonical spellings (`linux`, `macos`, `windows`; `x86_64`, `aarch64`) hash as v1 did; a lock written with another spelling re-locks once.
 
 #### Resolution context and repositories
 

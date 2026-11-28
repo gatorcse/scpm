@@ -1075,7 +1075,7 @@ fn boot_entries_follow_their_inputs() {
     // A new resolution context changes bootInputs, so every boot entry is resolved again.
     let wsfile = ws.path().join("scpm-workspace.yaml");
     let text = fs::read_to_string(&wsfile).unwrap();
-    fs::write(&wsfile, format!("{text}lock:\n  resolutionContext: {{jdk: '21'}}\n")).unwrap();
+    fs::write(&wsfile, format!("{text}lock:\n  jdk: 21\n")).unwrap();
     let summary = json_install(ws.path(), &shared_cache(), &[]);
     // Two compilers and two bridges, plus the worker and test-runner closures.
     assert_eq!(summary["bootRelocked"].as_array().unwrap().len(), 6, "{summary}");
@@ -1294,8 +1294,10 @@ fn foreign_mirror_settings_do_not_redirect_cs() {
         "dependencies:\n  com.example:hello: '1.0'\n",
     );
     let cache = tempfile::tempdir().unwrap();
+    // A host in the lock's system set, so the only notes are about ignored settings.
+    let jdk = fake_jdk(ws.path(), "Linux", "amd64");
     let hostile_scpm = || {
-        let mut cmd = scpm_no_boot(ws.path(), cache.path());
+        let mut cmd = scpm_on(ws.path(), cache.path(), &jdk);
         cmd.envs(hostile.iter().map(|(k, v)| (*k, v.as_os_str())))
             .env("COURSIER_MODE", "offline")
             .env("COURSIER_TTL", "0")
@@ -1624,4 +1626,160 @@ fn a_legacy_selection_conflicting_with_an_existing_shared_one_is_reported() {
     assert!(err.contains("Java coordinates now share one selection"), "{err}");
     assert!(err.contains("2.0.15") && err.contains("s@jvm-3"), "{err}");
     assert_eq!(lock(ws.path())["catalogs"]["default/org.slf4j:slf4j-api@jvm-java"]["version"], "2.0.16");
+}
+
+/// A JDK home whose `release` file names an OS and arch; it can't run anything, which commands
+/// that only read the host system don't need.
+fn fake_jdk(dir: &Path, os: &str, arch: &str) -> PathBuf {
+    let home = dir.join(format!("jdk-{os}-{arch}"));
+    fs::create_dir_all(home.join("bin")).unwrap();
+    fs::write(home.join("bin").join(if cfg!(windows) { "java.exe" } else { "java" }), "").unwrap();
+    fs::write(home.join("release"), format!("JAVA_VERSION=\"25\"\nOS_NAME=\"{os}\"\nOS_ARCH=\"{arch}\"\n")).unwrap();
+    home
+}
+
+/// `scpm` whose project JDK (so its host system) is `jdk`.
+fn scpm_on(dir: &Path, cache: &Path, jdk: &Path) -> Command {
+    let mut cmd = scpm_no_boot(dir, cache);
+    cmd.env_remove("SCPM_JAVA").env("SCPM_JAVA_HOME", jdk);
+    cmd
+}
+
+#[test]
+fn locks_are_version_2_and_restores_use_the_host_systems_projection() {
+    if !cs_available() {
+        return;
+    }
+    let server = Server::maven(hello_repo_files(b"hello jar"), None);
+    let ws = tempfile::tempdir().unwrap();
+    let repos = format!("repositories:\n  - {{id: local, url: '{}'}}\n", server.url("/maven"));
+    java_workspace(ws.path(), &repos, "dependencies:\n  com.example:hello: '1.0'\n");
+    let linux = fake_jdk(ws.path(), "Linux", "amd64");
+    let mac = fake_jdk(ws.path(), "Darwin", "aarch64");
+    let cache = tempfile::tempdir().unwrap();
+    let out = scpm_on(ws.path(), cache.path(), &linux).arg("install").assert().success().get_output().clone();
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("not one of the lock's systems"));
+    let path = ws.path().join("scpm-lock.yaml");
+    let v2 = fs::read_to_string(&path).unwrap();
+    let l = lock(ws.path());
+    assert_eq!(l["lockfileVersion"], 2);
+    assert_eq!(l["systems"], serde_json::json!(["linux-x86_64"]));
+    assert_eq!((&l["defaultSystems"], &l["jdk"]), (&serde_json::json!(1), &serde_json::json!("25")));
+    assert!(!v2.contains("fullContext") && !v2.contains("nativeMappings"), "`cs` writes neither:\n{v2}");
+
+    // A host outside the set gets the common projection, with a note, while no entry differs
+    // by system.
+    let empty = tempfile::tempdir().unwrap();
+    let out =
+        scpm_on(ws.path(), empty.path(), &mac).args(["install", "--frozen"]).assert().success().get_output().clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("the host system macos-aarch64 is not one of the lock's systems (linux-x86_64)"), "{err}");
+    assert_eq!(server.count(HELLO_JAR_PATH), 2, "the re-lock, then the restore");
+    assert!(walk(empty.path()).iter().any(|f| f.ends_with("hello-1.0.jar")));
+
+    // With a system-specific entry, it is an error before anything is downloaded; the host's
+    // own system restores it.
+    let mut edited: serde_yaml_ng::Value = serde_yaml_ng::from_str(&v2).unwrap();
+    for list in ["compileClasspath", "runtimeClasspath", "testCompileClasspath", "testRuntimeClasspath"] {
+        edited["variants"]["lib@jvm"][list] =
+            serde_yaml_ng::from_str("[{artifact: 'com.example:hello:1.0', systems: [linux-x86_64]}]").unwrap();
+    }
+    fs::write(&path, serde_yaml_ng::to_string(&edited).unwrap()).unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    let err = stderr_of(scpm_on(ws.path(), empty.path(), &mac).args(["install", "--frozen"]));
+    assert!(err.contains("macos-aarch64 is not one of the lock's systems") && err.contains("lock.systems"), "{err}");
+    assert_eq!(server.count(HELLO_JAR_PATH), 2, "nothing downloaded");
+    let out = scpm_on(ws.path(), empty.path(), &linux).args(["--json", "install", "--frozen"]).assert().success();
+    let summary: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(summary["fetch"]["downloaded"], 1, "{summary}");
+    let classpath = scpm_on(ws.path(), empty.path(), &linux).args(["classpath", "lib", "--frozen"]).assert().success();
+    assert!(String::from_utf8_lossy(&classpath.get_output().stdout).contains("hello-1.0.jar"));
+
+    // A version 1 lock converts with every hash kept: nothing re-locks, and the next write is
+    // the version 2 lock.
+    let mut v1: serde_yaml_ng::Value = serde_yaml_ng::from_str(&v2).unwrap();
+    let header = v1.as_mapping_mut().unwrap();
+    for key in ["systems", "defaultSystems", "jdk"] {
+        header.remove(key);
+    }
+    header.insert("lockfileVersion".into(), 1.into());
+    header.insert("resolutionContext".into(), serde_yaml_ng::from_str("{os: linux, arch: x86_64, jdk: '25'}").unwrap());
+    fs::write(&path, serde_yaml_ng::to_string(&v1).unwrap()).unwrap();
+    scpm_on(ws.path(), cache.path(), &linux).args(["install", "--frozen"]).assert().success();
+    let summary = {
+        let out = scpm_on(ws.path(), cache.path(), &linux).args(["--json", "install"]).assert().success();
+        serde_json::from_slice::<Value>(&out.get_output().stdout).unwrap()
+    };
+    assert_eq!(summary["relocked"], serde_json::json!([]), "{summary}");
+    assert_eq!(summary["lockfileWritten"], true);
+    assert_eq!(fs::read_to_string(&path).unwrap(), v2);
+}
+
+/// `cs` writes no markers and strips none (design §5.4): the `nativeMappings` header and the
+/// markers of variants it doesn't re-lock survive; what it re-locks is unmarked, and resolving a
+/// boot entry unmarks the boot section.
+#[test]
+fn cs_keeps_the_sidecars_markers_on_what_it_does_not_relock() {
+    if !cs_available() {
+        return;
+    }
+    let server = Server::maven(hello_repo_files(b"hello jar"), None);
+    let ws = tempfile::tempdir().unwrap();
+    let repos = format!("repositories:\n  - {{id: local, url: '{}'}}\n  - central\n", server.url("/maven"));
+    let hello = "dependencies:\n  com.example:hello: '1.0'\n";
+    two_java_modules(ws.path(), &repos, hello, hello);
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    let path = ws.path().join("scpm-lock.yaml");
+    let mut l: serde_yaml_ng::Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(!l["boot"].as_mapping().unwrap().is_empty());
+    l["nativeMappings"] = 3.into();
+    l["bootFullContext"] = true.into();
+    l["variants"]["a@jvm"]["fullContext"] = true.into();
+    fs::write(&path, serde_yaml_ng::to_string(&l).unwrap()).unwrap();
+
+    // Only b's manifest changes: only b re-locks, unmarked; the rest keeps its markers.
+    fs::write(
+        ws.path().join("modules/b/scpm.yaml"),
+        "scala: none\ndependencies:\n  com.example:hello: {version: '1.0', transitive: false}\n",
+    )
+    .unwrap();
+    let summary = json_install(ws.path(), &shared_cache(), &[]);
+    assert_eq!(summary["relocked"], serde_json::json!(["b@jvm"]), "{summary}");
+    assert_eq!(summary["bootRelocked"], serde_json::json!([]), "{summary}");
+    let l = lock(ws.path());
+    assert_eq!(l["nativeMappings"], 3);
+    assert_eq!(l["bootFullContext"], true);
+    assert_eq!(l["variants"]["a@jvm"]["fullContext"], true);
+    assert!(l["variants"]["b@jvm"].get("fullContext").is_none(), "{l}");
+
+    // A new repository re-resolves every boot entry (and variant): the boot section is unmarked.
+    let more = format!("{repos}  - {{id: extra, url: '{}'}}\n", server.url("/extra"));
+    let hello_b = "dependencies:\n  com.example:hello: {version: '1.0', transitive: false}\n";
+    two_java_modules(ws.path(), &more, hello, hello_b);
+    let summary = json_install(ws.path(), &shared_cache(), &[]);
+    assert!(!summary["bootRelocked"].as_array().unwrap().is_empty(), "{summary}");
+    let l = lock(ws.path());
+    assert!(l.get("bootFullContext").is_none(), "{l}");
+    assert!(l["variants"]["a@jvm"].get("fullContext").is_none(), "re-locked by cs: {l}");
+    assert_eq!(l["nativeMappings"], 3, "the header stays");
+}
+
+#[test]
+fn several_systems_need_the_sidecar_and_why_explains_only_the_host() {
+    let ws = tempfile::tempdir().unwrap();
+    let mac = fake_jdk(ws.path(), "Darwin", "aarch64");
+    java_workspace(
+        ws.path(),
+        "lock:\n  systems: [linux-x86_64, macos-aarch64]\n",
+        "dependencies:\n  com.example:hello: '1.0'\n",
+    );
+    let cache = tempfile::tempdir().unwrap();
+    let err = stderr_of(scpm_on(ws.path(), cache.path(), &mac).arg("install"));
+    assert!(err.contains("2 systems (linux-x86_64, macos-aarch64)") && err.contains("resolver sidecar"), "{err}");
+    assert!(!ws.path().join("scpm-lock.yaml").exists());
+
+    let err = stderr_of(scpm_on(ws.path(), cache.path(), &mac).args(["why", "hello", "--system", "linux-x86_64"]));
+    assert!(err.contains("`graph` method") && err.contains("M2") && err.contains("(macos-aarch64)"), "{err}");
+    let out = scpm_on(ws.path(), cache.path(), &mac).args(["install", "--system", "linux-amd64"]).assert().code(2);
+    assert!(String::from_utf8_lossy(&out.get_output().stderr).contains("unknown system `linux-amd64`"));
 }
