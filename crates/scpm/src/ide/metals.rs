@@ -155,11 +155,11 @@ pub fn module_id(key: &str) -> String {
 }
 
 /// Artifact keys and upstream variants of `kinds`' classpaths, merged in order, first wins.
-fn classpath(entries: &[&[ClasspathEntry]]) -> (Vec<String>, Vec<String>) {
+fn classpath(entries: &[Vec<&ClasspathEntry>]) -> (Vec<String>, Vec<String>) {
     let (mut artifacts, mut modules) = (Vec::new(), Vec::new());
     let (mut seen_a, mut seen_m) = (BTreeSet::new(), BTreeSet::new());
     for list in entries {
-        for e in *list {
+        for e in list {
             match e {
                 ClasspathEntry::Artifact(k) if seen_a.insert(k.clone()) => artifacts.push(k.clone()),
                 ClasspathEntry::Module { module } if seen_m.insert(module.clone()) => modules.push(module.clone()),
@@ -251,7 +251,7 @@ pub fn generate(tc: &Toolchain, opts: &Options) -> Result<Summary, IdeError> {
         .iter()
         .filter(|(id, _)| ws.variant(id).is_some())
         .flat_map(|(_, l)| [&l.compile_classpath, &l.test_compile_classpath, &l.test_runtime_classpath])
-        .flatten()
+        .flat_map(|c| c.common())
         .filter_map(|e| match e {
             ClasspathEntry::Artifact(k) => Some(k.clone()),
             ClasspathEntry::Module { .. } => None,
@@ -299,7 +299,7 @@ mod tests {
         let m = |k: &str| ClasspathEntry::Module { module: k.into() };
         let first = [m("u@jvm-3"), a("x"), a("y")];
         let second = [m("u@jvm-3"), m("w@jvm-3"), a("y"), a("z")];
-        let (artifacts, modules) = classpath(&[&first, &second]);
+        let (artifacts, modules) = classpath(&[first.iter().collect(), second.iter().collect()]);
         assert_eq!(artifacts, ["x", "y", "z"]);
         assert_eq!(modules, ["u@jvm-3", "w@jvm-3"]);
     }

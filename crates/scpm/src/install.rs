@@ -15,8 +15,8 @@ use crate::credentials::CoursierCredentials;
 use crate::fetch::{self, FetchItem, FetchOptions, FetchReport};
 use crate::graph::Graph;
 use crate::lockfile::{
-    ArtifactLock, CatalogSelection, ClasspathEntry, LOCKFILE_VERSION, LockError, Lockfile, Platform as HostPlatform,
-    ResolutionContextLock, Specifier, VariantLock,
+    ArtifactLock, CatalogSelection, Classpath, ClasspathEntry, LOCKFILE_VERSION, LockEntry, LockError, Lockfile,
+    Platform as HostPlatform, Specifier, VariantLock,
 };
 use crate::machine::Machine;
 use crate::platform::Platform;
@@ -27,12 +27,28 @@ use crate::workspace::{Dependency, Scope, Variant, Workspace};
 /// Zinc version whose binary compiler bridges are used for Scala 2 (Scala 3 ships its own).
 pub const ZINC_VERSION: &str = "2.1.0";
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct InstallOptions {
     /// Fail instead of re-locking stale variants (the default when `CI=true`).
     pub frozen: bool,
     /// Re-hash cached files against the lock and re-download any that don't match.
     pub verify: bool,
+    /// Whose files to restore besides the host system's (design §5.4, "Restores").
+    pub restore: RestoreSystems,
+    /// Use scpm's current default system set even when the lock's header recorded another
+    /// (`scpm install --reset-systems`); only when `lock.systems` is unset.
+    pub reset_systems: bool,
+}
+
+/// Which systems' files a restore downloads: always the host's, plus these.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RestoreSystems {
+    #[default]
+    Host,
+    /// The host's and these (`scpm install --system`).
+    Also(Vec<String>),
+    /// Every system of the lock (`scpm install --all-systems`).
+    All,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,6 +69,10 @@ pub struct InstallSummary {
     pub resolved_on: Option<HostPlatform>,
     pub fetch: FetchReport,
     pub warnings: Vec<String>,
+    /// Information for `scpm install`'s summary, such as a host system outside the lock's
+    /// system set (design §5.4). Commands that install first don't print these.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     /// Settings of other tools (Maven `settings.xml`, …) that touch the repositories this run
     /// contacted and that scpm ignored (design §5.9).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -78,6 +98,9 @@ pub enum InstallError {
     Coursier(#[from] coursier::CoursierError),
     #[error("{0}")]
     Resolve(String),
+    /// The system set, the host system or a JDK's system doesn't allow the command (design §5.4).
+    #[error("{0}")]
+    Systems(String),
     #[error("{0}")]
     Fetch(fetch::FetchFailure),
     /// The user config is invalid (design §5.9).
@@ -128,13 +151,19 @@ impl ClasspathKind {
         }
     }
 
-    pub fn entries(self, lock: &VariantLock) -> &[ClasspathEntry] {
+    pub fn classpath(self, lock: &VariantLock) -> &Classpath {
         match self {
             ClasspathKind::Compile => &lock.compile_classpath,
             ClasspathKind::Runtime => &lock.runtime_classpath,
             ClasspathKind::TestCompile => &lock.test_compile_classpath,
             ClasspathKind::TestRuntime => &lock.test_runtime_classpath,
         }
+    }
+
+    /// The classpath's entries, from a projected lock ([`ensure`] returns one): the host
+    /// system's classpath. On a lock that isn't projected, only the entries on every system.
+    pub fn entries(self, lock: &VariantLock) -> Vec<&ClasspathEntry> {
+        self.classpath(lock).common()
     }
 
     pub fn name(self) -> &'static str {
@@ -188,17 +217,61 @@ pub fn upstream_variants(graph: &Graph, id: &str, kind: ClasspathKind) -> Vec<St
     graph.order.iter().filter(|v| found.contains(*v)).cloned().collect()
 }
 
-fn resolution_context(ws: &Workspace) -> ResolutionContextLock {
-    let declared = ws.config.lock.resolution_context.clone().unwrap_or_default();
-    let jdk = declared
+/// What a lock is resolved for: its system set and JDK (design §5.4, "Systems").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockContext {
+    /// Sorted.
+    pub systems: Vec<String>,
+    /// The default set's version when the set is scpm's default (`lock.systems` unset).
+    pub default_systems: Option<u32>,
+    pub jdk: String,
+}
+
+/// The system set and JDK for a lock (design §5.4, "What decides the system set"):
+/// `lock.systems` when set; else the set the previous lock's header recorded from a default set
+/// (`defaultSystems`), so a newer binary's default never makes a lock stale; else (a new lock, a
+/// header written from a `lock.systems` that has since been removed, or `reset_systems`)
+/// scpm's current default set.
+pub fn lock_context(ws: &Workspace, previous: &Lockfile, reset_systems: bool) -> LockContext {
+    let jdk = ws
+        .config
+        .lock
         .jdk
-        .map(|v| v.0)
+        .as_ref()
+        .map(|v| v.0.clone())
         .or_else(|| ws.config.toolchain.jdk.as_deref().and_then(jdk_major))
         .unwrap_or_else(|| "25".to_string());
-    ResolutionContextLock {
-        os: declared.os.unwrap_or_else(|| "linux".into()),
-        arch: declared.arch.unwrap_or_else(|| "x86_64".into()),
-        jdk,
+    let (systems, default_systems) = match &ws.config.lock.systems {
+        Some(list) => (crate::system::normalized(list.iter().cloned()), None),
+        None => match previous.default_systems {
+            Some(version) if !reset_systems && !previous.systems.is_empty() => {
+                (crate::system::normalized(previous.systems.iter().cloned()), Some(version))
+            }
+            _ => (
+                crate::system::normalized(crate::system::DEFAULT_SYSTEMS.iter().copied()),
+                Some(crate::system::DEFAULT_SYSTEMS_VERSION),
+            ),
+        },
+    };
+    LockContext { systems, default_systems, jdk }
+}
+
+/// The resolution context as hashed into `inputsHash` and `bootInputs`. A single system hashes
+/// exactly as a version 1 lock's `resolutionContext` did (`{os, arch, jdk}`), so converting a
+/// v1 lock re-locks nothing (design §5.4).
+fn context_input(ctx: &LockContext) -> serde_json::Value {
+    #[derive(Serialize)]
+    struct Single<'a> {
+        os: &'a str,
+        arch: &'a str,
+        jdk: &'a str,
+    }
+    match ctx.systems.as_slice() {
+        [one] => {
+            let (os, arch) = one.split_once('-').unwrap_or((one.as_str(), ""));
+            serde_json::to_value(Single { os, arch, jdk: &ctx.jdk }).expect("context serializes")
+        }
+        systems => serde_json::json!({ "systems": systems, "jdk": ctx.jdk }),
     }
 }
 
@@ -331,7 +404,7 @@ fn sha256_json(doc: &serde_json::Value) -> String {
     format!("sha256:{}", fetch::hex(&digest))
 }
 
-fn inputs_hash(ws: &Workspace, graph: &Graph, v: &Variant, repos: &[Repo], ctx: &ResolutionContextLock) -> String {
+fn inputs_hash(ws: &Workspace, graph: &Graph, v: &Variant, repos: &[Repo], ctx: &LockContext) -> String {
     // Each classpath's upstream closure separately, in order: an upstream workspace edge that is
     // added, removed or changes scope moves variants between closures without changing their union.
     let upstream: BTreeMap<&str, Vec<UpstreamInputs<'_>>> = ClasspathKind::ALL
@@ -359,7 +432,7 @@ fn inputs_hash(ws: &Workspace, graph: &Graph, v: &Variant, repos: &[Repo], ctx: 
         "bomOwners": bom_owners,
         "overrides": overrides,
         "repositories": repo_inputs(repos),
-        "context": ctx,
+        "context": context_input(ctx),
         "minimumReleaseAge": ws.config.policy.minimum_release_age,
         // Rejected as unsupported for now (so always empty), but part of the contract.
         "minimumReleaseAgeExclude": ws.config.policy.minimum_release_age_exclude,
@@ -367,8 +440,8 @@ fn inputs_hash(ws: &Workspace, graph: &Graph, v: &Variant, repos: &[Repo], ctx: 
 }
 
 /// What every boot resolution depends on besides its own root (design §5.4, `bootInputs`).
-fn boot_inputs_hash(repos: &[Repo], ctx: &ResolutionContextLock) -> String {
-    sha256_json(&serde_json::json!({ "repositories": repo_inputs(repos), "context": ctx }))
+fn boot_inputs_hash(repos: &[Repo], ctx: &LockContext) -> String {
+    sha256_json(&serde_json::json!({ "repositories": repo_inputs(repos), "context": context_input(ctx) }))
 }
 
 /// Picks exact versions for ranges, sharing catalog selections workspace-wide (design §5.4).
@@ -715,11 +788,58 @@ fn helper_roots() -> Vec<BootRoot> {
     ]
 }
 
-/// Install-before-run (design §5.4): installs (frozen when asked or in CI), then reads the lock.
+/// Install-before-run (design §5.4): installs (frozen when asked or in CI), then reads the lock
+/// as the host system sees it ([`Lockfile::project`]).
 pub fn ensure(ws: &Workspace, graph: &Graph, frozen: bool) -> Result<(Lockfile, InstallSummary), InstallError> {
-    let summary = install(ws, graph, InstallOptions { frozen: frozen || in_ci(), verify: false })?;
+    ensure_for(ws, graph, frozen, None)
+}
+
+/// [`ensure`] for `system` instead of the host (`--system`): that system's files are restored
+/// too, and the lock is its projection.
+pub fn ensure_for(
+    ws: &Workspace,
+    graph: &Graph,
+    frozen: bool,
+    system: Option<&str>,
+) -> Result<(Lockfile, InstallSummary), InstallError> {
+    let restore = match system {
+        Some(s) => RestoreSystems::Also(vec![s.to_string()]),
+        None => RestoreSystems::Host,
+    };
+    let opts = InstallOptions { frozen: frozen || in_ci(), restore, ..Default::default() };
+    let summary = install(ws, graph, opts)?;
     let lock = Lockfile::read(&ws.root)?.ok_or_else(|| InstallError::Stale(vec!["(no scpm-lock.yaml)".into()]))?;
+    let system = system.unwrap_or(&crate::system::host().system);
+    let (lock, _) = projection(&lock, system)?;
     Ok((lock, summary))
+}
+
+/// The host system's view of a lock ([`projection`]).
+pub fn host_projection(lock: &Lockfile) -> Result<(Lockfile, Option<String>), InstallError> {
+    projection(lock, &crate::system::host().system)
+}
+
+/// `system`'s view of a lock (design §5.4, "Using it"): its projection. A system outside the
+/// lock's set is an error only when the lock has system-specific entries; otherwise it gets the
+/// entries common to every system, with a note (returned). scpm never guesses a nearby system.
+pub fn projection(lock: &Lockfile, system: &str) -> Result<(Lockfile, Option<String>), InstallError> {
+    if lock.systems.iter().any(|s| s == system) {
+        return Ok((lock.project(system), None));
+    }
+    let set = lock.systems.join(", ");
+    let host = if system == crate::system::host().system { "the host system " } else { "" };
+    if lock.has_system_specific_entries() {
+        return Err(InstallError::Systems(format!(
+            "{host}{system} is not one of the lock's systems ({set}), and the lock has entries that differ by system, \
+             so its classpaths for {system} are unknown\n  help: add {system} to `lock.systems` in \
+             scpm-workspace.yaml and run `scpm install`"
+        )));
+    }
+    let note = format!(
+        "{host}{system} is not one of the lock's systems ({set}); no entry differs by system, so {system} uses \
+         the classpaths common to all of them"
+    );
+    Ok((lock.project(system), Some(note)))
 }
 
 /// CI mode (implied `--frozen`) is `CI=true` (any case: AppVeyor sets `True`).
@@ -753,9 +873,10 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     }
     let (repos, machine) = repositories(ws)?;
     let cache = coursier::cache_dir();
-    let ctx = resolution_context(ws);
     let mut warnings = machine.warnings.clone();
+    let mut notes: Vec<String> = Vec::new();
     let mut previous = read_previous(&ws.root, opts.frozen, &mut warnings)?;
+    let ctx = lock_context(ws, &previous, opts.reset_systems);
     migrate_catalog_keys(ws, &mut previous.catalogs, &mut warnings);
 
     let hashes: BTreeMap<String, String> =
@@ -791,12 +912,35 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
         what.extend(removed.iter().map(|id| format!("{id} (removed)")));
         return Err(InstallError::Stale(what));
     }
+    let resolver = Resolver::Cs;
+    // `cs` resolves for the machine it runs on and takes only the JDK, so it can lock one
+    // system only (design §5.4). A lock that already has several systems still restores.
+    if (!stale.is_empty() || !missing_boot.is_empty()) && ctx.systems.len() > 1 {
+        return Err(InstallError::Systems(format!(
+            "the lock's system set has {} systems ({}), and `cs` can resolve for one system only; resolving for \
+             several systems needs the resolver sidecar (design §5.2.1), which this scpm does not include yet\n  \
+             help: set `lock.systems` to the one system to resolve for",
+            ctx.systems.len(),
+            ctx.systems.join(", ")
+        )));
+    }
+    if opts.frozen {
+        notes.extend(unmarked_note(&previous, resolver));
+    }
 
     let started = Instant::now();
     let mut lock = Lockfile {
         lockfile_version: LOCKFILE_VERSION,
-        resolution_context: ctx.clone(),
+        systems: ctx.systems.clone(),
+        default_systems: ctx.default_systems,
+        // `cs` applies no native mappings: it keeps the header as it is (design §5.4).
+        native_mappings: previous.native_mappings,
+        jdk: ctx.jdk.clone(),
         boot_inputs,
+        // One flag for the whole section: a boot entry resolved without the full context
+        // unmarks it.
+        boot_full_context: !boot.is_empty()
+            && if missing_boot.is_empty() { previous.boot_full_context } else { resolver.full_context() },
         boot: previous.boot.clone(),
         catalogs: BTreeMap::new(),
         variants: BTreeMap::new(),
@@ -892,27 +1036,21 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
 
     let all: Vec<&ResolveRequest> =
         requests.values().chain(plugin_requests.values()).chain(boot_requests.values()).collect();
-    let results = resolve_concurrently(&all, &labels, &repos, &machine.proxy, &cache, scratch.path())
+    let results = resolve_concurrently(&all, &labels, &ctx, &repos, &machine.proxy, &cache, scratch.path())
         .map_err(|e| with_notice(e, &repos, true))?;
 
-    record_artifacts(&mut lock, all.iter().flat_map(|req| &results[*req]), &repos)?;
+    record_artifacts(&mut lock, all.iter().flat_map(|req| results[*req].artifacts()), &repos)?;
     for (name, req) in &boot_requests {
-        lock.boot.insert(name.clone(), results[req].iter().map(|a| a.key.clone()).collect());
+        lock.boot.insert(name.clone(), results[req].classpath(Vec::new()));
     }
 
     for v in ws.variants() {
         let entry = if let Some(specs) = specifiers.remove(&v.id) {
-            let classpath = |kind: ClasspathKind| -> Vec<ClasspathEntry> {
-                let mut list: Vec<ClasspathEntry> = upstream_variants(graph, &v.id, kind)
-                    .into_iter()
-                    .map(|module| ClasspathEntry::Module { module })
-                    .collect();
-                list.extend(
-                    results[&requests[&(v.id.clone(), kind)]].iter().map(|a| ClasspathEntry::Artifact(a.key.clone())),
-                );
-                list
+            let classpath = |kind: ClasspathKind| -> Classpath {
+                results[&requests[&(v.id.clone(), kind)]].classpath(upstream_variants(graph, &v.id, kind))
             };
             VariantLock {
+                full_context: resolver.full_context(),
                 specifiers: specs,
                 inputs_hash: hashes[&v.id].clone(),
                 compile_classpath: classpath(ClasspathKind::Compile),
@@ -921,7 +1059,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
                 test_runtime_classpath: classpath(ClasspathKind::TestRuntime),
                 compiler_plugins: plugin_requests
                     .get(&v.id)
-                    .map(|r| results[r].iter().map(|a| a.key.clone()).collect())
+                    .map(|r| results[r].classpath(Vec::new()))
                     .unwrap_or_default(),
             }
         } else {
@@ -945,20 +1083,29 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     let resolve_ms = started.elapsed().as_millis();
 
     let lockfile_written = if opts.frozen { false } else { lock.write(&ws.root)? };
+    // `cs` applies only the JDK part of the context (design §5.4, "Phase 1 limit").
     let resolved_on = (!stale.is_empty() || !missing_boot.is_empty()).then(HostPlatform::current);
     if let Some(host) = &resolved_on
-        && (host.os != ctx.os || !same_arch(&host.arch, &ctx.arch))
+        && let [declared] = ctx.systems.as_slice()
+        && crate::system::from_os_arch(&host.os, &host.arch).as_deref() != Some(declared.as_str())
     {
         warnings.push(format!(
-            "resolved on {}-{}, but the lock declares {}-{}; OS/arch-specific POM profiles follow the resolving machine until the resolver sidecar lands (design §5.4)",
-            host.os, host.arch, ctx.os, ctx.arch
+            "resolved on {}-{}, but the lock declares {declared}; OS/arch-specific POM profiles follow the resolving machine until the resolver sidecar lands (design §5.4)",
+            host.os, host.arch
         ));
     }
+
+    // Restores download only the host system's files (and those of systems asked for), and
+    // only once the compile worker's JDK is known to be for the host system (design §5.4).
+    crate::system::check_worker().map_err(InstallError::Systems)?;
+    let host = crate::system::host();
+    notes.extend(host.note.clone());
+    let keys = restore_keys(&lock, &host.system, &opts.restore, &mut notes)?;
 
     // Re-locking ran `cs`.
     let ran_cs = !stale.is_empty() || !missing_boot.is_empty();
     let fetch_started = Instant::now();
-    let items = fetch_items(&lock, &repos, &CoursierCredentials::load(), &cache, &mut warnings)?;
+    let items = fetch_items_of(&lock, &keys, &repos, &CoursierCredentials::load(), &cache, &mut warnings)?;
     let fetch = fetch::fetch_all(items, FetchOptions { verify: opts.verify, proxy: machine.proxy.clone() })
         .map_err(|f| with_notice(InstallError::Fetch(f), &repos, ran_cs))?;
     let contacted = ran_cs || fetch.downloaded > 0;
@@ -982,10 +1129,35 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
         resolved_on,
         fetch,
         warnings,
+        notes,
         notices,
         resolve_ms,
         fetch_ms: fetch_started.elapsed().as_millis(),
     })
+}
+
+/// The artifacts a restore downloads (design §5.4, "Restores"): the host system's projection of
+/// every variant and boot entry, plus those of the systems `restore` asks for. A host outside
+/// the lock's set is checked here, before anything is downloaded; its note goes to `notes`.
+fn restore_keys(
+    lock: &Lockfile,
+    host: &str,
+    restore: &RestoreSystems,
+    notes: &mut Vec<String>,
+) -> Result<BTreeSet<String>, InstallError> {
+    let (view, outside) = projection(lock, host)?;
+    notes.extend(outside);
+    let mut keys: BTreeSet<String> = view.referenced_artifacts().into_iter().map(str::to_string).collect();
+    let others: Vec<&String> = match restore {
+        RestoreSystems::Host => Vec::new(),
+        RestoreSystems::Also(others) => others.iter().collect(),
+        RestoreSystems::All => lock.systems.iter().collect(),
+    };
+    for system in others {
+        let (view, _) = projection(lock, system)?;
+        keys.extend(view.referenced_artifacts().into_iter().map(str::to_string));
+    }
+    Ok(keys)
 }
 
 /// Adds the notice about ignored settings of other tools to an error from contacting the
@@ -1001,15 +1173,93 @@ pub(crate) fn with_notice(e: InstallError, repos: &[Repo], ran_cs: bool) -> Inst
     }
 }
 
-fn same_arch(a: &str, b: &str) -> bool {
-    fn norm(s: &str) -> &str {
-        match s {
-            "amd64" | "x86_64" => "x86_64",
-            "arm64" | "aarch64" => "aarch64",
-            other => other,
+/// Which resolver re-locks (design §5.2.1, "Migration").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolver {
+    /// The coursier CLI: one system, and only the JDK part of the context.
+    Cs,
+}
+
+impl Resolver {
+    /// Whether what it resolves carries `fullContext` (the OS, arch and JDK of every system).
+    pub fn full_context(self) -> bool {
+        match self {
+            Resolver::Cs => false,
         }
     }
-    norm(a) == norm(b)
+}
+
+/// The note a frozen run gives about variants (and a boot section) locked without the full
+/// resolution context, which it uses as they are (design §5.4). Only for a lock that already
+/// mixes them with sidecar-written ones, or when the sidecar resolves: under `cs` every variant
+/// is unmarked, and a note on every frozen run would say nothing new.
+fn unmarked_note(lock: &Lockfile, resolver: Resolver) -> Option<String> {
+    let unmarked: Vec<&str> =
+        lock.variants.iter().filter(|(_, v)| !v.full_context).map(|(id, _)| id.as_str()).collect();
+    let boot = !lock.boot.is_empty() && !lock.boot_full_context;
+    let sidecar_wrote =
+        lock.native_mappings.is_some() || lock.boot_full_context || lock.variants.values().any(|v| v.full_context);
+    if (unmarked.is_empty() && !boot) || !(sidecar_wrote || resolver.full_context()) {
+        return None;
+    }
+    let mut what = Vec::new();
+    if !unmarked.is_empty() {
+        what.push(unmarked.join(", "));
+    }
+    if boot {
+        what.push("the boot section".to_string());
+    }
+    Some(format!(
+        "{} {} locked without the full resolution context (by `cs`, whose OS and arch profiles follow the machine it \
+         ran on); used as locked, and a non-frozen install with the resolver sidecar re-locks {}",
+        what.join(" and "),
+        if unmarked.len() + usize::from(boot) == 1 { "was" } else { "were" },
+        if unmarked.len() + usize::from(boot) == 1 { "it" } else { "them" },
+    ))
+}
+
+/// One request's result for every system of the lock (design §5.2.1): a single merged list
+/// whose entries name the systems they are on when not on every one, or, when the per-system
+/// orders can't be merged, a list per system.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Resolution {
+    Merged(Vec<(ResolvedArtifact, Option<Vec<String>>)>),
+    BySystem(BTreeMap<String, Vec<ResolvedArtifact>>),
+}
+
+impl Resolution {
+    /// Every resolved file, on any system.
+    fn artifacts(&self) -> Vec<&ResolvedArtifact> {
+        match self {
+            Resolution::Merged(list) => list.iter().map(|(a, _)| a).collect(),
+            Resolution::BySystem(m) => m.values().flatten().collect(),
+        }
+    }
+
+    /// The locked classpath: `modules` (upstream workspace variants, on every system) first.
+    fn classpath(&self, modules: Vec<String>) -> Classpath {
+        let module_entries = || modules.iter().map(|m| ClasspathEntry::Module { module: m.clone() });
+        match self {
+            Resolution::Merged(list) => Classpath::List(
+                module_entries()
+                    .map(LockEntry::plain)
+                    .chain(list.iter().map(|(a, systems)| LockEntry {
+                        entry: ClasspathEntry::Artifact(a.key.clone()),
+                        systems: systems.clone(),
+                    }))
+                    .collect(),
+            ),
+            Resolution::BySystem(m) => Classpath::BySystem(
+                m.iter()
+                    .map(|(system, list)| {
+                        let entries =
+                            module_entries().chain(list.iter().map(|a| ClasspathEntry::Artifact(a.key.clone())));
+                        (system.clone(), entries.collect())
+                    })
+                    .collect(),
+            ),
+        }
+    }
 }
 
 fn bom_string(v: &Variant, bom: &Dependency, version: &str) -> String {
@@ -1040,11 +1290,14 @@ pub(crate) fn tempfile_dir() -> Result<tempfile::TempDir, InstallError> {
 fn resolve_concurrently<'a>(
     requests: &[&'a ResolveRequest],
     labels: &[(ResolveRequest, String)],
+    ctx: &LockContext,
     repos: &[Repo],
     proxy: &crate::machine::ProxyChoice,
     cache: &Path,
     scratch: &Path,
-) -> Result<HashMap<&'a ResolveRequest, Vec<ResolvedArtifact>>, InstallError> {
+) -> Result<HashMap<&'a ResolveRequest, Resolution>, InstallError> {
+    // Checked by the caller: `cs` resolves one system.
+    debug_assert!(ctx.systems.len() <= 1, "cs resolves a single system");
     let mut distinct: Vec<&ResolveRequest> = Vec::new();
     for r in requests {
         if !distinct.contains(r) {
@@ -1082,7 +1335,7 @@ fn resolve_concurrently<'a>(
                 other => other.into(),
             }
         })?;
-        out.insert(req, resolved);
+        out.insert(req, Resolution::Merged(resolved.into_iter().map(|a| (a, None)).collect()));
     }
     Ok(out)
 }
@@ -1284,9 +1537,23 @@ fn repo_access(repo: &Repo, shared: Option<Auth>, creds: &CoursierCredentials) -
     }
 }
 
-/// Every artifact the lock references, as download instructions.
+/// Every artifact the lock references, as download instructions. For a projection
+/// ([`Lockfile::project`]), that is one system's files.
 pub fn fetch_items(
     lock: &Lockfile,
+    repos: &[Repo],
+    creds: &CoursierCredentials,
+    cache: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<FetchItem>, InstallError> {
+    let keys: BTreeSet<String> = lock.referenced_artifacts().into_iter().map(str::to_string).collect();
+    fetch_items_of(lock, &keys, repos, creds, cache, warnings)
+}
+
+/// [`fetch_items`] for the artifacts `keys` names.
+fn fetch_items_of(
+    lock: &Lockfile,
+    keys: &BTreeSet<String>,
     repos: &[Repo],
     creds: &CoursierCredentials,
     cache: &Path,
@@ -1306,7 +1573,7 @@ pub fn fetch_items(
         .map(|(r, s)| (r.id.as_str(), repo_access(r, s.map(|(_, auth)| auth), &creds)))
         .collect();
     let mut items = Vec::new();
-    for key in lock.referenced_artifacts() {
+    for key in keys.iter().map(String::as_str) {
         let art = lock.artifacts.get(key).ok_or_else(|| {
             InstallError::Resolve(format!(
                 "{} references {key}, which has no artifacts entry",
@@ -1377,8 +1644,8 @@ pub fn fetch_items(
     Ok(items)
 }
 
-/// Absolute classpath for a variant from the lock: cached jars, and upstream modules' class
-/// directories (`.scpm/out/<id>/classes`).
+/// Absolute classpath for a variant from a projected lock ([`ensure`]): cached jars, and
+/// upstream modules' class directories (`.scpm/out/<id>/classes`).
 pub fn classpath_files(
     ws: &Workspace,
     lock: &Lockfile,
@@ -1395,7 +1662,7 @@ pub fn classpath_files(
             .collect();
     Ok(kind
         .entries(variant)
-        .iter()
+        .into_iter()
         .map(|e| match e {
             ClasspathEntry::Module { module } => ws.root.join(".scpm/out").join(module).join("classes"),
             ClasspathEntry::Artifact(key) => by_key[key].dest.clone(),
@@ -1422,6 +1689,167 @@ mod tests {
         assert_eq!(rev, vec!["B", "C", "A"]);
     }
     use super::*;
+
+    fn boot_list(keys: &[&str]) -> Classpath {
+        Classpath::plain(keys.iter().map(|k| ClasspathEntry::Artifact(k.to_string())))
+    }
+
+    fn header(systems: &[&str], default_systems: Option<u32>) -> Lockfile {
+        Lockfile {
+            lockfile_version: LOCKFILE_VERSION,
+            systems: systems.iter().map(|s| s.to_string()).collect(),
+            default_systems,
+            jdk: "25".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_system_set_comes_from_config_then_the_header_then_the_default() {
+        let (dir, ws, _) = workspace(&[("a", "{}\n")]);
+        // A new lock: the default set.
+        let ctx = lock_context(&ws, &Lockfile::default(), false);
+        assert_eq!((ctx.systems, ctx.default_systems), (vec!["linux-x86_64".to_string()], Some(1)));
+        // A header from a default set governs, even another version's (a newer binary's).
+        let newer = header(&["macos-aarch64", "linux-x86_64"], Some(2));
+        let ctx = lock_context(&ws, &newer, false);
+        assert_eq!(ctx.systems, ["linux-x86_64", "macos-aarch64"], "sorted");
+        assert_eq!(ctx.default_systems, Some(2));
+        // `--reset-systems`, and a header written from a since-removed `lock.systems`: the default.
+        assert_eq!(lock_context(&ws, &newer, true).systems, ["linux-x86_64"]);
+        assert_eq!(lock_context(&ws, &header(&["macos-aarch64"], None), false).systems, ["linux-x86_64"]);
+        // `lock.systems` wins, and records no default version.
+        std::fs::write(
+            dir.path().join("scpm-workspace.yaml"),
+            "modules: ['modules/*']\ntoolchain:\n  scala: 3.9.0\nlock:\n  systems: [macos-aarch64, linux-aarch64, macos-aarch64]\n  jdk: 21\n",
+        )
+        .unwrap();
+        let ws = crate::workspace::load(dir.path()).unwrap();
+        let ctx = lock_context(&ws, &newer, false);
+        assert_eq!(
+            ctx,
+            LockContext {
+                systems: vec!["linux-aarch64".into(), "macos-aarch64".into()],
+                default_systems: None,
+                jdk: "21".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_systems_are_config_errors() {
+        let (dir, _, _) = workspace(&[("a", "{}\n")]);
+        std::fs::write(
+            dir.path().join("scpm-workspace.yaml"),
+            "modules: ['modules/*']\ntoolchain:\n  scala: 3.9.0\nlock:\n  systems: [linux-amd64]\n  jdk: temurin\n",
+        )
+        .unwrap();
+        let err = crate::workspace::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("unknown system `linux-amd64`") && err.contains("linux-x86_64"), "{err}");
+        assert!(err.contains("`temurin` is not a JDK major version"), "{err}");
+    }
+
+    #[test]
+    fn a_system_outside_the_set_needs_a_lock_without_system_specific_entries() {
+        let mut lock = header(&["linux-aarch64", "linux-x86_64"], None);
+        lock.boot.insert("b".into(), boot_list(&["g:a:1"]));
+        let (view, note) = projection(&lock, "linux-x86_64").unwrap();
+        assert_eq!((view.boot, note), (lock.boot.clone(), None));
+        let (view, note) = projection(&lock, "windows-x86_64").unwrap();
+        assert_eq!(view.boot["b"], boot_list(&["g:a:1"]), "the common projection");
+        assert!(
+            note.unwrap().contains("windows-x86_64 is not one of the lock's systems (linux-aarch64, linux-x86_64)")
+        );
+        let Some(Classpath::List(l)) = lock.boot.get_mut("b") else { unreachable!() };
+        l.push(LockEntry {
+            entry: ClasspathEntry::Artifact("g:n:1:linux-x86_64".into()),
+            systems: Some(vec!["linux-x86_64".into()]),
+        });
+        let err = projection(&lock, "windows-x86_64").unwrap_err().to_string();
+        assert!(err.contains("add windows-x86_64 to `lock.systems`"), "{err}");
+        // A system in the set gets exactly its own entries.
+        assert_eq!(projection(&lock, "linux-aarch64").unwrap().0.boot["b"], boot_list(&["g:a:1"]));
+        assert_eq!(projection(&lock, "linux-x86_64").unwrap().0.boot["b"], boot_list(&["g:a:1", "g:n:1:linux-x86_64"]));
+    }
+
+    #[test]
+    fn restores_download_only_the_host_systems_files() {
+        let mut lock = header(&["linux-x86_64", "macos-aarch64"], None);
+        let scoped = |k: &str, s: &str| LockEntry {
+            entry: ClasspathEntry::Artifact(k.into()),
+            systems: Some(vec![s.to_string()]),
+        };
+        let plain = |k: &str| LockEntry::plain(ClasspathEntry::Artifact(k.into()));
+        lock.variants.insert(
+            "a@jvm-3".into(),
+            VariantLock {
+                runtime_classpath: Classpath::List(vec![
+                    plain("g:a:1"),
+                    scoped("g:n:1:linux-x86_64", "linux-x86_64"),
+                    scoped("g:n:1:osx", "macos-aarch64"),
+                ]),
+                test_runtime_classpath: Classpath::BySystem(
+                    [
+                        ("linux-x86_64".to_string(), vec![ClasspathEntry::Artifact("g:t:1".into())]),
+                        ("macos-aarch64".to_string(), vec![ClasspathEntry::Artifact("g:t:2".into())]),
+                    ]
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        lock.boot
+            .insert("b".into(), Classpath::List(vec![plain("g:c:1"), scoped("g:bn:1:linux-x86_64", "linux-x86_64")]));
+        let keys = |host: &str, restore: RestoreSystems| -> Vec<String> {
+            restore_keys(&lock, host, &restore, &mut Vec::new()).unwrap().into_iter().collect()
+        };
+        assert_eq!(keys("macos-aarch64", RestoreSystems::Host), ["g:a:1", "g:c:1", "g:n:1:osx", "g:t:2"]);
+        assert_eq!(
+            keys("linux-x86_64", RestoreSystems::Host),
+            ["g:a:1", "g:bn:1:linux-x86_64", "g:c:1", "g:n:1:linux-x86_64", "g:t:1"]
+        );
+        assert_eq!(keys("macos-aarch64", RestoreSystems::All).len(), 7);
+        assert_eq!(keys("macos-aarch64", RestoreSystems::Also(vec!["linux-x86_64".into()])).len(), 7);
+        // A host outside the set is refused before anything is downloaded.
+        let err = restore_keys(&lock, "windows-x86_64", &RestoreSystems::Host, &mut Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("the lock has entries that differ by system"), "{err}");
+    }
+
+    #[test]
+    fn frozen_runs_note_unmarked_variants_only_in_mixed_locks() {
+        let mut lock = header(&["linux-x86_64"], Some(1));
+        lock.variants.insert("a@jvm-3".into(), VariantLock::default());
+        lock.boot.insert("b".into(), boot_list(&["g:a:1"]));
+        assert_eq!(unmarked_note(&lock, Resolver::Cs), None, "a lock `cs` wrote alone");
+        lock.variants.insert("b@jvm-3".into(), VariantLock { full_context: true, ..Default::default() });
+        let note = unmarked_note(&lock, Resolver::Cs).unwrap();
+        assert!(
+            note.starts_with("a@jvm-3 and the boot section were locked without the full resolution context"),
+            "{note}"
+        );
+        lock.boot_full_context = true;
+        let note = unmarked_note(&lock, Resolver::Cs).unwrap();
+        assert!(note.starts_with("a@jvm-3 was locked") && note.ends_with("re-locks it"), "{note}");
+    }
+
+    #[test]
+    fn resolutions_become_locked_classpaths() {
+        let art = |k: &str| ResolvedArtifact { key: k.into(), file: PathBuf::from(k), url: String::new() };
+        let merged = Resolution::Merged(vec![
+            (art("g:a:1"), None),
+            (art("g:n:1:linux-x86_64"), Some(vec!["linux-x86_64".into()])),
+        ]);
+        let cp = merged.classpath(vec!["util@jvm-3".into()]);
+        assert_eq!(cp.project("linux-x86_64").len(), 3);
+        assert_eq!(cp.project("linux-aarch64").len(), 2);
+        assert_eq!(cp.common().len(), 2, "the module and g:a:1");
+        let by = Resolution::BySystem(
+            [("linux-x86_64".to_string(), vec![art("g:a:1")]), ("macos-aarch64".to_string(), vec![])].into(),
+        );
+        let cp = by.classpath(vec!["util@jvm-3".into()]);
+        assert_eq!(cp.project("macos-aarch64"), [ClasspathEntry::Module { module: "util@jvm-3".into() }]);
+        assert_eq!(by.artifacts().len(), 1);
+    }
 
     #[test]
     fn semanticdb_versions_are_published_ones() {
@@ -1453,7 +1881,7 @@ mod tests {
 
     #[test]
     fn boot_inputs_track_repositories_and_context() {
-        let ctx = ResolutionContextLock { os: "linux".into(), arch: "x86_64".into(), jdk: "25".into() };
+        let ctx = LockContext { systems: vec!["linux-x86_64".into()], default_systems: Some(1), jdk: "25".into() };
         let central = vec![Repo {
             id: "central".into(),
             url: coursier::CENTRAL_URL.into(),
@@ -1471,7 +1899,12 @@ mod tests {
         let base = boot_inputs_hash(&central, &ctx);
         assert_eq!(base, boot_inputs_hash(&central, &ctx));
         assert_ne!(base, boot_inputs_hash(&other, &ctx));
-        assert_ne!(base, boot_inputs_hash(&central, &ResolutionContextLock { jdk: "21".into(), ..ctx.clone() }));
+        assert_ne!(base, boot_inputs_hash(&central, &LockContext { jdk: "21".into(), ..ctx.clone() }));
+        assert_eq!(
+            base,
+            boot_inputs_hash(&central, &LockContext { default_systems: None, ..ctx.clone() }),
+            "where the set came from is not an input"
+        );
         // `groups` are an input; without them the hash is what it was before they existed.
         let grouped = vec![Repo { groups: vec!["com.acme".into()], ..central[0].clone() }];
         assert_ne!(base, boot_inputs_hash(&grouped, &ctx));
@@ -1499,7 +1932,7 @@ mod tests {
 
     fn hash_of(modules: &[(&str, &str)], id: &str) -> String {
         let (_dir, ws, graph) = workspace(modules);
-        let ctx = resolution_context(&ws);
+        let ctx = lock_context(&ws, &Lockfile::default(), false);
         inputs_hash(&ws, &graph, ws.variant(id).unwrap(), &[], &ctx)
     }
 
@@ -1534,7 +1967,13 @@ mod tests {
             std::fs::write(dir.path().join("modules/a/scpm.yaml"), manifest).unwrap();
             let ws = crate::workspace::load(dir.path()).unwrap();
             let graph = Graph::build(&ws).unwrap();
-            inputs_hash(&ws, &graph, ws.variant("a@jvm-3").unwrap(), &[], &resolution_context(&ws))
+            inputs_hash(
+                &ws,
+                &graph,
+                ws.variant("a@jvm-3").unwrap(),
+                &[],
+                &lock_context(&ws, &Lockfile::default(), false),
+            )
         };
         assert_ne!(hash(plain), hash(via_catalog));
     }
@@ -1597,7 +2036,7 @@ mod tests {
         let repos = vec![repo("central", &[]), repo("other", &[]), repo("acme", &["com.acme"])];
         let mut lock = Lockfile::default();
         let entry = |repo: &str| ArtifactLock { repo: repo.into(), sha256: "0".into(), size: 1 };
-        lock.boot.insert("x".into(), vec!["g:x:1".into(), "com.acme:y:1".into(), "g:z:1".into()]);
+        lock.boot.insert("x".into(), boot_list(&["g:x:1", "com.acme:y:1", "g:z:1"]));
         lock.artifacts.insert("g:x:1".into(), entry("other"));
         lock.artifacts.insert("com.acme:y:1".into(), entry("central"));
         lock.artifacts.insert("g:z:1".into(), entry("removed"));
@@ -1631,7 +2070,7 @@ mod tests {
         let good = cache.path().join("good");
         std::fs::write(&good, b"right").unwrap();
         let mut lock = Lockfile::default();
-        lock.boot.insert("x".into(), vec!["g:x:1".into()]);
+        lock.boot.insert("x".into(), boot_list(&["g:x:1"]));
         lock.artifacts.insert(
             "g:x:1".into(),
             ArtifactLock { repo: "central".into(), sha256: fetch::sha256_file(&good).unwrap(), size: 5 },
@@ -1745,7 +2184,7 @@ mod tests {
     #[test]
     fn invalid_lock_keys_are_errors() {
         let mut lock = Lockfile::default();
-        lock.boot.insert("x".into(), vec!["g:..:1".into()]);
+        lock.boot.insert("x".into(), boot_list(&["g:..:1"]));
         lock.artifacts.insert("g:..:1".into(), ArtifactLock { repo: "central".into(), sha256: "0".into(), size: 1 });
         let repos = vec![Repo {
             id: "central".into(),
@@ -1819,7 +2258,7 @@ mod tests {
         let resolved = ResolvedArtifact { key: "g:a:1".into(), file, url: "https://m/all/own/g/a/1/a-1.jar".into() };
         record_artifacts(&mut lock, [&resolved], &repos).unwrap();
         assert_eq!(lock.artifacts["g:a:1"].repo, "own");
-        lock.boot.insert("b".into(), vec!["g:a:1".into()]);
+        lock.boot.insert("b".into(), boot_list(&["g:a:1"]));
         let items =
             fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c"), &mut Vec::new()).unwrap();
         assert_eq!(items[0].url, "https://m/all/own/g/a/1/a-1.jar");
@@ -1849,7 +2288,7 @@ mod tests {
         ];
         let mut lock = Lockfile::default();
         lock.artifacts.insert("g:a:1".into(), ArtifactLock { repo: "central".into(), sha256: "0".into(), size: 1 });
-        lock.boot.insert("b".into(), vec!["g:a:1".into()]);
+        lock.boot.insert("b".into(), boot_list(&["g:a:1"]));
         let items =
             fetch_items(&lock, &repos, &CoursierCredentials::default(), Path::new("/c"), &mut Vec::new()).unwrap();
         assert_eq!(items[0].auth, Ok(Some(Auth::Bearer("t0k".into()))));
@@ -1920,5 +2359,39 @@ mod tests {
         let unshared = vec![repos[0].clone(), Repo { mirror: None, ..repos[1].clone() }];
         record_artifacts(&mut lock, &[via_mirror("g:x:1", "g/x/1/x-1.jar")], &unshared).unwrap();
         assert_eq!(lock.artifacts["g:x:1"].repo, "central");
+    }
+
+    /// A v1 lock converts with every hash kept (design §5.4): these are the values Phase 1's
+    /// code computed for this workspace with its default resolution context.
+    #[test]
+    fn single_system_hashes_equal_version_1s() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("scpm-workspace.yaml"),
+            "modules: ['modules/*']\ntoolchain:\n  scala: 3.9.0\n  jdk: temurin:21\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("modules/a")).unwrap();
+        std::fs::write(
+            dir.path().join("modules/a/scpm.yaml"),
+            "dependencies:\n  org.typelevel::cats-core: 2.13.0\n  g:x: ^1.0\n",
+        )
+        .unwrap();
+        let ws = crate::workspace::load(dir.path()).unwrap();
+        let graph = Graph::build(&ws).unwrap();
+        let repos = vec![Repo { id: "central".into(), url: coursier::CENTRAL_URL.into(), ..Default::default() }];
+        let ctx = lock_context(&ws, &Lockfile::default(), false);
+        assert_eq!((ctx.systems.as_slice(), ctx.jdk.as_str()), (&["linux-x86_64".to_string()][..], "21"));
+        assert_eq!(
+            inputs_hash(&ws, &graph, ws.variant("a@jvm-3").unwrap(), &repos, &ctx),
+            "sha256:aac1e06bcd0f976d7ff803e015880b4b3de8765f9da6c27ca246e81394c1ecd3"
+        );
+        assert_eq!(
+            boot_inputs_hash(&repos, &ctx),
+            "sha256:af971f6bd121ad25ba9a2705973f9a3719646fa531bacbeff61581ea668b953d"
+        );
+        // Another system set is another context.
+        let two = LockContext { systems: vec!["linux-x86_64".into(), "macos-aarch64".into()], ..ctx.clone() };
+        assert_ne!(boot_inputs_hash(&repos, &two), boot_inputs_hash(&repos, &ctx));
     }
 }

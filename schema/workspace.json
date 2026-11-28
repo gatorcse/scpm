@@ -223,16 +223,27 @@
     "LockSettings": {
       "type": "object",
       "properties": {
-        "resolutionContext": {
-          "description": "The fixed OS/arch/JDK used for POM profile activation when locking, so a lock made on\nmacOS equals one made on Linux. Default `{os: linux, arch: x86_64, jdk: <project jdk>}`.",
+        "jdk": {
+          "description": "The JDK major version POM profiles are activated for when locking. Default: the project\nJDK's major version (`toolchain.jdk`), else 25.",
           "anyOf": [
             {
-              "$ref": "#/$defs/ResolutionContext"
+              "$ref": "#/$defs/Ver"
             },
             {
               "type": "null"
             }
           ]
+        },
+        "systems": {
+          "description": "The systems (OS and CPU architecture pairs, e.g. `linux-x86_64`, `macos-aarch64`) every\nclasspath is locked for; each machine uses its own. Unset: scpm's default set, which the\nlock's header then records. More than one system needs the resolver sidecar.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
         }
       },
       "additionalProperties": false
@@ -616,34 +627,6 @@
         "id",
         "url"
       ]
-    },
-    "ResolutionContext": {
-      "type": "object",
-      "properties": {
-        "arch": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "jdk": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Ver"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "os": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "additionalProperties": false
     },
     "TaskDef": {
       "description": "A task definition, pnpm style.",

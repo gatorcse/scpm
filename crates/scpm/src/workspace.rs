@@ -479,6 +479,36 @@ fn validate_workspace(ctx: &Ctx, diags: &mut Diagnostics) {
     {
         diags.push(ctx.in_ws(d.at_key("toolchain.scala")));
     }
+    if let Some(systems) = &config.lock.systems {
+        if systems.is_empty() {
+            diags.push(ctx.in_ws(Diagnostic::new("`lock.systems` is empty").at_key("lock.systems").with_help(
+                format!(
+                    "list at least one system ({}), or remove the key for scpm's default set",
+                    crate::system::known_names()
+                ),
+            )));
+        }
+        for s in systems.iter().filter(|s| crate::system::known(s).is_none()) {
+            diags.push(
+                ctx.in_ws(
+                    Diagnostic::new(format!("unknown system `{s}`"))
+                        .at_key("lock.systems")
+                        .with_help(format!("known systems: {}", crate::system::known_names())),
+                ),
+            );
+        }
+    }
+    if let Some(jdk) = &config.lock.jdk
+        && crate::install::jdk_major(&jdk.0).is_none_or(|m| m != jdk.0)
+    {
+        diags.push(
+            ctx.in_ws(
+                Diagnostic::new(format!("`{}` is not a JDK major version", jdk.0))
+                    .at_key("lock.jdk")
+                    .with_help("e.g. `25`"),
+            ),
+        );
+    }
     let policy = &config.policy;
     let unsupported = [
         (config.scpm.is_some(), "scpm", 3),

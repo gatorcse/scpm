@@ -487,7 +487,7 @@ pub fn generate(tc: &Toolchain, opts: &Options) -> Result<Summary, IdeError> {
         }
         let vlock = &tc.lock.variants[&v.id];
         let lists: Vec<HashSet<&ClasspathEntry>> =
-            ClasspathKind::ALL.iter().map(|k| k.entries(vlock).iter().collect()).collect();
+            ClasspathKind::ALL.iter().map(|k| k.entries(vlock).into_iter().collect()).collect();
         let entry_scope = |e: &ClasspathEntry| scope(lists[0].contains(e), lists[1].contains(e));
         let mut libraries = Vec::new();
         let mut modules = Vec::new();

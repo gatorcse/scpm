@@ -100,14 +100,7 @@ pub fn why(
                 (None, _) => Err(InstallError::Stale(vec![owner.id.clone()])),
             }
         };
-        let req = classpath_request(
-            ws,
-            graph,
-            variant,
-            ClasspathKind::TestRuntime,
-            &lock.resolution_context.jdk,
-            &mut locked_version,
-        )?;
+        let req = classpath_request(ws, graph, variant, ClasspathKind::TestRuntime, &lock.jdk, &mut locked_version)?;
         let modules: BTreeSet<String> =
             found.iter().map(|k| k.split(':').take(2).collect::<Vec<_>>().join(":")).collect();
         let mut owners = vec![id.clone()];

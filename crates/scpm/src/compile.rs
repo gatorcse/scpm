@@ -100,7 +100,14 @@ impl<'a> Toolchain<'a> {
         let keys = self.lock.boot.get(name).ok_or_else(|| {
             CompileError::Setup(format!("the lockfile has no `{name}` boot entry; run `scpm install`"))
         })?;
-        Ok(keys.iter().map(|k| self.file(k)).collect())
+        Ok(keys
+            .common()
+            .into_iter()
+            .filter_map(|e| match e {
+                ClasspathEntry::Artifact(k) => Some(self.file(k)),
+                ClasspathEntry::Module { .. } => None,
+            })
+            .collect())
     }
 
     /// Classpath files of a variant, with upstream modules as their classes directories.
@@ -108,7 +115,7 @@ impl<'a> Toolchain<'a> {
         let vlock = self.lock.variants.get(id).ok_or_else(|| InstallError::Stale(vec![id.to_string()]))?;
         Ok(kind
             .entries(vlock)
-            .iter()
+            .into_iter()
             .map(|e| match e {
                 ClasspathEntry::Module { module } => (None, classes_dir(&self.ws.root, module)),
                 ClasspathEntry::Artifact(key) => (Some(key.clone()), self.file(key)),
@@ -151,7 +158,15 @@ pub fn compiler_options(
     let vlock = tc.lock.variants.get(&v.id).ok_or_else(|| InstallError::Stale(vec![v.id.clone()]))?;
     // Relative `-Xplugin:` paths resolve against the workspace root (daemon and foreground alike).
     let mut scalac = absolute_plugins(&ws.root, &v.scalac_options);
-    let plugins: Vec<PathBuf> = vlock.compiler_plugins.iter().map(|k| tc.file(k)).collect();
+    let plugins: Vec<PathBuf> = vlock
+        .compiler_plugins
+        .common()
+        .into_iter()
+        .filter_map(|e| match e {
+            ClasspathEntry::Artifact(k) => Some(tc.file(k)),
+            ClasspathEntry::Module { .. } => None,
+        })
+        .collect();
     for jar in &plugins {
         scalac.push(format!("-Xplugin:{}", jar.display()));
     }
