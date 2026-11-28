@@ -50,20 +50,53 @@ pub fn helper_jar(env_var: &str, project: &str) -> Result<PathBuf, WorkerError> 
         return Ok(path);
     }
     let exe = env::current_exe().map_err(|e| WorkerError::Setup(e.to_string()))?;
-    checkout_ancestors(&exe).find_map(|dir| find_jar(&dir.join("worker/target/out/jvm"), project)).ok_or_else(|| {
+    checkout_ancestors(&exe).into_iter().find_map(|dir| find_jar(&worker_out(&dir), project)).ok_or_else(|| {
         WorkerError::Setup(format!(
-            "cannot find the {project} jar; build it with `sbt package` in worker/ or set {env_var}"
+            "cannot find the {project} jar above {}; build it with `sbt package` in worker/ or set {env_var}",
+            exe.display()
         ))
     })
 }
 
 /// The directories above the scpm binary where a source checkout's `worker/` build output is
-/// looked for. The binary's path is resolved first, so a symlink to it (`~/.local/bin/scpm` →
-/// `<checkout>/target/release/scpm`) finds the checkout: macOS and Windows report the path the
-/// binary was started through, not its target.
-pub fn checkout_ancestors(exe: &Path) -> impl Iterator<Item = PathBuf> {
-    let exe = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
-    exe.ancestors().skip(1).map(Path::to_path_buf).collect::<Vec<_>>().into_iter()
+/// looked for: those above its resolved path first, so a symlink to it (`~/.local/bin/scpm` →
+/// `<checkout>/target/release/scpm`) finds the checkout (macOS and Windows report the path the
+/// binary was started through), then those above the path as started, so a checkout whose
+/// `target/` is a symlink to another disk still finds itself.
+pub fn checkout_ancestors(exe: &Path) -> Vec<PathBuf> {
+    let resolved = exe.canonicalize().map(without_verbatim_prefix).ok();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for path in resolved.iter().map(PathBuf::as_path).chain([exe]) {
+        for dir in path.ancestors().skip(1) {
+            if !dirs.iter().any(|d| d == dir) {
+                dirs.push(dir.to_path_buf());
+            }
+        }
+    }
+    dirs
+}
+
+/// `<dir>/worker/target/out/jvm`, joined one component at a time: Windows doesn't read `/` as
+/// a separator in a `\\?\` path.
+pub fn worker_out(dir: &Path) -> PathBuf {
+    ["worker", "target", "out", "jvm"].iter().fold(dir.to_path_buf(), |p, c| p.join(c))
+}
+
+/// `canonicalize` on Windows returns `\\?\C:\…`; the plain `C:\…` form is what the JVM, error
+/// messages and string joins expect. UNC and other verbatim forms are kept as they are.
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    if cfg!(windows)
+        && let Some(plain) = path.to_str().and_then(strip_verbatim_drive)
+    {
+        return PathBuf::from(plain);
+    }
+    path
+}
+
+fn strip_verbatim_drive(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix(r"\\?\")?;
+    let b = rest.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\').then_some(rest)
 }
 
 fn find_jar(out: &Path, project: &str) -> Option<PathBuf> {
@@ -1141,33 +1174,71 @@ mod java_home_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod checkout_tests {
-    use super::{checkout_ancestors, find_jar};
-    use std::fs;
+    use super::strip_verbatim_drive;
 
     #[test]
-    fn a_symlinked_binary_finds_its_checkouts_helper_jars() {
-        let tmp = tempfile::tempdir().unwrap();
-        let checkout = tmp.path().join("checkout");
-        let jar_dir = checkout.join("worker/target/out/jvm/scala-3.9.0/scpm-compile-worker");
-        fs::create_dir_all(&jar_dir).unwrap();
-        fs::write(jar_dir.join("scpm-compile-worker_3-0.1.0.jar"), b"").unwrap();
-        fs::create_dir_all(checkout.join("target/release")).unwrap();
-        let exe = checkout.join("target/release/scpm");
-        fs::write(&exe, b"").unwrap();
-        let bin = tmp.path().join("home/.local/bin");
-        fs::create_dir_all(&bin).unwrap();
-        let link = bin.join("scpm");
-        std::os::unix::fs::symlink(&exe, &link).unwrap();
+    fn the_verbatim_prefix_is_stripped_from_drive_paths_only() {
+        assert_eq!(strip_verbatim_drive(r"\\?\C:\co\target\release\scpm.exe"), Some(r"C:\co\target\release\scpm.exe"));
+        assert_eq!(strip_verbatim_drive(r"\\?\UNC\server\share\scpm.exe"), None);
+        assert_eq!(strip_verbatim_drive(r"C:\co\scpm.exe"), None);
+        assert_eq!(strip_verbatim_drive(r"\\?\C:"), None);
+    }
+}
 
-        let find = |exe| {
-            checkout_ancestors(exe).find_map(|d| find_jar(&d.join("worker/target/out/jvm"), "scpm-compile-worker"))
-        };
+#[cfg(all(test, unix))]
+mod checkout_symlink_tests {
+    use super::{checkout_ancestors, find_jar, worker_out};
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
+
+    /// A checkout with a built compile worker jar.
+    fn checkout(dir: &Path) {
+        let jars = worker_out(dir).join("scala-3.9.0/scpm-compile-worker");
+        fs::create_dir_all(&jars).unwrap();
+        fs::write(jars.join("scpm-compile-worker_3-0.1.0.jar"), b"").unwrap();
+    }
+
+    fn binary(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"").unwrap();
+    }
+
+    fn find(exe: &Path) -> Option<PathBuf> {
+        checkout_ancestors(exe).into_iter().find_map(|d| find_jar(&worker_out(&d), "scpm-compile-worker"))
+    }
+
+    #[test]
+    fn a_symlinked_binary_finds_its_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let co = tmp.path().join("checkout");
+        checkout(&co);
+        let exe = co.join("target/release/scpm");
+        binary(&exe);
+        let link = tmp.path().join("home/.local/bin/scpm");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&exe, &link).unwrap();
+
         let found = find(&link).expect("found through the symlink");
         assert_eq!(found.file_name().unwrap(), "scpm-compile-worker_3-0.1.0.jar");
-        assert!(found.starts_with(checkout.canonicalize().unwrap()), "{}", found.display());
+        assert!(found.starts_with(co.canonicalize().unwrap()), "{}", found.display());
         assert_eq!(find(&exe), Some(found), "and from the binary itself");
-        assert_eq!(find(&bin.join("missing")), None, "a path that does not resolve is searched as given");
+        assert_eq!(find(&tmp.path().join("home/.local/bin/missing")), None);
+    }
+
+    #[test]
+    fn a_checkout_whose_target_dir_is_a_symlink_still_finds_itself() {
+        // `<checkout>/target` → another disk: only the path as started leads back to the checkout.
+        let tmp = tempfile::tempdir().unwrap();
+        let co = tmp.path().join("checkout");
+        checkout(&co);
+        let fast = tmp.path().join("fast/target");
+        binary(&fast.join("release/scpm"));
+        symlink(&fast, co.join("target")).unwrap();
+
+        let found = find(&co.join("target/release/scpm")).expect("found above the path as started");
+        assert!(found.starts_with(&co), "{}", found.display());
     }
 }
