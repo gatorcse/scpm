@@ -1715,6 +1715,55 @@ fn locks_are_version_2_and_restores_use_the_host_systems_projection() {
     assert_eq!(fs::read_to_string(&path).unwrap(), v2);
 }
 
+/// `cs` writes no markers and strips none (design §5.4): the `nativeMappings` header and the
+/// markers of variants it doesn't re-lock survive; what it re-locks is unmarked, and resolving a
+/// boot entry unmarks the boot section.
+#[test]
+fn cs_keeps_the_sidecars_markers_on_what_it_does_not_relock() {
+    if !cs_available() {
+        return;
+    }
+    let server = Server::maven(hello_repo_files(b"hello jar"), None);
+    let ws = tempfile::tempdir().unwrap();
+    let repos = format!("repositories:\n  - {{id: local, url: '{}'}}\n  - central\n", server.url("/maven"));
+    let hello = "dependencies:\n  com.example:hello: '1.0'\n";
+    two_java_modules(ws.path(), &repos, hello, hello);
+    scpm(ws.path(), &shared_cache()).arg("install").assert().success();
+    let path = ws.path().join("scpm-lock.yaml");
+    let mut l: serde_yaml_ng::Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(!l["boot"].as_mapping().unwrap().is_empty());
+    l["nativeMappings"] = 3.into();
+    l["bootFullContext"] = true.into();
+    l["variants"]["a@jvm"]["fullContext"] = true.into();
+    fs::write(&path, serde_yaml_ng::to_string(&l).unwrap()).unwrap();
+
+    // Only b's manifest changes: only b re-locks, unmarked; the rest keeps its markers.
+    fs::write(
+        ws.path().join("modules/b/scpm.yaml"),
+        "scala: none\ndependencies:\n  com.example:hello: {version: '1.0', transitive: false}\n",
+    )
+    .unwrap();
+    let summary = json_install(ws.path(), &shared_cache(), &[]);
+    assert_eq!(summary["relocked"], serde_json::json!(["b@jvm"]), "{summary}");
+    assert_eq!(summary["bootRelocked"], serde_json::json!([]), "{summary}");
+    let l = lock(ws.path());
+    assert_eq!(l["nativeMappings"], 3);
+    assert_eq!(l["bootFullContext"], true);
+    assert_eq!(l["variants"]["a@jvm"]["fullContext"], true);
+    assert!(l["variants"]["b@jvm"].get("fullContext").is_none(), "{l}");
+
+    // A new repository re-resolves every boot entry (and variant): the boot section is unmarked.
+    let more = format!("{repos}  - {{id: extra, url: '{}'}}\n", server.url("/extra"));
+    let hello_b = "dependencies:\n  com.example:hello: {version: '1.0', transitive: false}\n";
+    two_java_modules(ws.path(), &more, hello, hello_b);
+    let summary = json_install(ws.path(), &shared_cache(), &[]);
+    assert!(!summary["bootRelocked"].as_array().unwrap().is_empty(), "{summary}");
+    let l = lock(ws.path());
+    assert!(l.get("bootFullContext").is_none(), "{l}");
+    assert!(l["variants"]["a@jvm"].get("fullContext").is_none(), "re-locked by cs: {l}");
+    assert_eq!(l["nativeMappings"], 3, "the header stays");
+}
+
 #[test]
 fn several_systems_need_the_sidecar_and_why_explains_only_the_host() {
     let ws = tempfile::tempdir().unwrap();

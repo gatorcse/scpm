@@ -138,6 +138,16 @@ impl LockEntry {
         LockEntry { entry, systems: None }
     }
 
+    /// An entry on `systems` (sorted and de-duplicated here), or on every system for `None`.
+    /// Workspace modules are on every system, so only artifacts may name systems.
+    pub fn new(entry: ClasspathEntry, systems: Option<Vec<String>>) -> LockEntry {
+        debug_assert!(
+            systems.is_none() || matches!(entry, ClasspathEntry::Artifact(_)),
+            "a workspace module is on every system: {entry:?}"
+        );
+        LockEntry { entry, systems: systems.map(crate::system::normalized) }
+    }
+
     pub fn applies_to(&self, system: &str) -> bool {
         self.systems.as_ref().is_none_or(|s| s.iter().any(|x| x == system))
     }
@@ -258,9 +268,7 @@ impl From<ClasspathRepr> for Classpath {
                     .map(|e| match e {
                         EntryRepr::Artifact(k) => LockEntry::plain(ClasspathEntry::Artifact(k)),
                         EntryRepr::Module(m) => LockEntry::plain(ClasspathEntry::Module { module: m.module }),
-                        EntryRepr::Scoped(s) => {
-                            LockEntry { entry: ClasspathEntry::Artifact(s.artifact), systems: Some(s.systems) }
-                        }
+                        EntryRepr::Scoped(s) => LockEntry::new(ClasspathEntry::Artifact(s.artifact), Some(s.systems)),
                     })
                     .collect(),
             ),
@@ -279,8 +287,11 @@ impl From<Classpath> for ClasspathRepr {
                         (ClasspathEntry::Artifact(k), Some(systems)) => {
                             EntryRepr::Scoped(ScopedRepr { artifact: k, systems })
                         }
-                        // Workspace modules are on every system.
-                        (ClasspathEntry::Module { module }, _) => EntryRepr::Module(ModuleRepr { module }),
+                        // Workspace modules are on every system (`LockEntry::new` checks).
+                        (ClasspathEntry::Module { module }, systems) => {
+                            debug_assert!(systems.is_none(), "module {module} with systems");
+                            EntryRepr::Module(ModuleRepr { module })
+                        }
                     })
                     .collect(),
             ),
@@ -373,11 +384,15 @@ mod v1 {
         pub fn convert(self) -> super::Lockfile {
             let ctx = self.resolution_context;
             let artifacts = |list: Vec<String>| Classpath::plain(list.into_iter().map(ClasspathEntry::Artifact));
+            // Phase 1 took any spelling (`amd64`, `Darwin`); the system is the canonical name.
+            // Only canonical spellings (`linux`/`x86_64`) hash as before, so others re-lock once.
+            let system =
+                crate::system::from_os_arch(&ctx.os, &ctx.arch).unwrap_or_else(|| format!("{}-{}", ctx.os, ctx.arch));
             super::Lockfile {
                 lockfile_version: LOCKFILE_VERSION,
                 // Phase 1's default context was default set version 1.
-                default_systems: ((ctx.os.as_str(), ctx.arch.as_str()) == DEFAULT).then_some(1),
-                systems: vec![format!("{}-{}", ctx.os, ctx.arch)],
+                default_systems: (system == format!("{}-{}", DEFAULT.0, DEFAULT.1)).then_some(1),
+                systems: vec![system],
                 native_mappings: None,
                 jdk: ctx.jdk,
                 boot_inputs: self.boot_inputs,
@@ -613,6 +628,24 @@ variants:
     }
 
     #[test]
+    fn entry_systems_are_normalized() {
+        let cp: Classpath =
+            serde_yaml_ng::from_str("[{artifact: 'g:a:1', systems: [macos-aarch64, linux-x86_64, macos-aarch64]}]")
+                .unwrap();
+        let Classpath::List(l) = &cp else { unreachable!() };
+        assert_eq!(l[0].systems.as_deref(), Some(&["linux-x86_64".to_string(), "macos-aarch64".to_string()][..]));
+        let built = LockEntry::new(ClasspathEntry::Artifact("g:a:1".into()), Some(vec!["b".into(), "a".into()]));
+        assert_eq!(built.systems, Some(vec!["a".to_string(), "b".to_string()]));
+    }
+
+    #[test]
+    #[should_panic(expected = "a workspace module is on every system")]
+    #[cfg(debug_assertions)]
+    fn modules_carry_no_systems() {
+        LockEntry::new(ClasspathEntry::Module { module: "a@jvm".into() }, Some(vec!["linux-x86_64".into()]));
+    }
+
+    #[test]
     fn version_1_locks_are_converted_keeping_their_hashes() {
         let v1 = "lockfileVersion: 1
 resolutionContext: {os: linux, arch: x86_64, jdk: '21'}
@@ -649,6 +682,11 @@ artifacts:
         assert_eq!(a.compiler_plugins, Classpath::plain([ClasspathEntry::Artifact("g:p:1".into())]));
         let other = Lockfile::parse(&v1.replace("os: linux, arch: x86_64", "os: macos, arch: aarch64")).unwrap();
         assert_eq!((other.systems.as_slice(), other.default_systems), (&["macos-aarch64".to_string()][..], None));
+        // Other spellings convert to the canonical system; Linux on amd64 was Phase 1's default.
+        let amd64 = Lockfile::parse(&v1.replace("os: linux, arch: x86_64", "os: Linux, arch: amd64")).unwrap();
+        assert_eq!((amd64.systems.as_slice(), amd64.default_systems), (&["linux-x86_64".to_string()][..], Some(1)));
+        let mac = Lockfile::parse(&v1.replace("os: linux, arch: x86_64", "os: Darwin, arch: arm64")).unwrap();
+        assert_eq!(mac.systems, ["macos-aarch64"]);
     }
 
     #[test]

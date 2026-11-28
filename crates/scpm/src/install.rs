@@ -40,15 +40,18 @@ pub struct InstallOptions {
     pub reset_systems: bool,
 }
 
-/// Which systems' files a restore downloads: always the host's, plus these.
+/// Which systems' files a restore downloads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum RestoreSystems {
     #[default]
     Host,
     /// The host's and these (`scpm install --system`).
     Also(Vec<String>),
-    /// Every system of the lock (`scpm install --all-systems`).
+    /// Every system of the lock, and the host's (`scpm install --all-systems`).
     All,
+    /// This system's only, not the host's (`scpm classpath --system`): the host may well be
+    /// outside the lock's set, as when packaging for Linux on a Mac.
+    Only(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -803,7 +806,7 @@ pub fn ensure_for(
     system: Option<&str>,
 ) -> Result<(Lockfile, InstallSummary), InstallError> {
     let restore = match system {
-        Some(s) => RestoreSystems::Also(vec![s.to_string()]),
+        Some(s) => RestoreSystems::Only(s.to_string()),
         None => RestoreSystems::Host,
     };
     let opts = InstallOptions { frozen: frozen || in_ci(), restore, ..Default::default() };
@@ -1138,21 +1141,26 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
 }
 
 /// The artifacts a restore downloads (design §5.4, "Restores"): the host system's projection of
-/// every variant and boot entry, plus those of the systems `restore` asks for. A host outside
-/// the lock's set is checked here, before anything is downloaded; its note goes to `notes`.
+/// every variant and boot entry, plus those of the systems `restore` asks for (or, for
+/// [`RestoreSystems::Only`], that system's alone). A host outside the lock's set is checked
+/// here, before anything is downloaded; its note goes to `notes`.
 fn restore_keys(
     lock: &Lockfile,
     host: &str,
     restore: &RestoreSystems,
     notes: &mut Vec<String>,
 ) -> Result<BTreeSet<String>, InstallError> {
-    let (view, outside) = projection(lock, host)?;
-    notes.extend(outside);
-    let mut keys: BTreeSet<String> = view.referenced_artifacts().into_iter().map(str::to_string).collect();
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    if !matches!(restore, RestoreSystems::Only(_)) {
+        let (view, outside) = projection(lock, host)?;
+        notes.extend(outside);
+        keys.extend(view.referenced_artifacts().into_iter().map(str::to_string));
+    }
     let others: Vec<&String> = match restore {
         RestoreSystems::Host => Vec::new(),
         RestoreSystems::Also(others) => others.iter().collect(),
         RestoreSystems::All => lock.systems.iter().collect(),
+        RestoreSystems::Only(system) => vec![system],
     };
     for system in others {
         let (view, _) = projection(lock, system)?;
@@ -1241,15 +1249,16 @@ impl Resolution {
     fn classpath(&self, modules: Vec<String>) -> Classpath {
         let module_entries = || modules.iter().map(|m| ClasspathEntry::Module { module: m.clone() });
         match self {
-            Resolution::Merged(list) => Classpath::List(
-                module_entries()
-                    .map(LockEntry::plain)
-                    .chain(list.iter().map(|(a, systems)| LockEntry {
-                        entry: ClasspathEntry::Artifact(a.key.clone()),
-                        systems: systems.clone(),
-                    }))
-                    .collect(),
-            ),
+            Resolution::Merged(list) => {
+                Classpath::List(
+                    module_entries()
+                        .map(LockEntry::plain)
+                        .chain(list.iter().map(|(a, systems)| {
+                            LockEntry::new(ClasspathEntry::Artifact(a.key.clone()), systems.clone())
+                        }))
+                        .collect(),
+                )
+            }
             Resolution::BySystem(m) => Classpath::BySystem(
                 m.iter()
                     .map(|(system, list)| {
@@ -1818,6 +1827,11 @@ mod tests {
         // A host outside the set is refused before anything is downloaded.
         let err = restore_keys(&lock, "windows-x86_64", &RestoreSystems::Host, &mut Vec::new()).unwrap_err();
         assert!(err.to_string().contains("the lock has entries that differ by system"), "{err}");
+        // Unless only another system is asked for (`classpath --system`, packaging for Linux).
+        assert_eq!(
+            keys("windows-x86_64", RestoreSystems::Only("linux-x86_64".into())),
+            keys("linux-x86_64", RestoreSystems::Host)
+        );
     }
 
     /// An up-to-date lock with several systems resolves nothing, so `cs` (one system only) is

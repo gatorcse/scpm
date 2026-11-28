@@ -971,7 +971,8 @@ artifacts:                           # every system's files, one entry each, all
 - **The frozen note about unmarked variants** is given only for a lock that already mixes them with sidecar-written ones (a variant or the boot section marked, or a `nativeMappings` header), or when the sidecar resolves. Under `cs` every variant is unmarked, and a note on every frozen CI run would say nothing new.
 - **Notes** (a host outside the set, unmarked variants, the project-JDK fallback) are part of `scpm install`'s summary (`notes` in `--json`). Commands that install first (`compile`, `test`, …) don't print them; errors are always printed.
 - **The project JDK** is, until scpm provisions `toolchain.jdk` (§6.3), the JDK that runs `run` and `test` today: the one `detect_java` finds. The worker-JDK check is in place (before restoring and compiling) but can't fail until the two are separate JDKs.
-- `scpm install --system <s>[,…]`, `--all-systems` and `--reset-systems`, and `scpm classpath --system <s>` exist; `scpm why --system <s>` accepts only the host system (M1 scope, §5.2.1).
+- `scpm install --system <s>[,…]`, `--all-systems` and `--reset-systems`, and `scpm classpath --system <s>` exist; `scpm why --system <s>` accepts only the host system (M1 scope, §5.2.1). `classpath --system <s>` restores only that system's files and works from a host outside the set (packaging for Linux on a Mac). `run --system` is deferred (it would run another system's natives on the host's JVM; packaging, Phase 4, is the real consumer).
+- **Converting a v1 lock** maps Phase 1's free-form `os`/`arch` to the canonical system (`Linux`/`amd64` → `linux-x86_64`, which counts as default set 1). Only the canonical spellings (`linux`, `macos`, `windows`; `x86_64`, `aarch64`) hash as v1 did; a lock written with another spelling re-locks once.
 
 #### Resolution context and repositories
 

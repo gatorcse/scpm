@@ -100,14 +100,15 @@ pub struct Host {
 }
 
 /// The project JDK: the JDK that runs `run` and `test`. Until scpm provisions `toolchain.jdk`
-/// itself (design §6.3), that is the JDK `detect_java` finds, so this is its home.
+/// itself (design §6.3), that is the JDK `detect_java` finds, so this is its home. When
+/// `SCPM_JAVA` names a `java` with no JDK home around it, there is none (never another JDK's).
 pub fn project_jdk() -> Option<PathBuf> {
-    crate::worker::java_home()
+    crate::worker::detected_java_home()
 }
 
 /// The JDK the compile worker runs on: the one `detect_java` finds.
 pub fn worker_jdk() -> Option<PathBuf> {
-    crate::worker::java_home()
+    crate::worker::detected_java_home()
 }
 
 /// The host system: the project JDK's, read from its `release` file, else (with a note) the OS
