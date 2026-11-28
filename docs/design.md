@@ -203,6 +203,8 @@ The explicitness concern ("A depends on B, here are all my projects") is kept tw
 
 A lone `scpm.yaml` with no workspace file is a valid single-module project, just as a lone `package.json` is.
 
+`scpm init [DIR]` writes the starting point. Outside a workspace it writes `scpm-workspace.yaml` (Scala and munit in the default catalog, `modules: [modules/*]`), one app module `modules/app` with a `Main` and a munit suite, and `.scpm/` in `.gitignore`. Inside a workspace it adds a library module at DIR, which `modules:` must already match (it does not edit the globs). It never overwrites a file, and it loads the result back as a workspace before returning, removing what it wrote if that fails. It resolves nothing; the first `install`, `compile` or `run` does.
+
 ### 4.2 Sketch: workspace file
 
 ```yaml

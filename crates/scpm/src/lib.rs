@@ -20,6 +20,7 @@ pub mod filter;
 pub mod foreign;
 pub mod graph;
 pub mod ide;
+pub mod init;
 pub mod install;
 pub mod lockfile;
 pub mod machine;
