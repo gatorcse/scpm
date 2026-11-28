@@ -736,9 +736,6 @@ pub(crate) fn classpath_request(
     Ok(req)
 }
 
-/// The native mappings for one classpath of a JVM variant (design §5.4): its dependencies'
-/// `natives:` (the variant's own, then upstream ones), then `lock.nativeClassifiers`, each
-/// replacing the built-in mapping for its module.
 /// Mapped modules on the host system's locked classpaths whose native jar for the host isn't
 /// there, read from the lock alone: for each variant the sidecar locked against this table
 /// (`fullContext`, and the header's `nativeMappings` equal to the table's version), each main
@@ -781,9 +778,11 @@ fn host_native_warnings(
                     let w = format!(
                         "{key} has no native jar for {host} (`{c}`) in {}: the repository didn't serve it when \
                          {id} was locked, so {id} runs without it here\n  help: once the repository (or the mirror \
-                         you reach it through) serves it, remove {id} from {} and run `scpm install`",
+                         you reach it through) serves it, remove {id} from {} and run `{}=sidecar scpm install` \
+                         (`cs`, the default in M1, applies no native mappings)",
                         crate::lockfile::LOCK_FILE,
-                        crate::lockfile::LOCK_FILE
+                        crate::lockfile::LOCK_FILE,
+                        crate::resolver::RESOLVER_ENV
                     );
                     if !out.contains(&w) {
                         out.push(w);
@@ -795,6 +794,9 @@ fn host_native_warnings(
     out
 }
 
+/// The native mappings for one classpath of a JVM variant (design §5.4): its dependencies'
+/// `natives:` (the variant's own, then upstream ones), then `lock.nativeClassifiers`, each
+/// replacing the built-in mapping for its module.
 fn native_specs(ws: &Workspace, graph: &Graph, v: &Variant, kind: ClasspathKind) -> Vec<crate::natives::NativeSpec> {
     if v.platform != Platform::Jvm {
         return Vec::new();

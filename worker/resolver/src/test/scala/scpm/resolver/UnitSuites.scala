@@ -146,6 +146,11 @@ class RecordingSuite extends munit.FunSuite:
       Recording.checksums("wrong checksum: /c/x.jar (expected SHA-1 abc12345 in /c/x.jar.sha1, got def45678)"),
       ("abc12345", "def45678")
     )
+    // Printed as a number: leading zeros come back, to the actual digest's length.
+    assertEquals(
+      Recording.checksums("wrong checksum: /c/x.pom (expected SHA-1 0 in /c/x.pom.sha1, got 38a07600)"),
+      ("00000000", "38a07600")
+    )
     assertEquals(Recording.checksums("checksum not found: /c/x.jar"), ("", ""))
     val roots = Seq("/cache")
     assert(Recording.localMiss("/cache/https/h/x.pom not found", roots))

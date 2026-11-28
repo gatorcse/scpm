@@ -119,7 +119,11 @@ object Recording:
     val expected = """expected (?:[A-Za-z0-9-]*[A-Za-z][A-Za-z0-9-]* )?([0-9a-fA-F]+)""".r
     val actual = """got ([0-9a-fA-F]+)""".r
     (expected.findFirstMatchIn(error), actual.findFirstMatchIn(error)) match
-      case (Some(e), Some(a)) => (e.group(1), a.group(1))
+      // Coursier prints the expected digest as a number, dropping leading zeros: pad it back to
+      // the length of the actual one.
+      case (Some(e), Some(a)) =>
+        val actual = a.group(1)
+        (e.group(1).reverse.padTo(actual.length, '0').reverse, actual)
       case _                  => ("", "")
 
   /** An HTTP status, or what went wrong, from coursier's error text (`ArtifactError.describe`). */

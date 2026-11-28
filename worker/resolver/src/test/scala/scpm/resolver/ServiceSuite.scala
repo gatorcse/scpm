@@ -291,12 +291,12 @@ class ServiceSuite extends munit.FunSuite:
   do
     test(s"a bad served checksum is `checksum`, in resolve and listVersions ($kind cache)") {
       server.module("public", "org.fix", "badsum", "1.0")
-      server.put("/public/org/fix/badsum/1.0/badsum-1.0.pom.sha1", "1234567890abcdef1234567890abcdef12345678".getBytes)
+      server.put("/public/org/fix/badsum/1.0/badsum-1.0.pom.sha1", "0034567890abcdef1234567890abcdef12345678".getBytes)
       val Seq(r) = resolve(cacheDir(), request(List("linux-x86_64"), root = "org.fix:badsum", natives = Nil)): @unchecked
       val err = r.error.getOrElse(fail(s"expected an error: $r"))
       assertEquals(err.code, "checksum", err.toString)
       val data = new String(com.github.plokhotnyuk.jsoniter_scala.core.writeToArray(err.data.get), "UTF-8")
-      assert(data.contains("\"expected\":\"1234567890abcdef1234567890abcdef12345678\""), s"$data ${err.message}")
+      assert(data.contains("\"expected\":\"0034567890abcdef1234567890abcdef12345678\""), s"$data ${err.message}")
       assert(data.contains("\"actual\":\"38a"), s"$data ${err.message}")
 
       server.metadata("public", "org.fix", "badmeta", Seq("1.0"))
