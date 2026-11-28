@@ -172,6 +172,9 @@ pub struct Dependency {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     pub transitive: bool,
+    /// `natives:`: system → classifier, replacing the built-in mapping (design §5.4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub natives: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// A dependency on another module in the workspace (`util: workspace:*`).
@@ -493,6 +496,21 @@ fn validate_workspace(ctx: &Ctx, diags: &mut Diagnostics) {
                 ctx.in_ws(
                     Diagnostic::new(format!("unknown system `{s}`"))
                         .at_key("lock.systems")
+                        .with_help(format!("known systems: {}", crate::system::known_names())),
+                ),
+            );
+        }
+    }
+    for (i, n) in config.lock.native_classifiers.iter().flatten().enumerate() {
+        let at = format!("lock.nativeClassifiers[{i}]");
+        if n.module.split(':').count() != 2 || n.module.split(':').any(str::is_empty) {
+            diags.push(ctx.in_ws(Diagnostic::new(format!("expected `org:name`, got `{}`", n.module)).at_key(&at)));
+        }
+        for s in n.natives.keys().filter(|s| crate::system::known(s).is_none()) {
+            diags.push(
+                ctx.in_ws(
+                    Diagnostic::new(format!("unknown system `{s}`"))
+                        .at_key(format!("{at}.natives"))
                         .with_help(format!("known systems: {}", crate::system::known_names())),
                 ),
             );
@@ -1485,16 +1503,32 @@ fn external_dependency(
     if let VersionSpec::Workspace { .. } = version {
         return Err(Diagnostic::new("`workspace:` is only for workspace modules (keys without `:`)"));
     }
-    let (exclude, classifier, kind, transitive) = match spec {
-        DepSpec::Version(_) => (Vec::new(), None, None, true),
-        DepSpec::Detailed(d) => (d.exclude.clone(), d.classifier.clone(), d.kind.clone(), d.transitive.unwrap_or(true)),
+    let (exclude, classifier, kind, transitive, natives) = match spec {
+        DepSpec::Version(_) => (Vec::new(), None, None, true, None),
+        DepSpec::Detailed(d) => {
+            (d.exclude.clone(), d.classifier.clone(), d.kind.clone(), d.transitive.unwrap_or(true), d.natives.clone())
+        }
     };
     for pattern in &exclude {
         if pattern.split(':').count() != 2 {
             return Err(Diagnostic::new(format!("invalid exclusion `{pattern}`; expected `org:name` (`*` allowed)")));
         }
     }
-    Ok(Dependency { scope, coord, spec: spec.version().0.clone(), version, exclude, classifier, kind, transitive })
+    if let Some(s) = natives.iter().flatten().map(|(s, _)| s).find(|s| crate::system::known(s).is_none()) {
+        return Err(Diagnostic::new(format!("natives: unknown system `{s}`"))
+            .with_help(format!("known systems: {}", crate::system::known_names())));
+    }
+    Ok(Dependency {
+        scope,
+        coord,
+        spec: spec.version().0.clone(),
+        version,
+        exclude,
+        classifier,
+        kind,
+        transitive,
+        natives,
+    })
 }
 
 /// A BOM entry (`org:name: <spec>`): its version resolves through catalogs like a dependency's.
@@ -1513,6 +1547,7 @@ fn bom_dependency(ctx: &Ctx, key: &str, spec: &Ver) -> Result<Dependency, Diagno
         classifier: None,
         kind: None,
         transitive: false,
+        natives: None,
     })
 }
 

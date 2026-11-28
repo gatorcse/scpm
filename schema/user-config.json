@@ -34,6 +34,13 @@
           "type": "null"
         }
       ]
+    },
+    "resolverMirror": {
+      "description": "A base URL to download the resolver sidecar's own jars from instead of the scpm GitHub\nrelease; each jar's file name is appended. Every jar stays pinned by the sha256 built into\nscpm, and no credentials are sent, so it must allow anonymous access.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "additionalProperties": false,

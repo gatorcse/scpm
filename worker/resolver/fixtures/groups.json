@@ -1,0 +1,43 @@
+{
+  "comment": "Which repositories serve a group (design §5.4, `groups:`). Run by both scpm's Rust tests (coursier::allowed_repos) and the resolver's (Groups.allowed), so the two matchers stay alike.",
+  "cases": [
+    {
+      "repositories": [
+        { "id": "central" },
+        { "id": "acme", "groups": ["com.acme"] },
+        { "id": "internal", "groups": ["com.acme.internal"] },
+        { "id": "mirror-of-internal", "groups": ["com.acme.internal", "org.x"] }
+      ],
+      "expect": {
+        "com.acme": ["acme"],
+        "com.acme.util": ["acme"],
+        "com.acme.internal.db": ["internal", "mirror-of-internal"],
+        "com.acmes": ["central"],
+        "org.x": ["mirror-of-internal"],
+        "org.typelevel": ["central"]
+      }
+    },
+    {
+      "repositories": [
+        { "id": "a", "groups": ["com.a"] },
+        { "id": "b", "groups": ["com.b"] }
+      ],
+      "expect": {
+        "com.a.x": ["a"],
+        "org.other": []
+      }
+    },
+    {
+      "repositories": [
+        { "id": "first" },
+        { "id": "grouped", "groups": ["io"] },
+        { "id": "second" }
+      ],
+      "expect": {
+        "io.netty": ["grouped"],
+        "iox": ["first", "second"],
+        "org.scala-lang": ["first", "second"]
+      }
+    }
+  ]
+}

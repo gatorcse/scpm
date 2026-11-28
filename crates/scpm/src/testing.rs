@@ -242,6 +242,7 @@ fn fork_runner(
         log_file: None,
         initialize: false,
         own_process_group: true,
+        clear_env: false,
     };
     let on_event = {
         let reporter = reporter.clone();
@@ -474,6 +475,7 @@ pub fn discover_tests(tc: &Toolchain, v: &Variant) -> Result<Vec<(String, Vec<St
         log_file: None,
         initialize: false,
         own_process_group: true,
+        clear_env: false,
     };
     let runner = Worker::spawn(spec, |_| {})?;
     let params = json!({"target": v.id, "testClassesDirs": [test_classes_dir(&tc.ws.root, &v.id)]});

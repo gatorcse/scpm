@@ -104,6 +104,9 @@ pub enum InstallError {
     /// The system set, the host system or a JDK's system doesn't allow the command (design §5.4).
     #[error("{0}")]
     Systems(String),
+    /// Starting or talking to the resolver sidecar failed (design §5.2.1).
+    #[error(transparent)]
+    Sidecar(#[from] crate::resolver::ResolverError),
     #[error("{0}")]
     Fetch(fetch::FetchFailure),
     /// The user config is invalid (design §5.9).
@@ -346,6 +349,9 @@ struct DependencyInput<'a> {
     classifier: Option<&'a str>,
     kind: Option<&'a str>,
     transitive: bool,
+    /// `natives:`, left out when absent so hashes are what they were before the key existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    natives: Option<&'a BTreeMap<String, String>>,
 }
 
 impl<'a> From<&'a Dependency> for DependencyInput<'a> {
@@ -359,6 +365,7 @@ impl<'a> From<&'a Dependency> for DependencyInput<'a> {
             classifier: d.classifier.as_deref(),
             kind: d.kind.as_deref(),
             transitive: d.transitive,
+            natives: d.natives.as_ref(),
         }
     }
 }
@@ -429,7 +436,7 @@ fn inputs_hash(ws: &Workspace, graph: &Graph, v: &Variant, repos: &[Repo], ctx: 
                 .collect()
         })
         .collect();
-    sha256_json(&serde_json::json!({
+    let mut inputs = serde_json::json!({
         "variant": variant_inputs(v),
         "upstream": upstream,
         "bomOwners": bom_owners,
@@ -439,7 +446,16 @@ fn inputs_hash(ws: &Workspace, graph: &Graph, v: &Variant, repos: &[Repo], ctx: 
         "minimumReleaseAge": ws.config.policy.minimum_release_age,
         // Rejected as unsupported for now (so always empty), but part of the contract.
         "minimumReleaseAgeExclude": ws.config.policy.minimum_release_age_exclude,
-    }))
+    });
+    // The whole workspace list, in every JVM variant's hash; absent, it adds nothing, so hashes
+    // stay what they were before the key existed. Built-in mappings are never hashed: the
+    // header's `nativeMappings` versions them (design §5.4).
+    if v.platform == Platform::Jvm
+        && let Some(list) = &ws.config.lock.native_classifiers
+    {
+        inputs["nativeClassifiers"] = serde_json::to_value(list).expect("serializes");
+    }
+    sha256_json(&inputs)
 }
 
 /// What every boot resolution depends on besides its own root (design §5.4, `bootInputs`).
@@ -455,6 +471,48 @@ struct Selector<'a> {
     previous: &'a BTreeMap<String, CatalogSelection>,
     catalogs: Mutex<BTreeMap<String, CatalogSelection>>,
     listed: Mutex<HashMap<String, Vec<String>>>,
+    sidecar: &'a LazySidecar<'a>,
+}
+
+/// The resolver sidecar, started at the first request that needs it and used for the rest of
+/// the command (design §5.2.1, "Lifecycle"); never for `cs`.
+pub(crate) struct LazySidecar<'a> {
+    resolver: Resolver,
+    machine: &'a crate::machine::Machine,
+    repos: &'a [Repo],
+    cell: std::cell::OnceCell<crate::resolver::Sidecar>,
+}
+
+impl<'a> LazySidecar<'a> {
+    fn new(resolver: Resolver, machine: &'a crate::machine::Machine, repos: &'a [Repo]) -> Self {
+        LazySidecar { resolver, machine, repos, cell: std::cell::OnceCell::new() }
+    }
+
+    fn get(&self) -> Result<Option<&crate::resolver::Sidecar>, InstallError> {
+        if self.resolver != Resolver::Sidecar {
+            return Ok(None);
+        }
+        if let Some(s) = self.cell.get() {
+            return Ok(Some(s));
+        }
+        // As for `cs`: a repository that needs an unusable environment proxy fails up front.
+        if let Some(p) = &self.machine.proxy {
+            for r in self.repos {
+                p.route(r.fetch_url()).map_err(|e| InstallError::Coursier(coursier::CoursierError::Config(e)))?;
+            }
+        }
+        let started = crate::resolver::Sidecar::start(self.machine)?;
+        let _ = self.cell.set(started);
+        Ok(self.cell.get())
+    }
+
+    /// Stops the sidecar if it was started; its notice (unpinned jars), if any.
+    fn finish(self) -> Option<String> {
+        let sidecar = self.cell.into_inner()?;
+        let notice = sidecar.notice.clone();
+        sidecar.shutdown();
+        notice
+    }
 }
 
 impl Selector<'_> {
@@ -496,8 +554,14 @@ impl Selector<'_> {
                         )));
                     }
                     // Contacting the repositories: an ignored setting of another tool may be why it fails.
-                    let v = coursier::list_versions(&dep.coord.org, &artifact, &allowed, self.proxy, self.cache)
-                        .map_err(|e| with_notice(e.into(), self.repos, true))?;
+                    let v = match self.sidecar.get()? {
+                        // The sidecar routes by `groups` itself, so it gets every repository.
+                        Some(sidecar) => sidecar
+                            .list_versions(&list_key, self.repos, self.cache)
+                            .map_err(|e| with_notice(e.into(), self.repos, true))?,
+                        None => coursier::list_versions(&dep.coord.org, &artifact, &allowed, self.proxy, self.cache)
+                            .map_err(|e| with_notice(e.into(), self.repos, true))?,
+                    };
                     self.listed.lock().expect("listed").insert(list_key.clone(), v.clone());
                     v
                 }
@@ -669,7 +733,35 @@ pub(crate) fn classpath_request(
     }
     req.boms = boms;
     req.forced = forced;
+    req.natives = native_specs(ws, graph, v, kind);
     Ok(req)
+}
+
+/// The native mappings for one classpath of a JVM variant (design §5.4): its dependencies'
+/// `natives:` (the variant's own, then upstream ones), then `lock.nativeClassifiers`, each
+/// replacing the built-in mapping for its module.
+fn native_specs(ws: &Workspace, graph: &Graph, v: &Variant, kind: ClasspathKind) -> Vec<crate::natives::NativeSpec> {
+    if v.platform != Platform::Jvm {
+        return Vec::new();
+    }
+    let mut overrides: Vec<(String, BTreeMap<String, String>)> = Vec::new();
+    let mut add = |owner: &Variant, dep: &Dependency| {
+        if let Some(natives) = &dep.natives {
+            overrides.push((format!("{}:{}", dep.coord.org, artifact_name(owner, &dep.coord)), natives.clone()));
+        }
+    };
+    for dep in v.dependencies.iter().filter(|d| kind.own_scopes().contains(&d.scope)) {
+        add(v, dep);
+    }
+    for up in upstream_variants(graph, &v.id, kind).iter().filter_map(|id| ws.variant(id)) {
+        for dep in up.dependencies.iter().filter(|d| kind.upstream_scopes().contains(&d.scope)) {
+            add(up, dep);
+        }
+    }
+    for n in ws.config.lock.native_classifiers.iter().flatten() {
+        overrides.push((n.module.clone(), n.natives.clone()));
+    }
+    crate::natives::specs(&crate::natives::BUILT_IN, &overrides)
 }
 
 /// A boot closure (design §5.4): its lock name, root dependencies, and whether they are fetched transitively.
@@ -882,13 +974,38 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     let ctx = lock_context(ws, &previous, opts.reset_systems);
     migrate_catalog_keys(ws, &mut previous.catalogs, &mut warnings);
 
+    let resolver = Resolver::from_env()?;
+    let table = &crate::natives::BUILT_IN;
     let hashes: BTreeMap<String, String> =
         ws.variants().map(|v| (v.id.clone(), inputs_hash(ws, graph, v, &repos, &ctx))).collect();
-    let stale: Vec<String> = hashes
+    let mut stale: Vec<String> = hashes
         .iter()
         .filter(|(id, hash)| previous.variants.get(*id).is_none_or(|l| &l.inputs_hash != *hash))
         .map(|(id, _)| id.clone())
         .collect();
+    // The sidecar re-locks what `cs` wrote (no `fullContext`), and, with a newer mapping table
+    // than the lock's, every variant holding a module whose mapping changed since (design §5.4).
+    let mut boot_unmarked = false;
+    if resolver.full_context() && !opts.frozen {
+        for (id, l) in &previous.variants {
+            let mapping_changed = previous.native_mappings.is_some_and(|n| {
+                n < table.version
+                    && l.classpaths()
+                        .iter()
+                        .any(|c| c.artifact_keys().any(|k| crate::natives::touched(table, n, table.version, k)))
+            });
+            if hashes.contains_key(id) && !stale.contains(id) && (!l.full_context || mapping_changed) {
+                stale.push(id.clone());
+            }
+        }
+        stale.sort();
+        boot_unmarked = !previous.boot.is_empty() && !previous.boot_full_context;
+    }
+    if opts.frozen
+        && let Some(n) = previous.native_mappings.filter(|n| *n != table.version)
+    {
+        notes.push(format!("the lock uses native mapping table {n}, this scpm has {}", table.version));
+    }
     // Compilers for every Scala version in use (Java-only variants drive Zinc with one too),
     // plus the JVM helpers.
     let scala_versions: BTreeSet<String> = ws.variants().map(|v| compiler_scala(ws, v)).collect();
@@ -901,8 +1018,9 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     };
     let boot_inputs = (!boot.is_empty()).then(|| boot_inputs_hash(&repos, &ctx));
     let boot_inputs_changed = previous.boot_inputs != boot_inputs;
+    // An unmarked boot section is re-resolved whole, whatever `bootInputs` says.
     let missing_boot: Vec<&BootRoot> =
-        boot.iter().filter(|b| boot_inputs_changed || !previous.boot.contains_key(&b.name)).collect();
+        boot.iter().filter(|b| boot_inputs_changed || boot_unmarked || !previous.boot.contains_key(&b.name)).collect();
     let removed: Vec<String> = previous.variants.keys().filter(|id| !hashes.contains_key(*id)).cloned().collect();
 
     if opts.frozen && (!stale.is_empty() || !missing_boot.is_empty() || !removed.is_empty()) {
@@ -915,16 +1033,29 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
         what.extend(removed.iter().map(|id| format!("{id} (removed)")));
         return Err(InstallError::Stale(what));
     }
-    let resolver = Resolver::Cs;
+    let relocks = !stale.is_empty() || !missing_boot.is_empty();
     // `cs` resolves for the machine it runs on and takes only the JDK, so it can lock one
     // system only (design §5.4). A lock that already has several systems still restores.
-    if (!stale.is_empty() || !missing_boot.is_empty()) && ctx.systems.len() > 1 {
+    if relocks && resolver == Resolver::Cs && ctx.systems.len() > 1 {
         return Err(InstallError::Systems(format!(
             "the lock's system set has {} systems ({}), and `cs` can resolve for one system only; resolving for \
-             several systems needs the resolver sidecar (design §5.2.1), which this scpm does not include yet\n  \
-             help: set `lock.systems` to the one system to resolve for",
+             several systems needs the resolver sidecar (design §5.2.1)\n  help: set {}=sidecar, or set \
+             `lock.systems` to the one system to resolve for",
             ctx.systems.len(),
-            ctx.systems.join(", ")
+            ctx.systems.join(", "),
+            crate::resolver::RESOLVER_ENV
+        )));
+    }
+    // Never downgrade the mapping table: an older scpm can't re-lock what a newer one mapped.
+    if relocks
+        && resolver.full_context()
+        && let Some(n) = previous.native_mappings.filter(|n| *n > table.version)
+    {
+        return Err(InstallError::Systems(format!(
+            "{} uses native mapping table {n}, and this scpm has {}; re-locking with it would drop newer \
+             mappings\n  help: upgrade scpm",
+            crate::lockfile::LOCK_FILE,
+            table.version
         )));
     }
     if opts.frozen {
@@ -952,6 +1083,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     lock.boot.retain(|name, _| boot.iter().any(|b| &b.name == name));
 
     let scratch = tempfile_dir()?;
+    let sidecar = LazySidecar::new(resolver, machine, &repos);
     let selector = Selector {
         repos: &repos,
         proxy: &machine.proxy,
@@ -959,6 +1091,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
         previous: &previous.catalogs,
         catalogs: Mutex::new(BTreeMap::new()),
         listed: Mutex::new(HashMap::new()),
+        sidecar: &sidecar,
     };
     // Ranges are never re-selected implicitly (design §5.5): seed every dependency whose spec is
     // unchanged with the version the previous lock selected, stale variants included. Only new
@@ -1039,8 +1172,14 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
 
     let all: Vec<&ResolveRequest> =
         requests.values().chain(plugin_requests.values()).chain(boot_requests.values()).collect();
-    let results = resolve_concurrently(&all, &labels, &ctx, &repos, &machine.proxy, &cache, scratch.path())
-        .map_err(|e| with_notice(e, &repos, true))?;
+    let results = if all.is_empty() {
+        Ok(HashMap::new())
+    } else if let Some(s) = sidecar.get()? {
+        resolve_with_sidecar(s, &all, &labels, &ctx, &repos, &cache)
+    } else {
+        resolve_concurrently(&all, &labels, &ctx, &repos, &machine.proxy, &cache, scratch.path())
+    }
+    .map_err(|e| with_notice(e, &repos, true))?;
 
     record_artifacts(&mut lock, all.iter().flat_map(|req| results[*req].artifacts()), &repos)?;
     for (name, req) in &boot_requests {
@@ -1093,9 +1232,21 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     notes.extend(host.note.clone());
     let keys = restore_keys(&lock, &host.system, &opts.restore, &mut notes)?;
 
+    // Whenever a sidecar install writes the lock at all, every variant was re-locked against
+    // this scpm's mapping table (affected ones in this run), so the header becomes its version;
+    // a newer header (only possible when nothing re-locked) stays (design §5.4).
+    if resolver.full_context()
+        && !opts.frozen
+        && previous.native_mappings.is_none_or(|n| n <= table.version)
+        && std::fs::read_to_string(ws.root.join(crate::lockfile::LOCK_FILE)).ok() != Some(lock.to_yaml())
+    {
+        lock.native_mappings = Some(table.version);
+    }
     let lockfile_written = if opts.frozen { false } else { lock.write(&ws.root)? };
+    let sidecar_notice = sidecar.finish();
     // `cs` applies only the JDK part of the context (design §5.4, "Phase 1 limit").
-    let resolved_on = (!stale.is_empty() || !missing_boot.is_empty()).then(HostPlatform::current);
+    let resolved_on =
+        (resolver == Resolver::Cs && (!stale.is_empty() || !missing_boot.is_empty())).then(HostPlatform::current);
     if let Some(host) = &resolved_on
         && let [declared] = ctx.systems.as_slice()
         && crate::system::from_os_arch(&host.os, &host.arch).as_deref() != Some(declared.as_str())
@@ -1106,15 +1257,17 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
         ));
     }
 
-    // Re-locking ran `cs`.
-    let ran_cs = !stale.is_empty() || !missing_boot.is_empty();
+    // Re-locking contacted the repositories; with `cs`, which inherits more than scpm reads.
+    let resolved_any = !stale.is_empty() || !missing_boot.is_empty();
+    let ran_cs = resolved_any && resolver == Resolver::Cs;
     let fetch_started = Instant::now();
     let items = fetch_items_of(&lock, &keys, &repos, &CoursierCredentials::load(), &cache, &mut warnings)?;
     let fetch = fetch::fetch_all(items, FetchOptions { verify: opts.verify, proxy: machine.proxy.clone() })
         .map_err(|f| with_notice(InstallError::Fetch(f), &repos, ran_cs))?;
-    let contacted = ran_cs || fetch.downloaded > 0;
-    let notices =
+    let contacted = resolved_any || fetch.downloaded > 0;
+    let mut notices: Vec<String> =
         if contacted { crate::foreign::take_notice(&repos, ran_cs).into_iter().collect() } else { Vec::new() };
+    notices.extend(sidecar_notice);
     warnings.extend(fetch.warnings.iter().cloned());
     if fetch.repaired > 0 {
         warnings.push(format!(
@@ -1187,15 +1340,59 @@ pub(crate) fn with_notice(e: InstallError, repos: &[Repo], ran_cs: bool) -> Inst
 pub enum Resolver {
     /// The coursier CLI: one system, and only the JDK part of the context.
     Cs,
+    /// The resolver sidecar (`SCPM_RESOLVER=sidecar`): every system, OS, arch and JDK.
+    Sidecar,
 }
 
 impl Resolver {
+    /// `SCPM_RESOLVER`: `cs` (the default in M1) or `sidecar`.
+    pub fn from_env() -> Result<Resolver, InstallError> {
+        match std::env::var(crate::resolver::RESOLVER_ENV).as_deref() {
+            Err(_) | Ok("") | Ok("cs") => Ok(Resolver::Cs),
+            Ok("sidecar") => Ok(Resolver::Sidecar),
+            Ok(other) => Err(InstallError::Unsupported(format!(
+                "{}={other}: expected `cs` or `sidecar`",
+                crate::resolver::RESOLVER_ENV
+            ))),
+        }
+    }
+
     /// Whether what it resolves carries `fullContext` (the OS, arch and JDK of every system).
     pub fn full_context(self) -> bool {
         match self {
             Resolver::Cs => false,
+            Resolver::Sidecar => true,
         }
     }
+}
+
+/// Resolves every request in one sidecar call (it runs them concurrently, each for every
+/// system of the lock). `labels` names what each request is for, in errors.
+fn resolve_with_sidecar<'a>(
+    sidecar: &crate::resolver::Sidecar,
+    requests: &[&'a ResolveRequest],
+    labels: &[(ResolveRequest, String)],
+    ctx: &LockContext,
+    repos: &[Repo],
+    cache: &Path,
+) -> Result<HashMap<&'a ResolveRequest, Resolution>, InstallError> {
+    let mut distinct: Vec<&ResolveRequest> = Vec::new();
+    for r in requests {
+        if !distinct.contains(r) {
+            distinct.push(r);
+        }
+    }
+    let results = sidecar.resolve(&distinct, &ctx.systems, &ctx.jdk, repos, cache)?;
+    let mut out = HashMap::new();
+    for (req, result) in distinct.into_iter().zip(results) {
+        let resolution = result.map_err(|msg| {
+            let what: Vec<&str> = labels.iter().filter(|(r, _)| r == req).map(|(_, l)| l.as_str()).collect();
+            let what = if what.is_empty() { "a request".to_string() } else { what.join(", ") };
+            InstallError::Resolve(format!("resolving {what} failed:\n{msg}"))
+        })?;
+        out.insert(req, resolution);
+    }
+    Ok(out)
 }
 
 /// The note a frozen run gives about variants (and a boot section) locked without the full

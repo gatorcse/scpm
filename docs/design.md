@@ -522,7 +522,7 @@ The POMs Rust skipped are not missing from anything that needs them. Coursier fe
 
 #### 5.2.1 The resolver sidecar
 
-> Status: **design (Phase 3)**, with a measurement spike (2026-11-26, below). Nothing is implemented yet. Decided: a **JVM jar first**; native-image later. The user's decisions of 2026-11-27 (bootstrap, distribution, bearer tokens, TLS trust, cold cost, M1 scope) are recorded where they apply and listed at the end.
+> Status: **M1 implemented** (opt-in with `SCPM_RESOLVER=sidecar`; "As implemented (M1)" near the end of this section), with a measurement spike (2026-11-26, below). Decided: a **JVM jar first**; native-image later. The user's decisions of 2026-11-27 (bootstrap, distribution, bearer tokens, TLS trust, cold cost, M1 scope) are recorded where they apply and listed at the end.
 
 The sidecar replaces `cs` for everything that resolves: re-locks, boot entries, `why`, and version listing. The Rust fetcher keeps restoring from the lock (§5.2), and no frozen CI run starts the sidecar.
 
@@ -750,6 +750,17 @@ Read: AOT + C1 cuts a cold sidecar by 56% (Mac) to 62% (Linux), matching the wor
 5. **Cold cost:** about 160 ms more than native `cs` per re-lock is acceptable; native-image waits.
 6. **M1 scope:** the minimum, except that multi-system resolution is not cut (Migration, above).
 7. **Naming:** an OS and arch pair is a *system* (`lock.systems`, `--system`, `--all-systems`, `natives:`, `lock.nativeClassifiers`); *platform* stays `jvm`/`js`/`native` (§5.4, "Systems").
+
+**As implemented (M1).** `worker/resolver`, `crates/scpm/src/resolver.rs` (the client and the bootstrap) and `natives.rs` (the mapping table); opt in with `SCPM_RESOLVER=sidecar`. The protocol is documented in [worker-protocol.md](worker-protocol.md). Details settled, or changed, in the implementation:
+
+- **`initialize` also takes `userAgent`**, so the sidecar sends the same `User-Agent` as `cs` and the fetcher. **`ttl` is in seconds.**
+- **TLS trust:** when the OS store yields no certificate at all (a JDK without the Keychain root store, or no PEM bundle found on Linux), the sidecar falls back to the JDK's `cacerts`, with a note on stderr, rather than failing every HTTPS request.
+- **`repository` in a result** is derived in the sidecar from the artifact's URL (the longest matching configured URL, then the first allowed for the group), the same rule Rust uses for the lock's `repo` hint, rather than from a map of underlying repository instances. Rust keeps deriving `repo` itself, so the field is informational.
+- **The download pool** is a fixed 48 threads in the sidecar, shared by every request's `FileCache`; there is no per-host limit yet (coursier's `HostThrottle` handles 429s, one for the whole sidecar).
+- **`bad_environment`** answers the first request, whatever its method, then the sidecar exits with status 2.
+- **The bootstrap list** is `worker/resolver/bootstrap.txt`, written by `sbt resolver/bootstrapList` (`SCPM_RELEASE_TAG` names the release; without it the list says `release none`) and compiled in with `include_str!`. A line is `<sha256> <size> <file name>`, the resolver's own jar first. URLs are `https://github.com/gatorcse/scpm/releases/download/<release>/<file>`, or `resolverMirror` + file. Where the jars come from, in order: `SCPM_RESOLVER_CLASSPATH` (with its notice); a source checkout's locally built jars (`sbt resolver/stage` copies the closure to `worker/target/out/jvm/resolver-stage`, found above the running binary as the compile worker's jar is); the built-in list. A `release none` list without `resolverMirror` is an error that says how to build or point at the jars. **The release workflow (not written yet) must:** build the jars, run `bootstrapList` with `SCPM_RELEASE_TAG`, upload every listed jar as an asset of that release, publish the release, and only then build and distribute the binaries that embed the list.
+- **The built-in mapping table** is version 1: Netty's epoll and kqueue transports (from 4.1.0) and io_uring (from 4.2.0), and LWJGL's `lwjgl`, `-glfw`, `-jemalloc`, `-openal`, `-opengl` and `-stb` (from 3.3.0, the first with every arm64 classifier). Each entry has a change-log line; the M > N rule and tombstones are implemented and unit-tested with a synthetic table.
+- **Not done in M1:** `scpm config explain` doesn't name the resolver's hosts yet; `scpm install` doesn't note systems a mapping leaves out; the hostile-environment test runs on the CI's Linux only (no Windows job exists yet).
 
 **Still open.** Host the resolver inside `scpmd` later, as a separate class loader, once per-workspace credentials can be kept apart there?
 

@@ -33,6 +33,11 @@ pub struct UserConfigFile {
     /// The proxy for every download. Set, it replaces `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyEntry>,
+    /// A base URL to download the resolver sidecar's own jars from instead of the scpm GitHub
+    /// release; each jar's file name is appended. Every jar stays pinned by the sha256 built into
+    /// scpm, and no credentials are sent, so it must allow anonymous access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver_mirror: Option<String>,
 }
 
 /// `{url, token}` (bearer) or `{url, user, password}` (basic auth). Each value is `env:VAR`,
@@ -131,6 +136,8 @@ pub struct Machine {
     pub proxy: ProxyChoice,
     /// Problems worth a warning (e.g. a user config with secrets that others can read).
     pub warnings: Vec<String>,
+    /// `resolverMirror`, ending in `/`.
+    pub resolver_mirror: Option<String>,
 }
 
 impl Machine {
@@ -143,6 +150,7 @@ impl Machine {
             mirrors: Vec::new(),
             proxy: None,
             warnings: Vec::new(),
+            resolver_mirror: None,
         }
     }
 
@@ -256,6 +264,17 @@ impl Machine {
             },
             None => proxy_from_env(&|var| std::env::var(var).ok()),
         };
+        let resolver_mirror = match &config.resolver_mirror {
+            Some(url) if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['?', '#']) => {
+                err(
+                    "resolverMirror".to_string(),
+                    "expected an http:// or https:// base URL without a query or fragment".to_string(),
+                );
+                None
+            }
+            Some(url) => Some(if url.ends_with('/') { url.clone() } else { format!("{url}/") }),
+            None => None,
+        };
         diags.into_result(Machine {
             path: Some(file.to_path_buf()),
             exists: true,
@@ -263,6 +282,7 @@ impl Machine {
             mirrors,
             proxy,
             warnings: Vec::new(),
+            resolver_mirror,
         })
     }
 

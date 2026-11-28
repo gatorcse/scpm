@@ -225,7 +225,7 @@ impl Auth {
         }
     }
 
-    fn password(&self) -> &str {
+    pub fn password(&self) -> &str {
         match self {
             Auth::Bearer(token) => token,
             Auth::Basic { password, .. } => password,
@@ -555,6 +555,8 @@ pub struct ResolveRequest {
     /// Forced versions, `org:name:version`.
     pub forced: Vec<String>,
     pub jdk_version: Option<String>,
+    /// Native mappings (design §5.4); only the resolver sidecar applies them, `cs` ignores them.
+    pub natives: Vec<crate::natives::NativeSpec>,
 }
 
 /// A resolved artifact, in classpath order.
@@ -595,7 +597,7 @@ fn dependency_parts(dep: &str) -> (&str, &str, Option<&str>, Option<&str>) {
 
 /// Artifact types coursier keeps (`-A`): its defaults plus whatever the roots declare, so
 /// `sources`/`javadoc` classifiers and types such as `exe` or `aar` are not dropped.
-fn artifact_types(req: &ResolveRequest) -> Vec<String> {
+pub(crate) fn artifact_types(req: &ResolveRequest) -> Vec<String> {
     let mut types: Vec<String> = ["jar", "bundle", "test-jar"].map(String::from).to_vec();
     for dep in req.dependencies.iter().chain(&req.intransitive) {
         let (_, _, classifier, kind) = dependency_parts(dep);

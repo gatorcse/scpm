@@ -1016,6 +1016,7 @@ pub fn serve(args: ServeArgs) -> Result<(), WorkerError> {
         // Initialized below, once its pid is on record (so `stop` can find it meanwhile).
         initialize: false,
         own_process_group: false,
+        clear_env: false,
     };
     let worker = Worker::spawn(spec, |_| {}).and_then(|w| {
         info.worker_pid = w.pid();

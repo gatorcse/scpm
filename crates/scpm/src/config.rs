@@ -141,6 +141,18 @@ pub struct LockSettings {
     /// JDK's major version (`toolchain.jdk`), else 25.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jdk: Option<Ver>,
+    /// Native mappings for modules that arrive only transitively: each replaces scpm's built-in
+    /// mapping for its module (`natives: {}` turns it off). Direct dependencies use `natives:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_classifiers: Option<Vec<NativeClassifiers>>,
+}
+
+/// `{module: org:name, natives: {<system>: <classifier>}}`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NativeClassifiers {
+    pub module: String,
+    pub natives: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -451,6 +463,11 @@ pub struct DepDetails {
     /// Default `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transitive: Option<bool>,
+    /// System → classifier of this module's native jar (e.g. `linux-x86_64: linux-aarch_64`),
+    /// replacing scpm's built-in mapping for it; systems not listed get no native jar, and `{}`
+    /// turns the mapping off. Needs the resolver sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub natives: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl DepSpec {

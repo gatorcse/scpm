@@ -1,0 +1,30 @@
+{
+  "comment": "Which hosts `noProxy` sends directly (design §5.9), as scpm normalises the list (lower case, `*.d` written `.d`, loopback added). Run by both scpm's Rust tests (ProxySettings::bypasses) and the resolver's (Proxies.bypasses).",
+  "cases": [
+    {
+      "noProxy": [".corp.example", "internal", "10.1.2.3", "localhost", "127.0.0.1", "::1"],
+      "expect": {
+        "corp.example": true,
+        "a.corp.example": true,
+        "a.b.corp.example": true,
+        "notcorp.example": false,
+        "internal": true,
+        "x.internal": true,
+        "internalx": false,
+        "10.1.2.3": true,
+        "10.1.2.33": false,
+        "localhost": true,
+        "127.0.0.1": true,
+        "[::1]": true,
+        "repo1.maven.org": false
+      }
+    },
+    {
+      "noProxy": ["*", "localhost", "127.0.0.1", "::1"],
+      "expect": {
+        "repo1.maven.org": true,
+        "anything.example": true
+      }
+    }
+  ]
+}

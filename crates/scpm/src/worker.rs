@@ -403,6 +403,9 @@ pub struct Spawn<'a> {
     pub initialize: bool,
     /// Start in a new process group so `kill` also stops processes the JVM started.
     pub own_process_group: bool,
+    /// Start from an empty environment: the child gets only `env` (the resolver sidecar is
+    /// sealed this way, design §5.2.1).
+    pub clear_env: bool,
 }
 
 /// Requests waiting for a reply; `None` once the worker's stdout has closed.
@@ -454,6 +457,9 @@ impl Worker {
         // where scpm runs, not to the child's `cwd`.
         let cp = spec.classpath.iter().map(|p| absolute(p).display().to_string()).collect::<Vec<_>>().join(sep);
         let mut cmd = Command::new(&java.path);
+        if spec.clear_env {
+            cmd.env_clear();
+        }
         cmd.args(helper_jvm_flags(&java)).args(spec.jvm_options).arg("-cp").arg(cp).arg(spec.main).envs(spec.env);
         if let Some(dir) = spec.cwd {
             cmd.current_dir(dir);
