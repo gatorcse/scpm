@@ -287,7 +287,15 @@ fn detected_java_home_from(
                 .filter(|home| home.join("bin").join(exe).is_file())
                 .map(|home| home.canonicalize().unwrap_or(home))
         }
-        None => java_home_from(None, homes, path),
+        // Exactly what `detect_java` picks: the first non-empty home variable, else the
+        // executable `java` that `find_in_path` finds on PATH (skipping non-executable files).
+        None => selected_java_home(|var| match var {
+            "SCPM_JAVA_HOME" => homes.first().cloned().flatten(),
+            "JAVA_HOME" => homes.get(1).cloned().flatten(),
+            "PATH" => path.clone(),
+            _ => None,
+        })
+        .map(|home| home.canonicalize().unwrap_or(home)),
     }
 }
 
@@ -1014,7 +1022,7 @@ mod version_tests {
 
 #[cfg(test)]
 mod java_home_tests {
-    use super::{detected_java_home_from, java_home_from};
+    use super::{detected_java_home_from, find_in_path, java_home_from};
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1072,5 +1080,19 @@ mod java_home_tests {
             Some(j17.clone())
         );
         assert_eq!(detected_java_home_from(None, &homes, path), Some(j17));
+    }
+
+    /// On PATH, the home is that of the `java` `detect_java` runs: a non-executable `java`
+    /// earlier on PATH is skipped, as spawning skips it.
+    #[cfg(unix)]
+    #[test]
+    fn the_detected_home_on_path_skips_non_executable_javas() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (x64, arm) = (jdk(dir.path(), "jdk-x64"), jdk(dir.path(), "jdk-arm"));
+        fs::set_permissions(x64.join("bin/java"), fs::Permissions::from_mode(0o644)).unwrap();
+        let path = std::env::join_paths([x64.join("bin"), arm.join("bin")]).unwrap();
+        assert_eq!(find_in_path(&path, Path::new("java")), Some(arm.join("bin/java")), "what detect_java runs");
+        assert_eq!(detected_java_home_from(None, &[None, None], Some(path)), Some(arm));
     }
 }
