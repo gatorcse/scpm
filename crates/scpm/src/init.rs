@@ -142,11 +142,12 @@ fn new_workspace(root: &Path, opts: &InitOptions, w: &mut Writer) -> Result<Stri
     w.write(
         &module_dir.join(MODULE_FILE),
         &format!(
-            "mainClass: {pkg}.Main\n\n\
+            "mainClass: {}.Main\n\n\
              # dependencies:\n\
              #   org.typelevel::cats-core: 2.13.0   # `::` adds the Scala suffix (cats-core_3)\n\
              #   util: workspace:*                  # another module of this workspace\n\n\
-             testDependencies:\n  {MUNIT}: catalog\n"
+             testDependencies:\n  {MUNIT}: catalog\n",
+            pkg.trim_matches('`')
         ),
     )?;
     write_sources(&module_dir, &pkg, "Main", true, true, w)?;
@@ -160,6 +161,15 @@ fn new_module(root: &Path, dir: &Path, opts: &InitOptions, w: &mut Writer) -> Re
     let name = opts.name.clone().unwrap_or_else(|| dir_name.clone());
     check_name(&name, opts.name.is_none().then_some(dir))?;
     let ws = workspace::load(root).map_err(InitError::Workspace)?;
+    // A workspace that is already broken is reported as such, not as a fault of the new files.
+    Graph::build(&ws).map_err(InitError::Workspace)?;
+    if opts.scala.is_none() && ws.config.toolchain.scala.is_none() {
+        return Err(InitError::Usage(format!(
+            "the workspace sets no default Scala version (`toolchain.scala` in {}), so the module needs its own\n  \
+             help: pass --scala <version>, e.g. --scala {DEFAULT_SCALA}",
+            root.join(WORKSPACE_FILE).display()
+        )));
+    }
     if let Some(m) = ws.modules.iter().find(|m| m.name == name) {
         return Err(InitError::Usage(format!(
             "the workspace already has a module named `{name}`, in {}\n  help: pass --name to choose another name",
@@ -169,7 +179,8 @@ fn new_module(root: &Path, dir: &Path, opts: &InitOptions, w: &mut Writer) -> Re
     let has_munit = ws.config.catalog.contains_key(MUNIT);
     let mut yaml = String::new();
     if name != dir_name {
-        yaml.push_str(&format!("name: {name}\n"));
+        // Quoted: `2024`, `1.0` and `null` are valid module names but not YAML strings.
+        yaml.push_str(&format!("name: '{name}'\n"));
     }
     if let Some(v) = &opts.scala {
         yaml.push_str(&format!("scala: {v}\n"));
@@ -230,17 +241,19 @@ fn write_sources(
 /// Adds `.scpm/` (build output, run logs) to the workspace's `.gitignore` unless it is there.
 fn gitignore(root: &Path, w: &mut Writer) -> Result<(), InitError> {
     let path = root.join(".gitignore");
-    match fs::read_to_string(&path) {
-        Ok(text) => {
+    match fs::read(&path) {
+        Ok(bytes) => {
+            // Read leniently: a .gitignore that isn't UTF-8 is still appended to, byte for byte.
+            let text = String::from_utf8_lossy(&bytes);
             let ignored = text.lines().map(str::trim).any(|l| matches!(l, ".scpm" | ".scpm/" | "/.scpm" | "/.scpm/"));
             if !ignored {
                 let sep = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
-                w.append(&path, &text, &format!("{sep}.scpm/\n"))?;
+                w.append(&path, &bytes, format!("{sep}.scpm/\n").as_bytes())?;
             }
             Ok(())
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => w.write(&path, ".scpm/\n"),
-        Err(e) => Err(io_error(&path, e)),
+        Err(e) => Err(InitError::Io(format!("cannot read {}: {e}", path.display()))),
     }
 }
 
@@ -248,6 +261,12 @@ fn check_scala(v: &str) -> Result<(), InitError> {
     let parsed = ScalaVersion::parse(v).map_err(|e| InitError::Usage(format!("--scala: {e}")))?;
     if parsed.binary == "2.12" {
         return Err(InitError::Usage(format!("--scala {v}: scpm compiles Scala 2.13 and 3, not 2.12")));
+    }
+    let minor: u32 = v.split('.').nth(1).and_then(|m| m.parse().ok()).unwrap_or(0);
+    if parsed.binary == "3" && minor < 3 {
+        return Err(InitError::Usage(format!(
+            "--scala {v}: the tests scpm init writes use munit {DEFAULT_MUNIT}, which needs Scala 3.3 or later"
+        )));
     }
     Ok(())
 }
@@ -274,11 +293,15 @@ fn refuse_existing(path: &Path) -> Result<(), InitError> {
 }
 
 /// The Scala package for a module: its name with `-` and `.` as `_`, back-quoted if that is a
-/// keyword, and `_`-prefixed if it starts with a digit.
+/// keyword, `_`-prefixed if it starts with a digit, and `java_` for `java`.
 fn package_name(module: &str) -> String {
     let mut pkg: String = module.chars().map(|c| if c == '-' || c == '.' { '_' } else { c }).collect();
     if pkg.starts_with(|c: char| c.is_ascii_digit()) {
         pkg.insert(0, '_');
+    }
+    // The JVM refuses to define classes in `java.*`.
+    if pkg == "java" {
+        pkg.push('_');
     }
     if KEYWORDS.contains(&pkg.as_str()) { format!("`{pkg}`") } else { pkg }
 }
@@ -359,7 +382,7 @@ struct Writer {
     created: Vec<PathBuf>,
     /// Files appended to, with their previous content.
     appended: Vec<PathBuf>,
-    originals: Vec<String>,
+    originals: Vec<Vec<u8>>,
 }
 
 impl Writer {
@@ -381,10 +404,10 @@ impl Writer {
         io::Write::write_all(&mut f, content.as_bytes()).map_err(|e| io_error(path, e))
     }
 
-    fn append(&mut self, path: &Path, original: &str, extra: &str) -> Result<(), InitError> {
-        fs::write(path, format!("{original}{extra}")).map_err(|e| io_error(path, e))?;
+    fn append(&mut self, path: &Path, original: &[u8], extra: &[u8]) -> Result<(), InitError> {
+        fs::write(path, [original, extra].concat()).map_err(|e| io_error(path, e))?;
         self.appended.push(path.to_path_buf());
-        self.originals.push(original.to_string());
+        self.originals.push(original.to_vec());
         Ok(())
     }
 
@@ -415,6 +438,8 @@ mod tests {
         assert_eq!(package_name("my.lib"), "my_lib");
         assert_eq!(package_name("2d"), "_2d");
         assert_eq!(package_name("type"), "`type`");
+        assert_eq!(package_name("java"), "java_");
+        assert_eq!(package_name("java-util"), "java_util");
         assert_eq!(object_name("json-codec"), "JsonCodec");
         assert_eq!(object_name("core"), "Core");
         assert_eq!(object_name("2d"), "Lib2d");
@@ -524,5 +549,66 @@ mod tests {
             fs::read_to_string(blocked.path().join("modules/app/src/main/scala/app/Main.scala")).unwrap(),
             "// mine"
         );
+    }
+
+    #[test]
+    fn a_keyword_app_name_gets_a_plain_main_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report = init(tmp.path(), &InitOptions { name: Some("type".into()), scala: None }).unwrap();
+        let yaml = fs::read_to_string(report.root.join("modules/type/scpm.yaml")).unwrap();
+        assert!(yaml.starts_with("mainClass: type.Main\n"), "{yaml}");
+        let main = fs::read_to_string(report.root.join("modules/type/src/main/scala/type/Main.scala")).unwrap();
+        assert!(main.starts_with("package `type`\n"), "{main}");
+    }
+
+    #[test]
+    fn names_that_are_not_yaml_strings_are_quoted() {
+        let tmp = tempfile::tempdir().unwrap();
+        init(tmp.path(), &InitOptions::default()).unwrap();
+        for (i, name) in ["2024", "1.0", "null", "true"].into_iter().enumerate() {
+            let dir = tmp.path().join(format!("modules/m{i}"));
+            let report = init(&dir, &InitOptions { name: Some(name.into()), scala: None }).unwrap();
+            assert_eq!(report.module, name);
+        }
+    }
+
+    #[test]
+    fn a_failed_load_restores_the_gitignore_byte_for_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = b"target\n\xff\xfe not utf-8".to_vec();
+        fs::write(tmp.path().join(".gitignore"), &original).unwrap();
+        fs::create_dir_all(tmp.path().join("modules/bad")).unwrap();
+        fs::write(tmp.path().join("modules/bad/scpm.yaml"), "dependencies: [not, a, map]\n").unwrap();
+        let err = init(tmp.path(), &InitOptions::default()).unwrap_err();
+        assert!(matches!(err, InitError::Invalid(_)), "{err}");
+        assert_eq!(fs::read(tmp.path().join(".gitignore")).unwrap(), original);
+        assert!(!tmp.path().join(WORKSPACE_FILE).exists() && !tmp.path().join("modules/app").exists());
+        assert!(tmp.path().join("modules/bad/scpm.yaml").is_file(), "the user's files stay");
+    }
+
+    #[test]
+    fn a_module_needs_a_scala_version_and_a_workspace_that_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(WORKSPACE_FILE), "modules: ['modules/*']\n").unwrap();
+        let err = init(&tmp.path().join("modules/a"), &InitOptions::default()).unwrap_err().to_string();
+        assert!(err.contains("pass --scala"), "{err}");
+        let ok = init(&tmp.path().join("modules/a"), &InitOptions { name: None, scala: Some("3.9.0".into()) });
+        assert_eq!(ok.unwrap().variants, ["a@jvm-3"]);
+
+        // Already broken (a dependency cycle): reported as the workspace's fault, nothing written.
+        fs::write(tmp.path().join("modules/a/scpm.yaml"), "scala: 3.9.0\ndependencies:\n  b: workspace:*\n").unwrap();
+        fs::create_dir_all(tmp.path().join("modules/b")).unwrap();
+        fs::write(tmp.path().join("modules/b/scpm.yaml"), "scala: 3.9.0\ndependencies:\n  a: workspace:*\n").unwrap();
+        let err = init(&tmp.path().join("modules/c"), &InitOptions { name: None, scala: Some("3.9.0".into()) });
+        assert!(matches!(err, Err(InitError::Workspace(_))), "{err:?}");
+        assert!(!tmp.path().join("modules/c").exists());
+    }
+
+    #[test]
+    fn scala_3_before_3_3_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = init(tmp.path(), &InitOptions { name: None, scala: Some("3.2.2".into()) }).unwrap_err().to_string();
+        assert!(err.contains("needs Scala 3.3 or later"), "{err}");
+        assert!(init(tmp.path(), &InitOptions { name: None, scala: Some("3.3.6".into()) }).is_ok());
     }
 }

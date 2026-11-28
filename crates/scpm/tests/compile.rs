@@ -1416,3 +1416,41 @@ fn switching_scpm_java_invalidates_the_fingerprint() {
     let after_path_switch = bare(dirs[1].path());
     assert!(after_path_switch.iter().any(|(_, s)| s != "upToDate"), "{after_path_switch:?}");
 }
+
+/// What `scpm init` writes runs and tests as it is, on Scala 3 and 2.13, and a library module it
+/// adds can be depended on.
+#[test]
+fn an_initialized_workspace_runs_and_tests() {
+    if !prerequisites() {
+        return;
+    }
+    for scala in [None, Some("2.13.18")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut init = scpm(tmp.path());
+        init.args(["init", "hello"]);
+        if let Some(v) = scala {
+            init.args(["--scala", v]);
+        }
+        init.assert().success();
+        let ws = tmp.path().join("hello");
+        let out = scpm(&ws).args(["run", "app", "--", "scpm"]).output().unwrap();
+        assert!(out.status.success(), "{scala:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "Hello, scpm!\n");
+
+        scpm(&ws).args(["init", "modules/json-codec"]).assert().success();
+        let app = ws.join("modules/app/scpm.yaml");
+        let yaml = fs::read_to_string(&app).unwrap();
+        fs::write(&app, yaml.replacen("# dependencies:\n", "dependencies:\n  json-codec: workspace:*\n", 1)).unwrap();
+        let main = ws.join("modules/app/src/main/scala/app/Main.scala");
+        let code = fs::read_to_string(&main).unwrap();
+        fs::write(&main, code.replace("println(greeting(", "println(json_codec.JsonCodec.greeting(")).unwrap();
+        let out = scpm(&ws).args(["run", "app", "--", "lib"]).output().unwrap();
+        assert!(out.status.success(), "{scala:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "Hello, lib!\n");
+
+        let out = scpm(&ws).args(["--json", "test"]).output().unwrap();
+        assert!(out.status.success(), "{scala:?}: {}", String::from_utf8_lossy(&out.stderr));
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["tests"]["passed"], 2, "{scala:?}");
+    }
+}

@@ -398,7 +398,8 @@ fn run(cli: Cli) -> Result<(), Failure> {
                         eprintln!("error: {message}");
                         Failure::Config(d)
                     }
-                    _ => Failure::Usage(message),
+                    crate::init::InitError::Io(_) => Failure::Command(message),
+                    crate::init::InitError::Usage(_) => Failure::Usage(message),
                 }
             })?;
             if cli.json {
@@ -1060,7 +1061,13 @@ fn print_init(report: &crate::init::InitReport, start: &std::path::Path) -> io::
         writeln!(out, "  ~ {f}")?;
     }
     let here = start.canonicalize().is_ok_and(|s| s == report.root);
-    let c = if here { String::new() } else { format!("-C {} ", report.root.display()) };
+    let root = report.root.display().to_string();
+    let root = if root.contains(|c: char| c.is_whitespace() || c == '\'') {
+        format!("'{}'", root.replace('\'', r"'\''"))
+    } else {
+        root
+    };
+    let c = if here { String::new() } else { format!("-C {root} ") };
     if report.kind == "workspace" {
         writeln!(out, "\nNext:\n  scpm {c}run {}      compile and run it\n  scpm {c}test", report.module)?;
     } else {
