@@ -176,6 +176,55 @@ suite, an `error` log naming it, and a `crashed` result with the counts so far a
 The runner is plain Java with no dependency beyond `test-interface`, so it can share a flat
 classpath with Scala 2 or Scala 3 tests.
 
+## Methods: resolver sidecar
+
+`worker/resolver` (main class `scpm.resolver.Main`) is coursier behind this envelope (design
+§5.2.1). It starts sealed: scpm clears its environment (keeping `LANG`/`LC_*`, and on Windows
+what the OS needs) and passes `-Duser.home`, `-Dcoursier.config-dir` and `-Dscala-cli.config` for
+private, empty locations. Requests run concurrently, and every one of them gets a response.
+Errors carry `code`, `message` and `data`.
+
+### `initialize`
+
+Params: `protocolVersion` (1), `proxy` (`{http?, https?, noProxy[]}`, each server `{host, port}`;
+absent for a direct connection), `trust` (`{pemBundle}`: the system PEM bundle on Linux, `null`
+elsewhere, where the OS store is used), `userAgent`. Result: `protocolVersion`, `resolverVersion`,
+`coursierVersion`, `javaVersion`, `pid`. If the start-up check found a setting the sidecar must
+not inherit (any `coursier.*` property but `coursier.config-dir`, any `scala-cli.*` but
+`scala-cli.config`, a `*.proxyHost`, or `java.net.useSystemProxies`), the first request is
+answered `bad_environment` (`data.what`) and the process exits with status 2.
+
+### `resolve`
+
+Params: `repositories` (`[{id, url, groups?, auth?: {user, password, realm?}, challenges?: [{user, password, realm}]}]`; `challenges` are realm-scoped entries, each sent only after a challenge naming its realm, in declared
+order, mirrors applied), `cache`, `ttl` (seconds; absent: 24 h), `refresh`, `offline`, and
+`requests`: `[{label, systems[], jdk, natives[], roots[], boms[], forced[], artifactTypes[]}]`.
+A root is `{module: "org:name", version, classifier?, type?, exclusions: ["org:name"],
+transitive}`; a native mapping `{module, versions? (a Maven interval), natives: {<system>:
+<classifier>}}`, several per module allowed (the first that maps the system at the resolved
+version applies); `boms` and `forced` are `org:name:version`. A mapped native jar the
+repository answers 404 or 403 for is left out, not an error.
+
+Result: `{results: [...]}`, one per request in order: `{classpath: [entry]}`, merged over the
+request's systems (an entry not on every system lists its `systems`, sorted), or `{bySystem:
+{<system>: [entry]}}` when the per-system orders have a cycle, or `{error}`. An entry is `{group,
+artifact, version, classifier?, extension, url, file, repository}`.
+
+Error codes besides the envelope's: `not_found` (`module`, `version`, `tried: [{repository, url,
+status}]`), `no_artifact` (`root`), `unauthorized` (`repository`, `url`, `status`), `transport`
+(`repository`, `url`, `cause`), `checksum` (`url`, `expected`, `actual`), `offline_miss` (`url`).
+
+### `listVersions`
+
+Params: `repositories`, `cache`, `ttl`, `refresh`, `offline`, `module` (`org:name`). Only the
+repositories the module's group may come from are asked. Result: `versions` (ascending) and
+`repositories: [{id, versions}]`. A 404 counts as no versions; a 401, 403 or transport failure
+fails the request.
+
+### `shutdown`
+
+Lets requests still running finish and answer, then answers `{}` and exits. End of input exits at once.
+
 ## Events
 
 Every event has `t` (type), `requestId`, and `target`.

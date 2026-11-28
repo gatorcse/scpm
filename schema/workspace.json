@@ -186,6 +186,16 @@
             "type": "string"
           }
         },
+        "natives": {
+          "description": "System → classifier of this module's native jar (e.g. `linux-x86_64: linux-x86_64`),\nreplacing scpm's built-in mapping for it (and, in a preset or variant overlay, the whole\ninherited map); systems not listed get no native jar, and `{}`\nturns the mapping off. Needs the resolver sidecar.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "transitive": {
           "description": "Default `true`.",
           "type": [
@@ -233,6 +243,16 @@
               "type": "null"
             }
           ]
+        },
+        "nativeClassifiers": {
+          "description": "Native mappings for modules that arrive only transitively: each replaces scpm's built-in\nmapping for its module (`natives: {}` turns it off). Direct dependencies use `natives:`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/NativeClassifiers"
+          }
         },
         "systems": {
           "description": "The systems (OS and CPU architecture pairs, e.g. `linux-x86_64`, `macos-aarch64`) every\nclasspath is locked for; each machine uses its own. Unset: scpm's default set, which the\nlock's header then records. More than one system needs the resolver sidecar.",
@@ -489,6 +509,26 @@
         }
       },
       "additionalProperties": false
+    },
+    "NativeClassifiers": {
+      "description": "`{module: org:name, natives: {<system>: <classifier>}}`.",
+      "type": "object",
+      "properties": {
+        "module": {
+          "type": "string"
+        },
+        "natives": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "module",
+        "natives"
+      ]
     },
     "OneOrMany": {
       "anyOf": [

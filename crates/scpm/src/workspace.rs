@@ -172,6 +172,9 @@ pub struct Dependency {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     pub transitive: bool,
+    /// `natives:`: system → classifier, replacing the built-in mapping (design §5.4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub natives: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// A dependency on another module in the workspace (`util: workspace:*`).
@@ -496,6 +499,15 @@ fn validate_workspace(ctx: &Ctx, diags: &mut Diagnostics) {
                         .with_help(format!("known systems: {}", crate::system::known_names())),
                 ),
             );
+        }
+    }
+    for (i, n) in config.lock.native_classifiers.iter().flatten().enumerate() {
+        let at = format!("lock.nativeClassifiers[{i}]");
+        if n.module.split(':').count() != 2 || n.module.split(':').any(str::is_empty) {
+            diags.push(ctx.in_ws(Diagnostic::new(format!("expected `org:name`, got `{}`", n.module)).at_key(&at)));
+        }
+        if let Err(d) = check_natives(&n.natives) {
+            diags.push(ctx.in_ws(d.at_key(format!("{at}.natives"))));
         }
     }
     if let Some(jdk) = &config.lock.jdk
@@ -1485,16 +1497,48 @@ fn external_dependency(
     if let VersionSpec::Workspace { .. } = version {
         return Err(Diagnostic::new("`workspace:` is only for workspace modules (keys without `:`)"));
     }
-    let (exclude, classifier, kind, transitive) = match spec {
-        DepSpec::Version(_) => (Vec::new(), None, None, true),
-        DepSpec::Detailed(d) => (d.exclude.clone(), d.classifier.clone(), d.kind.clone(), d.transitive.unwrap_or(true)),
+    let (exclude, classifier, kind, transitive, natives) = match spec {
+        DepSpec::Version(_) => (Vec::new(), None, None, true, None),
+        DepSpec::Detailed(d) => {
+            (d.exclude.clone(), d.classifier.clone(), d.kind.clone(), d.transitive.unwrap_or(true), d.natives.clone())
+        }
     };
     for pattern in &exclude {
         if pattern.split(':').count() != 2 {
             return Err(Diagnostic::new(format!("invalid exclusion `{pattern}`; expected `org:name` (`*` allowed)")));
         }
     }
-    Ok(Dependency { scope, coord, spec: spec.version().0.clone(), version, exclude, classifier, kind, transitive })
+    if let Some(n) = &natives {
+        check_natives(n).map_err(|d| Diagnostic { message: format!("natives: {}", d.message), ..d })?;
+    }
+    Ok(Dependency {
+        scope,
+        coord,
+        spec: spec.version().0.clone(),
+        version,
+        exclude,
+        classifier,
+        kind,
+        transitive,
+        natives,
+    })
+}
+
+/// A native mapping (`natives:`, `lock.nativeClassifiers`): known systems, and classifiers that
+/// can be part of a file name (they become one in the cache and the lock key).
+fn check_natives(natives: &std::collections::BTreeMap<String, String>) -> Result<(), Diagnostic> {
+    for (system, classifier) in natives {
+        if crate::system::known(system).is_none() {
+            return Err(Diagnostic::new(format!("unknown system `{system}`"))
+                .with_help(format!("known systems: {}", crate::system::known_names())));
+        }
+        if classifier.trim().is_empty() || classifier.contains(['/', '\\', ':', '@']) || classifier.contains("..") {
+            return Err(Diagnostic::new(format!("invalid classifier `{classifier}` for {system}")).with_help(
+                "a classifier is a plain name such as `linux-x86_64`; leave a system out for no native jar",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A BOM entry (`org:name: <spec>`): its version resolves through catalogs like a dependency's.
@@ -1513,6 +1557,7 @@ fn bom_dependency(ctx: &Ctx, key: &str, spec: &Ver) -> Result<Dependency, Diagno
         classifier: None,
         kind: None,
         transitive: false,
+        natives: None,
     })
 }
 

@@ -70,8 +70,13 @@ jobs:
         working-directory: worker
         # sbt 2 leaves the jars as symlinks into its own cache, which the cache step would save
         # as dangling links: replace them with the files they point to.
+        # `resolver/stage` copies the resolver sidecar's closure into target/out/jvm, where the
+        # scpm binary of this checkout finds it (tests/resolver.rs, which fail in CI without it);
+        # `resolver/testFull` runs all of its own tests (sbt 2's `test` is `testQuick`), which
+        # need no network.
         run: |
-          sbt -batch package
+          sbt -batch "package; resolver/stage; resolver/testFull"
+          test -f target/out/jvm/resolver-stage/classpath.txt
           find target/out/jvm -type l -print0 | while IFS= read -r -d '' link; do
             cp --remove-destination "$(readlink -f "$link")" "$link"
           done

@@ -243,6 +243,16 @@
             "type": "string"
           }
         },
+        "natives": {
+          "description": "System → classifier of this module's native jar (e.g. `linux-x86_64: linux-x86_64`),\nreplacing scpm's built-in mapping for it (and, in a preset or variant overlay, the whole\ninherited map); systems not listed get no native jar, and `{}`\nturns the mapping off. Needs the resolver sidecar.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "transitive": {
           "description": "Default `true`.",
           "type": [

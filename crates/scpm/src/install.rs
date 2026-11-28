@@ -104,6 +104,9 @@ pub enum InstallError {
     /// The system set, the host system or a JDK's system doesn't allow the command (design §5.4).
     #[error("{0}")]
     Systems(String),
+    /// Starting or talking to the resolver sidecar failed (design §5.2.1).
+    #[error(transparent)]
+    Sidecar(#[from] crate::resolver::ResolverError),
     #[error("{0}")]
     Fetch(fetch::FetchFailure),
     /// The user config is invalid (design §5.9).
@@ -346,6 +349,9 @@ struct DependencyInput<'a> {
     classifier: Option<&'a str>,
     kind: Option<&'a str>,
     transitive: bool,
+    /// `natives:`, left out when absent so hashes are what they were before the key existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    natives: Option<&'a BTreeMap<String, String>>,
 }
 
 impl<'a> From<&'a Dependency> for DependencyInput<'a> {
@@ -359,6 +365,7 @@ impl<'a> From<&'a Dependency> for DependencyInput<'a> {
             classifier: d.classifier.as_deref(),
             kind: d.kind.as_deref(),
             transitive: d.transitive,
+            natives: d.natives.as_ref(),
         }
     }
 }
@@ -429,7 +436,7 @@ fn inputs_hash(ws: &Workspace, graph: &Graph, v: &Variant, repos: &[Repo], ctx: 
                 .collect()
         })
         .collect();
-    sha256_json(&serde_json::json!({
+    let mut inputs = serde_json::json!({
         "variant": variant_inputs(v),
         "upstream": upstream,
         "bomOwners": bom_owners,
@@ -439,7 +446,16 @@ fn inputs_hash(ws: &Workspace, graph: &Graph, v: &Variant, repos: &[Repo], ctx: 
         "minimumReleaseAge": ws.config.policy.minimum_release_age,
         // Rejected as unsupported for now (so always empty), but part of the contract.
         "minimumReleaseAgeExclude": ws.config.policy.minimum_release_age_exclude,
-    }))
+    });
+    // The whole workspace list, in every JVM variant's hash; absent, it adds nothing, so hashes
+    // stay what they were before the key existed. Built-in mappings are never hashed: the
+    // header's `nativeMappings` versions them (design §5.4).
+    if v.platform == Platform::Jvm
+        && let Some(list) = &ws.config.lock.native_classifiers
+    {
+        inputs["nativeClassifiers"] = serde_json::to_value(list).expect("serializes");
+    }
+    sha256_json(&inputs)
 }
 
 /// What every boot resolution depends on besides its own root (design §5.4, `bootInputs`).
@@ -455,6 +471,47 @@ struct Selector<'a> {
     previous: &'a BTreeMap<String, CatalogSelection>,
     catalogs: Mutex<BTreeMap<String, CatalogSelection>>,
     listed: Mutex<HashMap<String, Vec<String>>>,
+    sidecar: &'a LazySidecar<'a>,
+}
+
+/// The resolver sidecar, started at the first request that needs it and used for the rest of
+/// the command (design §5.2.1, "Lifecycle"); never for `cs`.
+pub(crate) struct LazySidecar<'a> {
+    resolver: Resolver,
+    machine: &'a crate::machine::Machine,
+    repos: &'a [Repo],
+    cell: std::cell::OnceCell<crate::resolver::Sidecar>,
+}
+
+impl<'a> LazySidecar<'a> {
+    fn new(resolver: Resolver, machine: &'a crate::machine::Machine, repos: &'a [Repo]) -> Self {
+        LazySidecar { resolver, machine, repos, cell: std::cell::OnceCell::new() }
+    }
+
+    fn get(&self) -> Result<Option<&crate::resolver::Sidecar>, InstallError> {
+        if self.resolver != Resolver::Sidecar {
+            return Ok(None);
+        }
+        if let Some(s) = self.cell.get() {
+            return Ok(Some(s));
+        }
+        // As for `cs`: a repository that needs an unusable environment proxy fails up front.
+        if let Some(p) = &self.machine.proxy {
+            for r in self.repos {
+                p.route(r.fetch_url()).map_err(|e| InstallError::Coursier(coursier::CoursierError::Config(e)))?;
+            }
+        }
+        let started = crate::resolver::Sidecar::start(self.machine)?;
+        let _ = self.cell.set(started);
+        Ok(self.cell.get())
+    }
+
+    /// Stops the sidecar if it was started.
+    fn finish(self) {
+        if let Some(sidecar) = self.cell.into_inner() {
+            sidecar.shutdown();
+        }
+    }
 }
 
 impl Selector<'_> {
@@ -496,8 +553,14 @@ impl Selector<'_> {
                         )));
                     }
                     // Contacting the repositories: an ignored setting of another tool may be why it fails.
-                    let v = coursier::list_versions(&dep.coord.org, &artifact, &allowed, self.proxy, self.cache)
-                        .map_err(|e| with_notice(e.into(), self.repos, true))?;
+                    let v = match self.sidecar.get()? {
+                        // The sidecar routes by `groups` itself, so it gets every repository.
+                        Some(sidecar) => sidecar
+                            .list_versions(&list_key, self.repos, self.cache)
+                            .map_err(|e| with_notice(e.into(), self.repos, true))?,
+                        None => coursier::list_versions(&dep.coord.org, &artifact, &allowed, self.proxy, self.cache)
+                            .map_err(|e| with_notice(e.into(), self.repos, true))?,
+                    };
                     self.listed.lock().expect("listed").insert(list_key.clone(), v.clone());
                     v
                 }
@@ -669,7 +732,93 @@ pub(crate) fn classpath_request(
     }
     req.boms = boms;
     req.forced = forced;
+    req.natives = native_specs(ws, graph, v, kind);
     Ok(req)
+}
+
+/// Mapped modules on the host system's locked classpaths whose native jar for the host isn't
+/// there, read from the lock alone: for each variant the sidecar locked against this table
+/// (`fullContext`, and the header's `nativeMappings` equal to the table's version), each main
+/// jar whose mapping (built-in, or the manifest's override) names a classifier for the host.
+fn host_native_warnings(
+    ws: &Workspace,
+    graph: &Graph,
+    lock: &Lockfile,
+    host: &str,
+    table: &crate::natives::Table,
+) -> Vec<String> {
+    if lock.native_mappings != Some(table.version) || !lock.systems.iter().any(|s| s == host) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (id, vlock) in lock.variants.iter().filter(|(_, l)| l.full_context) {
+        let Some(v) = ws.variant(id) else { continue };
+        for kind in ClasspathKind::ALL {
+            let specs = native_specs(ws, graph, v, kind);
+            let entries = kind.classpath(vlock).project(host);
+            let keys: BTreeSet<&str> = entries
+                .iter()
+                .filter_map(|e| match e {
+                    ClasspathEntry::Artifact(k) => Some(k.as_str()),
+                    ClasspathEntry::Module { .. } => None,
+                })
+                .collect();
+            for key in keys.iter().filter(|k| k.split(':').count() == 3 && !k.contains('@')) {
+                let mut parts = key.split(':');
+                let (Some(g), Some(a), Some(ver)) = (parts.next(), parts.next(), parts.next()) else { continue };
+                let module = format!("{g}:{a}");
+                let classifier = specs
+                    .iter()
+                    .filter(|s| s.module == module)
+                    .filter(|s| s.versions.as_deref().is_none_or(|i| interval_contains(i, ver)))
+                    .find_map(|s| s.natives.get(host));
+                if let Some(c) = classifier
+                    && !keys.contains(format!("{key}:{c}").as_str())
+                {
+                    let w = format!(
+                        "{key} has no native jar for {host} (`{c}`) in {}: the repository didn't serve it when \
+                         {id} was locked, so {id} runs without it here\n  help: once the repository (or the mirror \
+                         you reach it through) serves it, remove {id} from {} and run `{}=sidecar scpm install` \
+                         (`cs`, the default in M1, applies no native mappings)",
+                        crate::lockfile::LOCK_FILE,
+                        crate::lockfile::LOCK_FILE,
+                        crate::resolver::RESOLVER_ENV
+                    );
+                    if !out.contains(&w) {
+                        out.push(w);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The native mappings for one classpath of a JVM variant (design §5.4): its dependencies'
+/// `natives:` (the variant's own, then upstream ones), then `lock.nativeClassifiers`, each
+/// replacing the built-in mapping for its module.
+fn native_specs(ws: &Workspace, graph: &Graph, v: &Variant, kind: ClasspathKind) -> Vec<crate::natives::NativeSpec> {
+    if v.platform != Platform::Jvm {
+        return Vec::new();
+    }
+    let mut overrides: Vec<(String, BTreeMap<String, String>)> = Vec::new();
+    let mut add = |owner: &Variant, dep: &Dependency| {
+        if let Some(natives) = &dep.natives {
+            overrides.push((format!("{}:{}", dep.coord.org, artifact_name(owner, &dep.coord)), natives.clone()));
+        }
+    };
+    for dep in v.dependencies.iter().filter(|d| kind.own_scopes().contains(&d.scope)) {
+        add(v, dep);
+    }
+    for up in upstream_variants(graph, &v.id, kind).iter().filter_map(|id| ws.variant(id)) {
+        for dep in up.dependencies.iter().filter(|d| kind.upstream_scopes().contains(&d.scope)) {
+            add(up, dep);
+        }
+    }
+    for n in ws.config.lock.native_classifiers.iter().flatten() {
+        overrides.push((n.module.clone(), n.natives.clone()));
+    }
+    crate::natives::specs(&crate::natives::BUILT_IN, &overrides)
 }
 
 /// A boot closure (design §5.4): its lock name, root dependencies, and whether they are fetched transitively.
@@ -882,13 +1031,38 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     let ctx = lock_context(ws, &previous, opts.reset_systems);
     migrate_catalog_keys(ws, &mut previous.catalogs, &mut warnings);
 
+    let resolver = Resolver::from_env()?;
+    let table = &crate::natives::BUILT_IN;
     let hashes: BTreeMap<String, String> =
         ws.variants().map(|v| (v.id.clone(), inputs_hash(ws, graph, v, &repos, &ctx))).collect();
-    let stale: Vec<String> = hashes
+    let mut stale: Vec<String> = hashes
         .iter()
         .filter(|(id, hash)| previous.variants.get(*id).is_none_or(|l| &l.inputs_hash != *hash))
         .map(|(id, _)| id.clone())
         .collect();
+    // The sidecar re-locks what `cs` wrote (no `fullContext`), and, with a newer mapping table
+    // than the lock's, every variant holding a module whose mapping changed since (design §5.4).
+    let mut boot_unmarked = false;
+    if resolver.full_context() && !opts.frozen {
+        for (id, l) in &previous.variants {
+            let mapping_changed = previous.native_mappings.is_some_and(|n| {
+                n < table.version
+                    && l.classpaths()
+                        .iter()
+                        .any(|c| c.artifact_keys().any(|k| crate::natives::touched(table, n, table.version, k)))
+            });
+            if hashes.contains_key(id) && !stale.contains(id) && (!l.full_context || mapping_changed) {
+                stale.push(id.clone());
+            }
+        }
+        stale.sort();
+        boot_unmarked = !previous.boot.is_empty() && !previous.boot_full_context;
+    }
+    if opts.frozen
+        && let Some(n) = previous.native_mappings.filter(|n| *n != table.version)
+    {
+        notes.push(format!("the lock uses native mapping table {n}, this scpm has {}", table.version));
+    }
     // Compilers for every Scala version in use (Java-only variants drive Zinc with one too),
     // plus the JVM helpers.
     let scala_versions: BTreeSet<String> = ws.variants().map(|v| compiler_scala(ws, v)).collect();
@@ -901,8 +1075,9 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     };
     let boot_inputs = (!boot.is_empty()).then(|| boot_inputs_hash(&repos, &ctx));
     let boot_inputs_changed = previous.boot_inputs != boot_inputs;
+    // An unmarked boot section is re-resolved whole, whatever `bootInputs` says.
     let missing_boot: Vec<&BootRoot> =
-        boot.iter().filter(|b| boot_inputs_changed || !previous.boot.contains_key(&b.name)).collect();
+        boot.iter().filter(|b| boot_inputs_changed || boot_unmarked || !previous.boot.contains_key(&b.name)).collect();
     let removed: Vec<String> = previous.variants.keys().filter(|id| !hashes.contains_key(*id)).cloned().collect();
 
     if opts.frozen && (!stale.is_empty() || !missing_boot.is_empty() || !removed.is_empty()) {
@@ -915,16 +1090,29 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
         what.extend(removed.iter().map(|id| format!("{id} (removed)")));
         return Err(InstallError::Stale(what));
     }
-    let resolver = Resolver::Cs;
+    let relocks = !stale.is_empty() || !missing_boot.is_empty();
     // `cs` resolves for the machine it runs on and takes only the JDK, so it can lock one
     // system only (design §5.4). A lock that already has several systems still restores.
-    if (!stale.is_empty() || !missing_boot.is_empty()) && ctx.systems.len() > 1 {
+    if relocks && resolver == Resolver::Cs && ctx.systems.len() > 1 {
         return Err(InstallError::Systems(format!(
             "the lock's system set has {} systems ({}), and `cs` can resolve for one system only; resolving for \
-             several systems needs the resolver sidecar (design §5.2.1), which this scpm does not include yet\n  \
-             help: set `lock.systems` to the one system to resolve for",
+             several systems needs the resolver sidecar (design §5.2.1)\n  help: set {}=sidecar, or set \
+             `lock.systems` to the one system to resolve for",
             ctx.systems.len(),
-            ctx.systems.join(", ")
+            ctx.systems.join(", "),
+            crate::resolver::RESOLVER_ENV
+        )));
+    }
+    // Never downgrade the mapping table: an older scpm can't re-lock what a newer one mapped.
+    if relocks
+        && resolver.full_context()
+        && let Some(n) = previous.native_mappings.filter(|n| *n > table.version)
+    {
+        return Err(InstallError::Systems(format!(
+            "{} uses native mapping table {n}, and this scpm has {}; re-locking with it would drop newer \
+             mappings\n  help: upgrade scpm",
+            crate::lockfile::LOCK_FILE,
+            table.version
         )));
     }
     if opts.frozen {
@@ -952,6 +1140,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     lock.boot.retain(|name, _| boot.iter().any(|b| &b.name == name));
 
     let scratch = tempfile_dir()?;
+    let sidecar = LazySidecar::new(resolver, machine, &repos);
     let selector = Selector {
         repos: &repos,
         proxy: &machine.proxy,
@@ -959,6 +1148,7 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
         previous: &previous.catalogs,
         catalogs: Mutex::new(BTreeMap::new()),
         listed: Mutex::new(HashMap::new()),
+        sidecar: &sidecar,
     };
     // Ranges are never re-selected implicitly (design §5.5): seed every dependency whose spec is
     // unchanged with the version the previous lock selected, stale variants included. Only new
@@ -1039,10 +1229,37 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
 
     let all: Vec<&ResolveRequest> =
         requests.values().chain(plugin_requests.values()).chain(boot_requests.values()).collect();
-    let results = resolve_concurrently(&all, &labels, &ctx, &repos, &machine.proxy, &cache, scratch.path())
-        .map_err(|e| with_notice(e, &repos, true))?;
+    let results = if all.is_empty() {
+        Ok(HashMap::new())
+    } else if let Some(s) = sidecar.get()? {
+        resolve_with_sidecar(s, &all, &labels, &ctx, &repos, &cache)
+    } else {
+        resolve_concurrently(&all, &labels, &ctx, &repos, &machine.proxy, &cache, scratch.path())
+    }
+    .map_err(|e| with_notice(e, &repos, true))?;
 
     record_artifacts(&mut lock, all.iter().flat_map(|req| results[*req].artifacts()), &repos)?;
+    // Systems a mapped module got no native jar on (design §5.4): unmapped ones are a note, a
+    // built-in mapping's missing jar a warning, a user-written mapping's an error (before the
+    // lock is written).
+    if resolver.full_context() {
+        let mut errors: Vec<String> = Vec::new();
+        for req in requests.values() {
+            let found = native_notes(req, &results[req], &ctx.systems);
+            for (into, items) in
+                [(&mut notes, found.notes), (&mut warnings, found.warnings), (&mut errors, found.errors)]
+            {
+                for item in items {
+                    if !into.contains(&item) {
+                        into.push(item);
+                    }
+                }
+            }
+        }
+        if !errors.is_empty() {
+            return Err(InstallError::Resolve(errors.join("\n")));
+        }
+    }
     for (name, req) in &boot_requests {
         lock.boot.insert(name.clone(), results[req].classpath(Vec::new()));
     }
@@ -1092,10 +1309,31 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     let host = crate::system::host();
     notes.extend(host.note.clone());
     let keys = restore_keys(&lock, &host.system, &opts.restore, &mut notes)?;
+    // Every install, frozen included: a mapped module on the host's classpaths without its
+    // native jar (the repository had none when it was locked) is said each time, not only on
+    // the run that re-locked it (design §5.4, "Mapped modules contribute a jar").
+    for w in host_native_warnings(ws, graph, &lock, &host.system, table) {
+        if !warnings.contains(&w) {
+            warnings.push(w);
+        }
+    }
 
+    // Whenever a sidecar install writes the lock at all, every variant was re-locked against
+    // this scpm's mapping table (affected ones in this run), so the header becomes its version;
+    // a newer header (only possible when nothing re-locked) stays (design §5.4). A re-lock
+    // always raises it, even one whose result equals the lock: otherwise it would repeat.
+    if resolver.full_context()
+        && !opts.frozen
+        && previous.native_mappings.is_none_or(|n| n <= table.version)
+        && (relocks || std::fs::read_to_string(ws.root.join(crate::lockfile::LOCK_FILE)).ok() != Some(lock.to_yaml()))
+    {
+        lock.native_mappings = Some(table.version);
+    }
     let lockfile_written = if opts.frozen { false } else { lock.write(&ws.root)? };
+    sidecar.finish();
     // `cs` applies only the JDK part of the context (design §5.4, "Phase 1 limit").
-    let resolved_on = (!stale.is_empty() || !missing_boot.is_empty()).then(HostPlatform::current);
+    let resolved_on =
+        (resolver == Resolver::Cs && (!stale.is_empty() || !missing_boot.is_empty())).then(HostPlatform::current);
     if let Some(host) = &resolved_on
         && let [declared] = ctx.systems.as_slice()
         && crate::system::from_os_arch(&host.os, &host.arch).as_deref() != Some(declared.as_str())
@@ -1106,14 +1344,15 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
         ));
     }
 
-    // Re-locking ran `cs`.
-    let ran_cs = !stale.is_empty() || !missing_boot.is_empty();
+    // Re-locking contacted the repositories; with `cs`, which inherits more than scpm reads.
+    let resolved_any = !stale.is_empty() || !missing_boot.is_empty();
+    let ran_cs = resolved_any && resolver == Resolver::Cs;
     let fetch_started = Instant::now();
     let items = fetch_items_of(&lock, &keys, &repos, &CoursierCredentials::load(), &cache, &mut warnings)?;
     let fetch = fetch::fetch_all(items, FetchOptions { verify: opts.verify, proxy: machine.proxy.clone() })
         .map_err(|f| with_notice(InstallError::Fetch(f), &repos, ran_cs))?;
-    let contacted = ran_cs || fetch.downloaded > 0;
-    let notices =
+    let contacted = resolved_any || fetch.downloaded > 0;
+    let notices: Vec<String> =
         if contacted { crate::foreign::take_notice(&repos, ran_cs).into_iter().collect() } else { Vec::new() };
     warnings.extend(fetch.warnings.iter().cloned());
     if fetch.repaired > 0 {
@@ -1187,15 +1426,165 @@ pub(crate) fn with_notice(e: InstallError, repos: &[Repo], ran_cs: bool) -> Inst
 pub enum Resolver {
     /// The coursier CLI: one system, and only the JDK part of the context.
     Cs,
+    /// The resolver sidecar (`SCPM_RESOLVER=sidecar`): every system, OS, arch and JDK.
+    Sidecar,
 }
 
 impl Resolver {
+    /// `SCPM_RESOLVER`: `cs` (the default in M1) or `sidecar`.
+    pub fn from_env() -> Result<Resolver, InstallError> {
+        match std::env::var(crate::resolver::RESOLVER_ENV).as_deref() {
+            Err(_) | Ok("") | Ok("cs") => Ok(Resolver::Cs),
+            Ok("sidecar") => Ok(Resolver::Sidecar),
+            Ok(other) => Err(InstallError::Unsupported(format!(
+                "{}={other}: expected `cs` or `sidecar`",
+                crate::resolver::RESOLVER_ENV
+            ))),
+        }
+    }
+
     /// Whether what it resolves carries `fullContext` (the OS, arch and JDK of every system).
     pub fn full_context(self) -> bool {
         match self {
             Resolver::Cs => false,
+            Resolver::Sidecar => true,
         }
     }
+}
+
+/// What a re-lock found about mapped modules' native jars (design §5.4).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NativeFindings {
+    /// No mapping row covers a system at the resolved version (a library that doesn't support
+    /// it, or a version older than its native jars): expected, so a note.
+    notes: Vec<String>,
+    /// A built-in row maps the system, but the repository answered 404 or 403 for the jar (the
+    /// sidecar leaves it out, as coursier skips an optional artifact on either). The table
+    /// follows Maven Central, so this is a proxy's negative cache, a mirror without the
+    /// classifiers, or the like: a warning.
+    warnings: Vec<String>,
+    /// The same for a mapping the user wrote (`natives:`, `lock.nativeClassifiers`), most
+    /// likely a typo in a classifier: an error.
+    errors: Vec<String>,
+}
+
+/// [`NativeFindings`] for one request's resolution. A module whose matching rows map nothing
+/// (`natives: {}`, which turns mapping off) is never mentioned.
+fn native_notes(req: &ResolveRequest, res: &Resolution, systems: &[String]) -> NativeFindings {
+    let mut found = NativeFindings::default();
+    if req.natives.is_empty() {
+        return found;
+    }
+    // Keys on each system.
+    let on: BTreeMap<&str, BTreeSet<&str>> = systems
+        .iter()
+        .map(|s| {
+            let keys: BTreeSet<&str> = match res {
+                Resolution::Merged(list) => list
+                    .iter()
+                    .filter(|(_, sys)| sys.as_ref().is_none_or(|l| l.contains(s)))
+                    .map(|(a, _)| a.key.as_str())
+                    .collect(),
+                Resolution::BySystem(m) => m.get(s).into_iter().flatten().map(|a| a.key.as_str()).collect(),
+            };
+            (s.as_str(), keys)
+        })
+        .collect();
+    let mains: BTreeSet<&str> =
+        on.values().flatten().copied().filter(|k| k.split(':').count() == 3 && !k.contains('@')).collect();
+    for key in mains {
+        let mut parts = key.split(':');
+        let (Some(g), Some(a), Some(v)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        let module = format!("{g}:{a}");
+        let rows: Vec<&crate::natives::NativeSpec> = req.natives.iter().filter(|n| n.module == module).collect();
+        if rows.iter().all(|r| r.natives.is_empty()) {
+            continue;
+        }
+        let mut unmapped = Vec::new();
+        let (mut absent_built_in, mut absent_written) = (Vec::new(), Vec::new());
+        for s in systems.iter().filter(|s| on[s.as_str()].contains(key)) {
+            let mapped = rows
+                .iter()
+                .filter(|r| r.versions.as_deref().is_none_or(|i| interval_contains(i, v)))
+                .find_map(|r| r.natives.get(s).map(|c| (c, r.written)));
+            match mapped {
+                None => unmapped.push(s.as_str()),
+                Some((c, written)) if !on[s.as_str()].contains(format!("{key}:{c}").as_str()) => {
+                    if written { &mut absent_written } else { &mut absent_built_in }.push(format!("{s} (`{c}`)"))
+                }
+                Some(_) => {}
+            }
+        }
+        if !unmapped.is_empty() {
+            found.notes.push(format!(
+                "{key} gets no native jar on {}: no native mapping covers {} at this version",
+                unmapped.join(", "),
+                if unmapped.len() == 1 { "that system" } else { "those systems" }
+            ));
+        }
+        if !absent_built_in.is_empty() {
+            found.warnings.push(format!(
+                "{key} gets no native jar on {}: scpm's mapping names that classifier, but the repository answered \
+                 404 or 403 for it (a proxy's negative cache, or a mirror without the classifier jars?)",
+                absent_built_in.join(", ")
+            ));
+        }
+        if !absent_written.is_empty() {
+            found.errors.push(format!(
+                "{key}: the repository has no native jar for {} (it answered 404 or 403)\n  help: check the \
+                 classifier in `natives:` or `lock.nativeClassifiers`; leave a system out for no native jar",
+                absent_written.join(", ")
+            ));
+        }
+    }
+    found
+}
+
+/// Whether a Maven interval (`[a,b)`, `[a,)`, …) contains `version`.
+fn interval_contains(interval: &str, version: &str) -> bool {
+    use crate::semver::MavenVersion;
+    let t = interval.trim();
+    let (Some(open), Some(close)) = (t.chars().next(), t.chars().last()) else { return false };
+    let Some((lo, hi)) = t.get(1..t.len() - 1).and_then(|inner| inner.split_once(',')) else { return false };
+    let v = MavenVersion::parse(version);
+    let lo_ok = lo.trim().is_empty() || {
+        let b = MavenVersion::parse(lo.trim());
+        if open == '[' { v >= b } else { v > b }
+    };
+    let hi_ok = hi.trim().is_empty() || {
+        let b = MavenVersion::parse(hi.trim());
+        if close == ']' { v <= b } else { v < b }
+    };
+    lo_ok && hi_ok
+}
+
+/// Resolves every request in one sidecar call (it runs them concurrently, each for every
+/// system of the lock). `labels` names what each request is for, in errors.
+fn resolve_with_sidecar<'a>(
+    sidecar: &crate::resolver::Sidecar,
+    requests: &[&'a ResolveRequest],
+    labels: &[(ResolveRequest, String)],
+    ctx: &LockContext,
+    repos: &[Repo],
+    cache: &Path,
+) -> Result<HashMap<&'a ResolveRequest, Resolution>, InstallError> {
+    let mut distinct: Vec<&ResolveRequest> = Vec::new();
+    for r in requests {
+        if !distinct.contains(r) {
+            distinct.push(r);
+        }
+    }
+    let results = sidecar.resolve(&distinct, &ctx.systems, &ctx.jdk, repos, cache)?;
+    let mut out = HashMap::new();
+    for (req, result) in distinct.into_iter().zip(results) {
+        let resolution = result.map_err(|msg| {
+            let what: Vec<&str> = labels.iter().filter(|(r, _)| r == req).map(|(_, l)| l.as_str()).collect();
+            let what = if what.is_empty() { "a request".to_string() } else { what.join(", ") };
+            InstallError::Resolve(format!("resolving {what} failed:\n{msg}"))
+        })?;
+        out.insert(req, resolution);
+    }
+    Ok(out)
 }
 
 /// The note a frozen run gives about variants (and a boot section) locked without the full
@@ -1748,6 +2137,83 @@ mod tests {
                 jdk: "21".into()
             }
         );
+    }
+
+    #[test]
+    fn native_classifiers_must_be_plain_names() {
+        for bad in ["''", "'../x'", "'a/b'", "'a\\b'"] {
+            let (dir, _, _) = workspace(&[("a", "{}\n")]);
+            std::fs::write(
+                dir.path().join("modules/a/scpm.yaml"),
+                format!("dependencies:\n  g:x: {{version: '1', natives: {{linux-x86_64: {bad}}}}}\n"),
+            )
+            .unwrap();
+            let err = crate::workspace::load(dir.path()).unwrap_err().to_string();
+            assert!(err.contains("natives: invalid classifier"), "{bad}: {err}");
+            std::fs::write(dir.path().join("modules/a/scpm.yaml"), "{}\n").unwrap();
+            std::fs::write(
+                dir.path().join("scpm-workspace.yaml"),
+                format!(
+                    "modules: ['modules/*']\ntoolchain:\n  scala: 3.9.0\nlock:\n  nativeClassifiers:\n    - {{module: 'g:x', natives: {{linux-x86_64: {bad}}}}}\n"
+                ),
+            )
+            .unwrap();
+            let err = crate::workspace::load(dir.path()).unwrap_err().to_string();
+            assert!(err.contains("lock.nativeClassifiers[0].natives") && err.contains("invalid classifier"), "{err}");
+        }
+    }
+
+    /// Systems a mapped module gets no native jar on are noted, whether no row maps them at the
+    /// version or the repository lacked the mapped jar.
+    #[test]
+    fn missing_native_jars_are_noted() {
+        let art = |k: &str| ResolvedArtifact { key: k.into(), file: PathBuf::from(k), url: String::new() };
+        let systems: Vec<String> = ["linux-aarch64", "linux-x86_64", "macos-aarch64"].map(String::from).to_vec();
+        let epoll = "io.netty:netty-transport-native-epoll";
+        let req =
+            ResolveRequest { natives: crate::natives::specs(&crate::natives::BUILT_IN, &[]), ..Default::default() };
+        // 4.1.30: no aarch64 jar exists, and macOS has no epoll at all.
+        let old = Resolution::Merged(vec![
+            (art(&format!("{epoll}:4.1.30.Final")), None),
+            (art(&format!("{epoll}:4.1.30.Final:linux-x86_64")), Some(vec!["linux-x86_64".into()])),
+        ]);
+        let found = native_notes(&req, &old, &systems);
+        assert_eq!(
+            found.notes,
+            [format!(
+                "{epoll}:4.1.30.Final gets no native jar on linux-aarch64, macos-aarch64: no native mapping covers those systems at this version"
+            )]
+        );
+        assert!(found.warnings.is_empty() && found.errors.is_empty());
+        // 4.1.115 maps linux-aarch_64, which this repository didn't serve: a built-in row's warning.
+        let new = Resolution::Merged(vec![
+            (art(&format!("{epoll}:4.1.115.Final")), Some(vec!["linux-aarch64".into(), "linux-x86_64".into()])),
+            (art(&format!("{epoll}:4.1.115.Final:linux-x86_64")), Some(vec!["linux-x86_64".into()])),
+        ]);
+        let found = native_notes(&req, &new, &systems[..2]);
+        assert!(found.notes.is_empty() && found.errors.is_empty(), "{found:?}");
+        assert_eq!(found.warnings.len(), 1);
+        assert!(
+            found.warnings[0]
+                .starts_with(&format!("{epoll}:4.1.115.Final gets no native jar on linux-aarch64 (`linux-aarch_64`)"))
+        );
+        assert!(found.warnings[0].contains("404 or 403"), "{found:?}");
+        // The same for a mapping the user wrote: an error.
+        let mine = BTreeMap::from([("linux-aarch64".to_string(), "linux-aarch_64".to_string())]);
+        let written = ResolveRequest {
+            natives: crate::natives::specs(&crate::natives::BUILT_IN, &[(epoll.into(), mine)]),
+            ..Default::default()
+        };
+        let found = native_notes(&written, &new, &systems[..2]);
+        assert_eq!(found.errors.len(), 1, "{found:?}");
+        assert!(found.errors[0].contains("natives:"), "{found:?}");
+        // `natives: {}` turns mapping off: nothing to say.
+        let off = ResolveRequest {
+            natives: crate::natives::specs(&crate::natives::BUILT_IN, &[(epoll.into(), BTreeMap::new())]),
+            ..Default::default()
+        };
+        assert_eq!(native_notes(&off, &old, &systems), NativeFindings::default());
+        assert_eq!(native_notes(&ResolveRequest::default(), &new, &systems), NativeFindings::default());
     }
 
     #[test]

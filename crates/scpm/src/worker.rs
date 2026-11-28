@@ -166,6 +166,34 @@ fn detect_java() -> Result<Java, WorkerError> {
     Ok(Java { path, source, version, major })
 }
 
+/// The `java` binary of the JDK at `home` itself (`<home>/bin/java`), never a shim or wrapper
+/// on PATH, which may behave differently in another environment (a sealed one, say). Its version
+/// comes from `<home>/release`, else from running that binary; JDK [`MIN_JAVA`] or newer.
+/// `source` says where `home` came from, for messages.
+pub fn java_in_home(home: &Path, source: &str) -> Result<Java, WorkerError> {
+    let exe = if cfg!(windows) { "java.exe" } else { "java" };
+    let path = home.join("bin").join(exe);
+    if !is_executable(&path) {
+        return Err(WorkerError::Setup(format!(
+            "{} (from {source}) is not a JDK: it has no executable bin/{exe}\n  help: point SCPM_JAVA_HOME at a JDK {MIN_JAVA}+",
+            home.display()
+        )));
+    }
+    let version = match std::fs::read_to_string(home.join("release")).ok().as_deref().and_then(parse_release) {
+        Some(v) => v,
+        None => java_version(&path, source)?,
+    };
+    let major = major_version(&version);
+    if major < MIN_JAVA {
+        return Err(WorkerError::Setup(format!(
+            "{} (from {source}) is Java {}; scpm needs JDK {MIN_JAVA} or newer (set SCPM_JAVA_HOME)",
+            path.display(),
+            if version.is_empty() { "of unknown version".to_string() } else { version }
+        )));
+    }
+    Ok(Java { path, source: source.to_string(), version, major })
+}
+
 /// The version `java -version` reports for `java`, read from its JDK's `release` file when it
 /// has a usable one (no JVM start); otherwise by running `java -version`.
 fn java_version(java: &Path, source: &str) -> Result<String, WorkerError> {
@@ -395,7 +423,7 @@ pub struct Spawn<'a> {
     pub classpath: &'a [PathBuf],
     pub main: &'a str,
     pub jvm_options: &'a [String],
-    pub env: Vec<(String, String)>,
+    pub env: Vec<(OsString, OsString)>,
     pub cwd: Option<&'a Path>,
     pub log_file: Option<&'a Path>,
     /// Send `initialize` and check the protocol version (the compile worker does; the
@@ -403,6 +431,11 @@ pub struct Spawn<'a> {
     pub initialize: bool,
     /// Start in a new process group so `kill` also stops processes the JVM started.
     pub own_process_group: bool,
+    /// Start from an empty environment: the child gets only `env` (the resolver sidecar is
+    /// sealed this way, design §5.2.1).
+    pub clear_env: bool,
+    /// The JDK to run instead of the one [`java`] detects (see [`java_in_home`]).
+    pub java: Option<Java>,
 }
 
 /// Requests waiting for a reply; `None` once the worker's stdout has closed.
@@ -448,12 +481,18 @@ fn push_tail(tail: &Mutex<VecDeque<String>>, line: String) {
 impl Worker {
     /// Starts `java <flags> <options> -cp <classpath> <main>`. Events go to `on_event`.
     pub fn spawn(spec: Spawn, on_event: impl Fn(Value) + Send + 'static) -> Result<Worker, WorkerError> {
-        let java = java()?;
+        let java = match spec.java.clone() {
+            Some(java) => java,
+            None => java()?,
+        };
         let sep = if cfg!(windows) { ";" } else { ":" };
         // Relative entries (e.g. a relative `SCPM_TEST_RUNNER_JAR`) must name files relative to
         // where scpm runs, not to the child's `cwd`.
         let cp = spec.classpath.iter().map(|p| absolute(p).display().to_string()).collect::<Vec<_>>().join(sep);
         let mut cmd = Command::new(&java.path);
+        if spec.clear_env {
+            cmd.env_clear();
+        }
         cmd.args(helper_jvm_flags(&java)).args(spec.jvm_options).arg("-cp").arg(cp).arg(spec.main).envs(spec.env);
         if let Some(dir) = spec.cwd {
             cmd.current_dir(dir);

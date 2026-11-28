@@ -237,11 +237,13 @@ fn fork_runner(
         classpath: &classpath,
         main: "scpm.testrunner.Main",
         jvm_options: &v.jvm_options,
-        env: v.env.iter().map(|(k, val)| (k.clone(), val.clone())).collect(),
+        env: v.env.iter().map(|(k, val)| (k.into(), val.into())).collect(),
         cwd: Some(&module_dir),
         log_file: None,
         initialize: false,
         own_process_group: true,
+        clear_env: false,
+        java: None,
     };
     let on_event = {
         let reporter = reporter.clone();
@@ -469,11 +471,13 @@ pub fn discover_tests(tc: &Toolchain, v: &Variant) -> Result<Vec<(String, Vec<St
         classpath: &classpath,
         main: "scpm.testrunner.Main",
         jvm_options: &v.jvm_options,
-        env: v.env.iter().map(|(k, val)| (k.clone(), val.clone())).collect(),
+        env: v.env.iter().map(|(k, val)| (k.into(), val.into())).collect(),
         cwd: Some(&module_dir),
         log_file: None,
         initialize: false,
         own_process_group: true,
+        clear_env: false,
+        java: None,
     };
     let runner = Worker::spawn(spec, |_| {})?;
     let params = json!({"target": v.id, "testClassesDirs": [test_classes_dir(&tc.ws.root, &v.id)]});

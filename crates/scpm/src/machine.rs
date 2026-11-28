@@ -33,6 +33,11 @@ pub struct UserConfigFile {
     /// The proxy for every download. Set, it replaces `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyEntry>,
+    /// A base URL to download the resolver sidecar's own jars from instead of the scpm GitHub
+    /// release; each jar's file name is appended. Every jar stays pinned by the sha256 built into
+    /// scpm, and no credentials are sent, so it must allow anonymous access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver_mirror: Option<String>,
 }
 
 /// `{url, token}` (bearer) or `{url, user, password}` (basic auth). Each value is `env:VAR`,
@@ -131,6 +136,8 @@ pub struct Machine {
     pub proxy: ProxyChoice,
     /// Problems worth a warning (e.g. a user config with secrets that others can read).
     pub warnings: Vec<String>,
+    /// `resolverMirror`, ending in `/`.
+    pub resolver_mirror: Option<String>,
 }
 
 impl Machine {
@@ -143,6 +150,7 @@ impl Machine {
             mirrors: Vec::new(),
             proxy: None,
             warnings: Vec::new(),
+            resolver_mirror: None,
         }
     }
 
@@ -256,6 +264,22 @@ impl Machine {
             },
             None => proxy_from_env(&|var| std::env::var(var).ok()),
         };
+        // The same checks as every other URL here (no credentials or other `@`, never echoed);
+        // no credentials are sent to it, so a user in the URL would be a mistake either way.
+        let resolver_mirror = match &config.resolver_mirror {
+            Some(url) => match check_url(url) {
+                Err(m) => {
+                    err("resolverMirror".to_string(), m);
+                    None
+                }
+                Ok(_) if url.contains(['?', '#']) => {
+                    err("resolverMirror".to_string(), "a base URL can't have a query or fragment (`?`, `#`)".into());
+                    None
+                }
+                Ok(_) => Some(if url.ends_with('/') { url.clone() } else { format!("{url}/") }),
+            },
+            None => None,
+        };
         diags.into_result(Machine {
             path: Some(file.to_path_buf()),
             exists: true,
@@ -263,6 +287,7 @@ impl Machine {
             mirrors,
             proxy,
             warnings: Vec::new(),
+            resolver_mirror,
         })
     }
 
@@ -796,6 +821,17 @@ mod tests {
         let path = dir.path().join("config.yaml");
         std::fs::write(&path, yaml).unwrap();
         Machine::from_file(&path)
+    }
+
+    #[test]
+    fn resolver_mirrors_are_checked_like_other_urls() {
+        let m = machine("resolverMirror: https://artifacts.example/scpm\n").unwrap();
+        assert_eq!(m.resolver_mirror.as_deref(), Some("https://artifacts.example/scpm/"));
+        for bad in ["https://bob:s3cret@artifacts.example/", "ftp://artifacts.example/", "https://a.example/?x=1"] {
+            let err = machine(&format!("resolverMirror: '{bad}'\n")).err().unwrap().to_string();
+            assert!(err.contains("resolverMirror"), "{err}");
+            assert!(!err.contains("s3cret"), "never echoed: {err}");
+        }
     }
 
     #[test]
