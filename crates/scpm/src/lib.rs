@@ -18,6 +18,7 @@ pub mod fetch;
 pub mod filter;
 pub mod foreign;
 pub mod graph;
+pub mod ide;
 pub mod install;
 pub mod lockfile;
 pub mod machine;

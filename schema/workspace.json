@@ -37,6 +37,17 @@
       },
       "default": {}
     },
+    "ide": {
+      "description": "IDE project files that a non-frozen `scpm install` keeps up to date (design §10).",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WorkspaceIde"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "lock": {
       "$ref": "#/$defs/LockSettings",
       "default": {}
@@ -278,6 +289,17 @@
             "type": "string"
           }
         },
+        "ide": {
+          "description": "IDE settings (not allowed in `variants` overrides).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModuleIde"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "javacOptions": {
           "type": "array",
           "items": {
@@ -438,6 +460,20 @@
             {
               "type": "null"
             }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModuleIde": {
+      "description": "`ide` in a module file or a preset.",
+      "type": "object",
+      "properties": {
+        "primary": {
+          "description": "The variant `scpm idea` turns into this module's IntelliJ module, as a variant selector\n(`2.13`, `jvm-3`, …). IntelliJ modules can't share a content root, so a cross-built\nmodule gets one IntelliJ module. Default: the first variant (the first Scala version\nlisted).",
+          "type": [
+            "string",
+            "null"
           ]
         }
       },
@@ -739,6 +775,27 @@
         "maxBump": {
           "type": [
             "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "WorkspaceIde": {
+      "description": "`ide` in the workspace file: which IDE files a non-frozen `scpm install` regenerates.",
+      "type": "object",
+      "properties": {
+        "idea": {
+          "description": "Regenerate the IntelliJ project files (`scpm idea`) after every non-frozen install.\nWithout it, they are regenerated only when scpm generated them before.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "metals": {
+          "description": "Regenerate `.metals/mbt.json` (Metals v2) after every non-frozen install. Without it,\nthe file is regenerated only when it already exists.",
+          "type": [
+            "boolean",
             "null"
           ]
         }

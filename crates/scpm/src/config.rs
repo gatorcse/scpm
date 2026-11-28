@@ -90,6 +90,35 @@ pub struct WorkspaceFile {
     pub versioning: Option<Versioning>,
     #[serde(default)]
     pub lock: LockSettings,
+    /// IDE project files that a non-frozen `scpm install` keeps up to date (design §10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ide: Option<WorkspaceIde>,
+}
+
+/// `ide` in the workspace file: which IDE files a non-frozen `scpm install` regenerates.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceIde {
+    /// Regenerate `.metals/mbt.json` (Metals v2) after every non-frozen install. Without it,
+    /// the file is regenerated only when it already exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metals: Option<bool>,
+    /// Regenerate the IntelliJ project files (`scpm idea`) after every non-frozen install.
+    /// Without it, they are regenerated only when scpm generated them before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idea: Option<bool>,
+}
+
+/// `ide` in a module file or a preset.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModuleIde {
+    /// The variant `scpm idea` turns into this module's IntelliJ module, as a variant selector
+    /// (`2.13`, `jvm-3`, …). IntelliJ modules can't share a content root, so a cross-built
+    /// module gets one IntelliJ module. Default: the first variant (the first Scala version
+    /// listed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -355,6 +384,9 @@ pub struct ModuleFile {
     pub variants: IndexMap<String, ModuleFile>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub tasks: IndexMap<String, TaskDef>,
+    /// IDE settings (not allowed in `variants` overrides).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ide: Option<ModuleIde>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

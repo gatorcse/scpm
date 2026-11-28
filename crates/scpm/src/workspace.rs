@@ -45,6 +45,15 @@ pub struct Module {
     /// Directory relative to the workspace root (`.` for the root module), `/`-separated.
     pub dir: String,
     pub variants: Vec<Variant>,
+    /// The variant `scpm idea` turns into an IntelliJ module (`ide.primary`, else the first).
+    pub ide_primary: String,
+}
+
+impl Module {
+    /// The variant IDEs that allow one variant per module show (`ide.primary`).
+    pub fn primary_variant(&self) -> &Variant {
+        self.variants.iter().find(|v| v.id == self.ide_primary).unwrap_or(&self.variants[0])
+    }
 }
 
 /// One buildable unit: a module on one platform with one Scala version.
@@ -579,6 +588,7 @@ fn module_checks(m: &ModuleFile, prefix: &str, kind: Kind, depth: Option<usize>)
             ("platforms", !m.platforms.is_empty()),
             ("scala", m.scala.is_some()),
             ("variants", !m.variants.is_empty()),
+            ("ide", m.ide.is_some()),
         ];
         for (key, set) in forbidden {
             if set {
@@ -1093,9 +1103,32 @@ fn expand_module(ctx: &Ctx, rel_dir: &Path) -> Result<Module, Diagnostics> {
                 .with_help(format!("this module's variants: {}", all_ids.join(", "))),
         );
     }
+    let mut ide_primary = variants.first().map(|v| v.id.clone()).unwrap_or_default();
+    if let Some(selector) = base.ide.as_ref().and_then(|ide| ide.primary.as_deref()) {
+        match VariantSelector::parse(selector) {
+            Err(e) => {
+                let d = Diagnostic::new(format!("invalid variant selector `{selector}`: {e}"))
+                    .in_file(&file)
+                    .at_key("ide.primary");
+                diags.push(match e.help() {
+                    Some(help) => d.with_help(help),
+                    None => d,
+                });
+            }
+            Ok(sel) => match variants.iter().find(|v| sel.matches(v.platform, v.scala.as_ref())) {
+                Some(v) => ide_primary = v.id.clone(),
+                None => diags.push(
+                    Diagnostic::new(format!("`ide.primary` selector `{selector}` matches no variant"))
+                        .in_file(&file)
+                        .at_key("ide.primary")
+                        .with_help(format!("this module's variants: {}", all_ids.join(", "))),
+                ),
+            },
+        }
+    }
     let dir = if rel_dir.as_os_str().is_empty() { ".".to_string() } else { slash_path(rel_dir) };
     diags.dedup();
-    diags.into_result(Module { name, dir, variants })
+    diags.into_result(Module { name, dir, variants, ide_primary })
 }
 
 fn from_value<T: DeserializeOwned>(value: &Value, file: &Path) -> Result<T, Diagnostics> {

@@ -51,6 +51,17 @@
         "type": "string"
       }
     },
+    "ide": {
+      "description": "IDE settings (not allowed in `variants` overrides).",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ModuleIde"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "javacOptions": {
       "type": "array",
       "items": {
@@ -265,6 +276,20 @@
           "$ref": "#/$defs/DepDetails"
         }
       ]
+    },
+    "ModuleIde": {
+      "description": "`ide` in a module file or a preset.",
+      "type": "object",
+      "properties": {
+        "primary": {
+          "description": "The variant `scpm idea` turns into this module's IntelliJ module, as a variant selector\n(`2.13`, `jvm-3`, …). IntelliJ modules can't share a content root, so a cross-built\nmodule gets one IntelliJ module. Default: the first variant (the first Scala version\nlisted).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "OneOrMany": {
       "anyOf": [

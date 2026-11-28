@@ -44,6 +44,11 @@ Milestones land as a stack of PRs; see [docs/roadmap.md](docs/roadmap.md).
   and `--no-daemon` or `SCPM_NO_DAEMON=1` to opt out. If it can't start or doesn't answer,
   commands fall back to a worker of their own. It is always off in CI, and the MCP server
   uses it too (retrying a minute after a failure).
+- **M8:** IDE support, part 1.
+  - `scpm ide metals [--output FILE] [--no-sources | --refresh-sources]` writes `.metals/mbt.json` for Metals v2.
+  - `scpm idea [--force]` (or `scpm ide idea`) writes native IntelliJ project files into `.idea/`: one module per scpm module (`ide: {primary: <selector>}` picks the variant of a cross-built module), libraries, Scala SDKs and the project JDK. IntelliJ compiles into `.scpm/idea-out/`. Existing IntelliJ files scpm didn't generate are left alone unless you pass `--force`.
+  - Classpaths come from the lock. Sources jars are fetched by the `scpm ide …` commands with `cs` and are never locked.
+  - A non-frozen `scpm install`, and the install step before `compile`, `test` and `run`, refresh the IDE files scpm still owns, or that are enabled with `ide: {metals: true, idea: true}`. Enabled files are still subject to the ownership checks: an `mbt.json` written by a Metals importer script and IntelliJ files scpm didn't generate are left alone. Refreshes use only cached sources jars and write only when the content changed.
 
 ## Development
 

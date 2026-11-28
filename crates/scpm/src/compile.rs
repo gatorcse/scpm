@@ -117,6 +117,44 @@ impl<'a> Toolchain<'a> {
     }
 }
 
+/// The compiler options scpm passes for a variant (shared with the IDE generators).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompilerOptions {
+    /// The variant's `scalacOptions`, its release target and `-Xplugin:<jar>` per plugin.
+    pub scalac: Vec<String>,
+    pub javac: Vec<String>,
+    /// The Java release target: `release`, else the project JDK's major version (design §6.3).
+    pub release: Option<String>,
+    /// Compiler plugin jars (also in `scalac` as `-Xplugin:`).
+    pub plugins: Vec<PathBuf>,
+}
+
+/// The scalac and javac options a variant compiles with: its own, the release target, and its
+/// locked compiler plugins.
+pub fn compiler_options(tc: &Toolchain, v: &crate::workspace::Variant) -> Result<CompilerOptions, CompileError> {
+    let ws = tc.ws;
+    let vlock = tc.lock.variants.get(&v.id).ok_or_else(|| InstallError::Stale(vec![v.id.clone()]))?;
+    // Relative `-Xplugin:` paths resolve against the workspace root (daemon and foreground alike).
+    let mut scalac = absolute_plugins(&ws.root, &v.scalac_options);
+    let plugins: Vec<PathBuf> = vlock.compiler_plugins.iter().map(|k| tc.file(k)).collect();
+    for jar in &plugins {
+        scalac.push(format!("-Xplugin:{}", jar.display()));
+    }
+    let mut javac = v.javac_options.clone();
+    let release = v.release.clone().or_else(|| ws.config.toolchain.jdk.as_deref().and_then(install::jdk_major));
+    if let Some(release) = &release {
+        javac.extend(["--release".to_string(), release.clone()]);
+        if let Some(s) = &v.scala {
+            if s.binary == "3" {
+                scalac.extend(["-java-output-version".to_string(), release.clone()]);
+            } else {
+                scalac.push(format!("-release:{release}"));
+            }
+        }
+    }
+    Ok(CompilerOptions { scalac, javac, release, plugins })
+}
+
 fn is_scala_library(key: &str) -> bool {
     key.starts_with("org.scala-lang:scala-library:") || key.starts_with("org.scala-lang:scala3-library_3:")
 }
@@ -215,24 +253,7 @@ fn plan(tc: &Toolchain, node: &Node, upstream: &[String], tools: &str) -> Result
         classpath.insert(0, (None, classes_dir(&ws.root, &v.id)));
     }
 
-    let mut scalac_options = absolute_plugins(&ws.root, &v.scalac_options);
-    let vlock = &tc.lock.variants[&v.id];
-    for key in &vlock.compiler_plugins {
-        scalac_options.push(format!("-Xplugin:{}", tc.file(key).display()));
-    }
-    let mut javac_options = v.javac_options.clone();
-    // The release target defaults to the project JDK (design §6.3).
-    let release = v.release.clone().or_else(|| ws.config.toolchain.jdk.as_deref().and_then(install::jdk_major));
-    if let Some(release) = &release {
-        javac_options.extend(["--release".to_string(), release.clone()]);
-        if let Some(s) = &v.scala {
-            if s.binary == "3" {
-                scalac_options.extend(["-java-output-version".to_string(), release.clone()]);
-            } else {
-                scalac_options.push(format!("-release:{release}"));
-            }
-        }
-    }
+    let CompilerOptions { scalac: scalac_options, javac: javac_options, .. } = compiler_options(tc, v)?;
 
     // The fingerprint covers everything that can change the output; equal fingerprints let us
     // skip the worker entirely.

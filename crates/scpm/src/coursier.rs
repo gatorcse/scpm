@@ -686,6 +686,79 @@ pub fn resolve(
     Ok(result)
 }
 
+/// Downloads the sources jars of `modules` (`org:name:version`, no dependencies) into the cache
+/// with `cs fetch --sources --intransitive`, which checks them against the repository's
+/// checksums. Returns the sources jar of each module that has one; a module that publishes no
+/// sources jar is simply missing from the result.
+pub fn fetch_sources(
+    modules: &[String],
+    repos: &[Repo],
+    proxy: &ProxyChoice,
+    cache: &Path,
+    scratch: &Path,
+) -> Result<BTreeMap<String, PathBuf>, CoursierError> {
+    let mut found = BTreeMap::new();
+    for round in sources_rounds(modules) {
+        found.extend(fetch_sources_once(&round, repos, proxy, cache, scratch)?);
+    }
+    Ok(found)
+}
+
+/// Splits `org:name:version` modules into fetches holding at most one version of each
+/// `org:name`: coursier reconciles versions of one module within a fetch (latest wins), which
+/// would drop the other versions' sources.
+fn sources_rounds(modules: &[String]) -> Vec<Vec<String>> {
+    let mut rounds: Vec<Vec<String>> = Vec::new();
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for m in modules {
+        let ga = m.rsplit_once(':').map_or(m.as_str(), |(ga, _)| ga).to_string();
+        let round = *seen.entry(ga).and_modify(|n| *n += 1).or_insert(0);
+        if rounds.len() <= round {
+            rounds.push(Vec::new());
+        }
+        rounds[round].push(m.clone());
+    }
+    rounds
+}
+
+/// One `cs fetch --sources` call for modules with distinct `org:name`.
+fn fetch_sources_once(
+    modules: &[String],
+    repos: &[Repo],
+    proxy: &ProxyChoice,
+    cache: &Path,
+    scratch: &Path,
+) -> Result<BTreeMap<String, PathBuf>, CoursierError> {
+    if modules.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let report_path = scratch.join(format!("sources-{}.json", unique_suffix()));
+    let mut cmd = Command::new(cs_binary());
+    cmd.arg("fetch").arg("--quiet").arg("--sources").arg("--json-output-file").arg(&report_path);
+    let common = add_common_args(&mut cmd, repos, proxy, cache)?;
+    for m in modules {
+        cmd.arg("--intransitive").arg(m);
+    }
+    let out = cmd.output().map_err(|source| CoursierError::Spawn { bin: cs_binary(), source })?;
+    let report_text = fs::read_to_string(&report_path);
+    let _ = fs::remove_file(&report_path);
+    if !out.status.success() {
+        return Err(common.failure(&out.stderr));
+    }
+    let report: Report = serde_json::from_str(&report_text.map_err(|e| CoursierError::Output(e.to_string()))?)
+        .map_err(|e| CoursierError::Output(e.to_string()))?;
+    let mut found = BTreeMap::new();
+    for dep in report.dependencies {
+        let Some(file) = dep.file else { continue };
+        // `org:name:jar:sources:version`.
+        let parts: Vec<&str> = dep.coord.split(':').collect();
+        if let [g, a, _, "sources", v] = parts.as_slice() {
+            found.insert(format!("{g}:{a}:{v}"), PathBuf::from(file));
+        }
+    }
+    Ok(found)
+}
+
 /// Asks coursier which dependency chains in `req` lead to `module` (`org:name`), via
 /// `cs resolve --what-depends-on`. Each chain runs from a root of the request to the module.
 pub fn what_depends_on(
@@ -1289,6 +1362,23 @@ pub fn maven_path(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sources_fetches_hold_one_version_per_module() {
+        let m = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let rounds = sources_rounds(&m(&[
+            "org.scala-lang:scala-library:2.12.20",
+            "org.slf4j:slf4j-api:2.0.17",
+            "org.scala-lang:scala-library:2.13.18",
+        ]));
+        assert_eq!(
+            rounds,
+            vec![
+                m(&["org.scala-lang:scala-library:2.12.20", "org.slf4j:slf4j-api:2.0.17"]),
+                m(&["org.scala-lang:scala-library:2.13.18"]),
+            ]
+        );
+    }
 
     #[test]
     fn cache_paths_round_trip() {

@@ -596,6 +596,30 @@ fn module_variant_selectors_use_the_grammar() {
 }
 
 #[test]
+fn ide_settings_are_validated() {
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", &format!("{WS}ide: {{metals: true, idea: false}}\n")),
+        ("modules/a/scpm.yaml", "scala: ['3.9.0', '2.13.18']\nide: {primary: '2.12'}\n"),
+        ("modules/b/scpm.yaml", "ide: {primary: 'jvm-'}\n"),
+        ("modules/c/scpm.yaml", "variants:\n  '3':\n    ide: {primary: '3'}\n"),
+        ("modules/d/scpm.yaml", "ide: {primery: '3'}\n"),
+    ]);
+    let err = config_error(dir.path(), &["ls"]);
+    once(&err, "modules/a/scpm.yaml: ide.primary: `ide.primary` selector `2.12` matches no variant");
+    assert!(err.contains("this module's variants: a@jvm-3, a@jvm-2.13"), "{err}");
+    once(&err, "modules/b/scpm.yaml: ide.primary: invalid variant selector `jvm-`");
+    once(&err, "modules/c/scpm.yaml: variants.3: `ide` cannot be set in a variant override");
+    assert!(err.contains("modules/d/scpm.yaml") && err.contains("primery"), "{err}");
+
+    let dir = workspace(&[
+        ("scpm-workspace.yaml", WS),
+        ("modules/a/scpm.yaml", "scala: ['3.9.0', '2.13.18']\nide: {primary: '2.13'}\n"),
+    ]);
+    let ws = json(dir.path(), &["config", "a"]);
+    assert_eq!(ws.as_array().unwrap().len(), 2, "both variants still exist");
+}
+
+#[test]
 fn forbidden_keys_inside_variants() {
     let dir = workspace(&[
         ("scpm-workspace.yaml", WS),
