@@ -1082,6 +1082,14 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
     lock.prune(&used_catalogs);
     let resolve_ms = started.elapsed().as_millis();
 
+    // Restores download only the host system's files (and those of systems asked for), and
+    // only once the compile worker's JDK is known to be for the host system (design §5.4).
+    // Checked before the lock is written, so a refused command leaves the lock as it was.
+    crate::system::check_worker().map_err(InstallError::Systems)?;
+    let host = crate::system::host();
+    notes.extend(host.note.clone());
+    let keys = restore_keys(&lock, &host.system, &opts.restore, &mut notes)?;
+
     let lockfile_written = if opts.frozen { false } else { lock.write(&ws.root)? };
     // `cs` applies only the JDK part of the context (design §5.4, "Phase 1 limit").
     let resolved_on = (!stale.is_empty() || !missing_boot.is_empty()).then(HostPlatform::current);
@@ -1094,13 +1102,6 @@ pub fn install(ws: &Workspace, graph: &Graph, opts: InstallOptions) -> Result<In
             host.os, host.arch
         ));
     }
-
-    // Restores download only the host system's files (and those of systems asked for), and
-    // only once the compile worker's JDK is known to be for the host system (design §5.4).
-    crate::system::check_worker().map_err(InstallError::Systems)?;
-    let host = crate::system::host();
-    notes.extend(host.note.clone());
-    let keys = restore_keys(&lock, &host.system, &opts.restore, &mut notes)?;
 
     // Re-locking ran `cs`.
     let ran_cs = !stale.is_empty() || !missing_boot.is_empty();
@@ -1296,6 +1297,10 @@ fn resolve_concurrently<'a>(
     cache: &Path,
     scratch: &Path,
 ) -> Result<HashMap<&'a ResolveRequest, Resolution>, InstallError> {
+    // Nothing to resolve: a lock with several systems that is up to date only restores.
+    if requests.is_empty() {
+        return Ok(HashMap::new());
+    }
     // Checked by the caller: `cs` resolves one system.
     debug_assert!(ctx.systems.len() <= 1, "cs resolves a single system");
     let mut distinct: Vec<&ResolveRequest> = Vec::new();
@@ -1813,6 +1818,81 @@ mod tests {
         // A host outside the set is refused before anything is downloaded.
         let err = restore_keys(&lock, "windows-x86_64", &RestoreSystems::Host, &mut Vec::new()).unwrap_err();
         assert!(err.to_string().contains("the lock has entries that differ by system"), "{err}");
+    }
+
+    /// An up-to-date lock with several systems resolves nothing, so `cs` (one system only) is
+    /// never asked and the install only restores, frozen or not.
+    #[test]
+    fn an_up_to_date_lock_with_several_systems_only_restores() {
+        let (dir, _, _) = workspace(&[("a", "scala: none\n")]);
+        std::fs::write(
+            dir.path().join("scpm-workspace.yaml"),
+            "modules: ['modules/*']\nlock:\n  systems: [linux-x86_64, macos-aarch64]\n",
+        )
+        .unwrap();
+        let ws = crate::workspace::load(dir.path()).unwrap();
+        let graph = Graph::build(&ws).unwrap();
+        let (repos, _) = repositories(&ws).unwrap();
+        let ctx = lock_context(&ws, &Lockfile::default(), false);
+        assert_eq!(ctx.systems.len(), 2);
+        let mut lock = header(&["linux-x86_64", "macos-aarch64"], None);
+        lock.boot_inputs = Some(boot_inputs_hash(&repos, &ctx));
+        let boot: Vec<BootRoot> = boot_roots(JAVA_ONLY_SCALA).into_iter().chain(helper_roots()).collect();
+        for b in &boot {
+            lock.boot.insert(b.name.clone(), Classpath::default());
+        }
+        let v = ws.variant("a@jvm").unwrap();
+        lock.variants.insert(
+            v.id.clone(),
+            VariantLock { inputs_hash: inputs_hash(&ws, &graph, v, &repos, &ctx), ..Default::default() },
+        );
+        lock.write(dir.path()).unwrap();
+        let before = std::fs::read_to_string(dir.path().join(crate::lockfile::LOCK_FILE)).unwrap();
+        for frozen in [true, false] {
+            let summary = install(&ws, &graph, InstallOptions { frozen, ..Default::default() }).unwrap();
+            assert!(summary.relocked.is_empty() && summary.boot_relocked.is_empty(), "{summary:?}");
+            assert_eq!(summary.fetch.downloaded, 0);
+        }
+        assert_eq!(std::fs::read_to_string(dir.path().join(crate::lockfile::LOCK_FILE)).unwrap(), before);
+    }
+
+    /// A refused restore leaves the lock as it was: the checks run before it is written.
+    #[test]
+    fn a_refused_restore_writes_no_lock() {
+        let (dir, ws2, graph) = workspace(&[("a", "scala: none\n")]);
+        let (repos, _) = repositories(&ws2).unwrap();
+        let ctx = lock_context(&ws2, &Lockfile::default(), false);
+        // An up-to-date lock whose header differs from what this install writes (no
+        // `defaultSystems`), with a system-specific boot entry for another system.
+        let mut lock = header(&["linux-x86_64"], None);
+        lock.boot_inputs = Some(boot_inputs_hash(&repos, &ctx));
+        for b in boot_roots(JAVA_ONLY_SCALA).into_iter().chain(helper_roots()) {
+            lock.boot.insert(b.name, Classpath::default());
+        }
+        lock.boot.insert(
+            "compiler-bridge@2.13.18+zinc-2.1.0".into(),
+            Classpath::List(vec![LockEntry {
+                entry: ClasspathEntry::Artifact("g:n:1".into()),
+                systems: Some(vec!["linux-x86_64".into()]),
+            }]),
+        );
+        lock.artifacts.insert("g:n:1".into(), ArtifactLock { repo: "central".into(), sha256: "0".into(), size: 1 });
+        let v = ws2.variant("a@jvm").unwrap();
+        lock.variants.insert(
+            v.id.clone(),
+            VariantLock { inputs_hash: inputs_hash(&ws2, &graph, v, &repos, &ctx), ..Default::default() },
+        );
+        lock.write(dir.path()).unwrap();
+        let before = std::fs::read_to_string(dir.path().join(crate::lockfile::LOCK_FILE)).unwrap();
+        let opts =
+            InstallOptions { restore: RestoreSystems::Also(vec!["windows-x86_64".into()]), ..Default::default() };
+        let err = install(&ws2, &graph, opts).unwrap_err().to_string();
+        assert!(err.contains("is not one of the lock's systems"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(crate::lockfile::LOCK_FILE)).unwrap(),
+            before,
+            "not rewritten"
+        );
     }
 
     #[test]
